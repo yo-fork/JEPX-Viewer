@@ -245,11 +245,20 @@ export function categoryBarOption(
 }
 
 /**
+ * 発散スケール（TOKENS.div）で塗ったセルに載せる数値ラベルの色。t は |値| / 範囲の最大（0〜1）。
+ * ライトは中央が明るく両端も黒文字の方が読みやすい。ダークは中央が暗く、両端が明るい。
+ */
+export function labelOnDiv(t: number, theme: ThemeName): string {
+  return theme === 'light' || t > 0.5 ? '#0b0b0b' : '#ffffff';
+}
+
+/**
  * 連続スケール（TOKENS.seq）で塗ったセルに載せる数値ラベルの色。
  * pos はスケール上の位置（0〜1）。ライトでは値が大きいほど濃く、ダークでは明るくなるので、
  * セル自体の明るさで黒か白を選ぶ。
  */
 export function labelOnSeq(pos: number, theme: ThemeName): string {
-  const cellIsLight = theme === 'light' ? pos < 0.6 : pos > 0.4;
+  // ライトは 100→700 段、ダークは 550→100 段のスケール。白と黒のどちらがコントラストが高いかで分ける
+  const cellIsLight = theme === 'light' ? pos < 0.6 : pos > 0.2;
   return cellIsLight ? '#0b0b0b' : '#ffffff';
 }

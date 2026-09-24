@@ -60,6 +60,8 @@ export interface AppState {
   trendGran: TrendGran;
   trendStat: TrendStat;
   trendSplit: boolean;
+  /** 系列ごとに分割したときに各図へ重ねる線 */
+  splitRefs: PriceKey[];
   intradayMode: IntradayMode;
   intradayStat: 'mean' | 'median';
   heatKind: HeatKind;
@@ -69,6 +71,8 @@ export interface AppState {
   distGroup: DistGroup;
   pairA: AreaKey;
   pairB: AreaKey;
+  /** エリア比較タブの比較の基準（平均差・分断率・月別の差） */
+  areaBase: PriceKey;
   yearMetric: YearMetric;
   tableUnit: TableUnit;
   tableKind: TableKind;
@@ -89,6 +93,7 @@ export const DEFAULT_STATE: AppState = {
   trendGran: 'auto',
   trendStat: 'mean',
   trendSplit: false,
+  splitRefs: ['system'],
   intradayMode: 'series',
   intradayStat: 'mean',
   heatKind: 'dateSlot',
@@ -98,6 +103,7 @@ export const DEFAULT_STATE: AppState = {
   distGroup: 'month',
   pairA: 'tokyo',
   pairB: 'kansai',
+  areaBase: 'system',
   yearMetric: 'mean',
   tableUnit: 'month',
   tableKind: 'areas',
@@ -119,6 +125,14 @@ const listOf = <T extends string>(allowed: readonly T[]): Codec<T[]> => ({
     return items.length > 0 ? items : undefined;
   },
 });
+/** 空の選択も表せるリスト（空は "none"） */
+const listOrNone = <T extends string>(allowed: readonly T[]): Codec<T[]> => {
+  const list = listOf(allowed);
+  return {
+    enc: (v) => (v.length === 0 ? 'none' : list.enc(v)),
+    dec: (s) => (s === 'none' ? [] : list.dec(s)),
+  };
+};
 const intIn = (min: number, max: number): Codec<number> => ({
   enc: (v) => String(v),
   dec: (s) => {
@@ -157,6 +171,7 @@ const SCHEMA: { [K in keyof AppState]: [string, Codec<AppState[K]>] } = {
   trendGran: ['g', oneOf<TrendGran>(['auto', 'slot', 'day', 'week', 'month', 'fy', 'year'])],
   trendStat: ['stat', oneOf<TrendStat>(['mean', 'max', 'min', 'median'])],
   trendSplit: ['split', bool],
+  splitRefs: ['sr', listOrNone(PRICE_KEYS)],
   intradayMode: ['im', oneOf<IntradayMode>(['series', 'season', 'daytype', 'fy'])],
   intradayStat: ['is', oneOf<'mean' | 'median'>(['mean', 'median'])],
   heatKind: ['hk', oneOf<HeatKind>(['dateSlot', 'monthSlot', 'dowSlot', 'fyMonth'])],
@@ -166,6 +181,7 @@ const SCHEMA: { [K in keyof AppState]: [string, Codec<AppState[K]>] } = {
   distGroup: ['dg', oneOf<DistGroup>(['month', 'fy', 'dow', 'hour', 'area'])],
   pairA: ['a', oneOf(AREA_KEYS)],
   pairB: ['b', oneOf(AREA_KEYS)],
+  areaBase: ['base', oneOf(PRICE_KEYS)],
   yearMetric: ['ym', oneOf<YearMetric>(['mean', 'max', 'min', 'floor'])],
   tableUnit: ['tu', oneOf<TableUnit>(['day', 'week', 'month', 'fy', 'year', 'dow', 'slot', 'all'])],
   tableKind: ['tk', oneOf<TableKind>(['areas', 'stats'])],

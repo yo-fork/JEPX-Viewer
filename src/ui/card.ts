@@ -33,6 +33,7 @@ export class ChartCard {
   private readonly chartEl: HTMLDivElement;
   private readonly tableEl: HTMLDivElement;
   private readonly emptyEl: HTMLDivElement;
+  private readonly titleEl: HTMLHeadingElement;
   private readonly subtitleEl: HTMLParagraphElement;
   private readonly toggleBtn: HTMLButtonElement;
   private readonly csvBtn: HTMLButtonElement;
@@ -42,6 +43,7 @@ export class ChartCard {
 
   constructor(parent: HTMLElement, opts: CardOptions) {
     const titleId = uniqueId('card');
+    this.titleEl = h('h3', { class: 'card-title', id: titleId }, opts.title);
     this.subtitleEl = h('p', { class: 'card-subtitle' }, opts.subtitle ?? '');
     this.toggleBtn = h(
       'button',
@@ -62,7 +64,7 @@ export class ChartCard {
       h(
         'div',
         { class: 'card-head' },
-        h('div', { class: 'card-titles' }, h('h3', { class: 'card-title', id: titleId }, opts.title), this.subtitleEl),
+        h('div', { class: 'card-titles' }, this.titleEl, this.subtitleEl),
         h('div', { class: 'card-actions' }, this.toggleBtn, this.csvBtn),
       ),
       this.chartEl,
@@ -84,6 +86,10 @@ export class ChartCard {
     this.csvBtn.disabled = !table;
     this.toggleBtn.disabled = !table;
     if (this.showTable) this.renderTable();
+  }
+
+  setTitle(text: string): void {
+    this.titleEl.textContent = text;
   }
 
   setSubtitle(text: string): void {

@@ -115,6 +115,60 @@ export function numberField(
   return { el, set: (v) => (input.value = String(v)) };
 }
 
+export interface ChipOption<T extends string> {
+  value: T;
+  label: string;
+  /** 線の見本の色（省略時は見本なし） */
+  color?: string;
+  dashed?: boolean;
+}
+
+export interface ChipGroup<T extends string> {
+  el: HTMLElement;
+  set(selected: T[]): void;
+}
+
+/** 複数選択のチップ（トグルボタン）。選択は options の並び順で返す */
+export function chipGroup<T extends string>(
+  label: string,
+  options: ChipOption<T>[],
+  selected: T[],
+  onChange: (selected: T[]) => void,
+): ChipGroup<T> {
+  const labelId = uniqueId('chips');
+  let current = [...selected];
+  const buttons = options.map((o) =>
+    h(
+      'button',
+      {
+        type: 'button',
+        class: 'chip',
+        'aria-pressed': String(current.includes(o.value)),
+        style: o.color ? `--c:${o.color}` : undefined,
+        onclick: () => {
+          const next = current.includes(o.value) ? current.filter((v) => v !== o.value) : [...current, o.value];
+          onChange(options.map((x) => x.value).filter((v) => next.includes(v)));
+        },
+      },
+      o.color ? h('span', { class: `chip-key${o.dashed ? ' is-dashed' : ''}`, 'aria-hidden': 'true' }) : null,
+      o.label,
+    ),
+  );
+  const el = h(
+    'div',
+    { class: 'field field-series' },
+    h('span', { class: 'field-label', id: labelId }, label),
+    h('div', { class: 'chips', role: 'group', 'aria-labelledby': labelId }, buttons),
+  );
+  return {
+    el,
+    set: (sel) => {
+      current = [...sel];
+      buttons.forEach((b, i) => b.setAttribute('aria-pressed', String(current.includes(options[i].value))));
+    },
+  };
+}
+
 /** ツールバー（ビュー固有の表示設定の行） */
 export function toolbar(...items: HTMLElement[]): HTMLElement {
   return h('div', { class: 'view-toolbar' }, items);

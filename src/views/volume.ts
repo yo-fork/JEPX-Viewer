@@ -150,7 +150,7 @@ export class VolumeView extends View {
             data: points,
             symbolSize: 5,
             large: points.length > 4000,
-            itemStyle: { color: t.cat[0], opacity: 0.35 },
+            itemStyle: { color: t.cat[0], opacity: t.scatterAlpha },
             emphasis: { itemStyle: { opacity: 1, borderColor: t.surface, borderWidth: 2 }, scale: 2 },
           },
         ],

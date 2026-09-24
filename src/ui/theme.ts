@@ -26,11 +26,21 @@ export interface Tokens {
   seq: string[];
   /** 順序スケール（古い→新しい）。面に近い端でも 2:1 以上のコントラスト */
   ordinal: string[];
-  /** 発散スケール（負 → 中立 → 正） */
-  div: [string, string, string];
+  /** 発散スケール（負 → 中立 → 正。両側は同じ明度の段を対にする） */
+  div: string[];
   neutralSeries: string;
   /** 強調しない文脈線（過去の年度など） */
   deemph: string;
+  /** 凡例で非表示にした項目の文字色 */
+  inactive: string;
+  /** データの無いカレンダーのセル */
+  emptyCell: string;
+  /** 箱ひげの箱などの面の不透明度 */
+  fillAlpha: number;
+  /** 最低〜最高の帯の不透明度 */
+  bandAlpha: number;
+  /** 散布図の点の不透明度 */
+  scatterAlpha: number;
 }
 
 const BLUE = {
@@ -67,23 +77,37 @@ export const TOKENS: Record<ThemeName, Tokens> = {
     div: ['#2a78d6', '#f0efec', '#e34948'],
     neutralSeries: '#52514e',
     deemph: '#c3c2b7',
+    inactive: '#c3c2b7',
+    emptyCell: 'rgba(11,11,11,0.05)',
+    fillAlpha: 0.16,
+    bandAlpha: 0.12,
+    scatterAlpha: 0.35,
   },
+  // ダークは暗い面に沈まないよう、連続・順序スケールの暗い端を持ち上げ（面に対し 2.6:1 / 3.2:1 以上）、
+  // 補助テキスト・罫線・面の塗りをライトより一段明るく・濃くしている
   dark: {
     page: '#0d0d0d',
     surface: '#1a1a19',
-    raised: '#242422',
+    raised: '#262624',
     ink: '#ffffff',
-    ink2: '#c3c2b7',
-    muted: '#9d9b94',
-    grid: '#2c2c2a',
-    axis: '#383835',
-    border: 'rgba(255,255,255,0.10)',
+    ink2: '#d0cfc7',
+    muted: '#aeaca5',
+    grid: '#353533',
+    axis: '#4a4945',
+    border: 'rgba(255,255,255,0.13)',
     cat: ['#3987e5', '#d95926', '#199e70', '#c98500', '#d55181', '#008300', '#9085e9', '#e66767'],
-    seq: [BLUE[700], BLUE[600], BLUE[500], BLUE[400], BLUE[300], BLUE[200], BLUE[100]],
-    ordinal: [BLUE[600], BLUE[550], BLUE[500], BLUE[450], BLUE[400], BLUE[350], BLUE[300], BLUE[250], BLUE[200], BLUE[100]],
-    div: ['#3987e5', '#383835', '#e66767'],
-    neutralSeries: '#c3c2b7',
-    deemph: '#6b6a65',
+    seq: [BLUE[550], BLUE[500], BLUE[450], BLUE[400], BLUE[350], BLUE[300], BLUE[250], BLUE[200], BLUE[150], BLUE[100]],
+    ordinal: [BLUE[500], BLUE[450], BLUE[400], BLUE[350], BLUE[300], BLUE[250], BLUE[200], BLUE[150], BLUE[100]],
+    // 青の 300・450 段と同じ明度の赤を対にし、中央は面より少し明るい無彩色
+    div: [BLUE[300], BLUE[450], '#3a3a37', '#d2393a', '#f27b74'],
+    // 全エリア色と色覚シミュレーション下でも ΔE 10 以上離れる明るさ（検証済み）
+    neutralSeries: '#b3b1a9',
+    deemph: '#757470',
+    inactive: '#5f5e5a',
+    emptyCell: 'rgba(255,255,255,0.07)',
+    fillAlpha: 0.3,
+    bandAlpha: 0.22,
+    scatterAlpha: 0.6,
   },
 };
 

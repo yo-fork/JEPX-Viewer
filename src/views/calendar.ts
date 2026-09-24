@@ -13,7 +13,7 @@ import { segmented, selectField, toolbar, type Segmented, type SelectField } fro
 import { TOKENS } from '../ui/theme';
 import { ttHeader, ttNote, ttRow } from '../ui/tooltip';
 import { NO_DATA, View } from './base';
-import { describeSelection, PRICE_UNIT, rangeTag, withAlpha } from './common';
+import { describeSelection, PRICE_UNIT, rangeTag } from './common';
 
 const METRICS: { value: CalMetric; label: string }[] = [
   { value: 'mean', label: '日平均' },
@@ -124,7 +124,7 @@ export class CalendarView extends View {
           cellSize: ['auto', 14],
           orient: 'horizontal',
           splitLine: { show: false },
-          itemStyle: { color: withAlpha(theme === 'light' ? '#0b0b0b' : '#ffffff', 0.05), borderColor: t.surface, borderWidth: 2 },
+          itemStyle: { color: t.emptyCell, borderColor: t.surface, borderWidth: 2 },
           yearLabel: { show: true, formatter: `${fy}年度`, position: 'left', margin: 28, color: t.ink2, fontSize: 12 },
           dayLabel: { firstDay: 1, nameMap: DAYS, color: t.muted, fontSize: 10, margin: 6 },
           monthLabel: { nameMap: MONTHS, color: t.muted, fontSize: 10, margin: 6 },
