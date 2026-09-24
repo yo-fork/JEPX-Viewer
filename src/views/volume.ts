@@ -11,7 +11,7 @@ import { TOKENS } from '../ui/theme';
 import { ttHeader, ttRow } from '../ui/tooltip';
 import { NO_DATA, View } from './base';
 import { axisTooltip, describeSelection, endLabels, grid, labelRoom, lineSeries, rangeTag, seriesLegend, slotAxis, valueAxis } from './common';
-import { autoGranularity, buildSeriesPoints, periodLabel, TIME_AXIS_LABEL } from './timeseries';
+import { autoGranularity, breakGaps, buildSeriesPoints, periodLabel, TIME_AXIS_LABEL } from './timeseries';
 
 const UNIT = '百万kWh';
 const MAX_SCATTER = 12000;
@@ -67,7 +67,7 @@ export class VolumeView extends View {
         tooltip: { trigger: 'axis', formatter: axisTooltip(keys, theme, (p) => periodLabel(p.value[0], gran), (v) => `${fmtNum(v, 1)} ${unit}`) },
         xAxis: { type: 'time', axisLabel: TIME_AXIS_LABEL },
         yAxis: valueAxis(unit),
-        series: keys.map((k, i) => lineSeries(k, theme, data[i], { sampling: 'lttb', ...trendEnds[i] })),
+        series: keys.map((k, i) => lineSeries(k, theme, perDay ? data[i] : breakGaps(data[i]), { sampling: 'lttb', ...trendEnds[i] })),
       },
       {
         columns: ['期間', ...keys.map((k) => `${SERIES_LABEL[k]}（${unit}）`)],

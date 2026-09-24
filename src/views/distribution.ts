@@ -102,7 +102,9 @@ export class DistributionView extends View {
     }
     const overflow = counts[nBins];
     if (overflow === 0) counts.pop();
-    const digits = width < 1 ? 1 : 0;
+    // 階級幅に合わせた小数桁（0.25 刻みなら 2 桁、0.5・2.5 刻みなら 1 桁）
+    const tenths = Math.round(width * 1e6) / 1e5; // width × 10（浮動小数点の誤差を除く）
+    const digits = Number.isInteger(width) ? 0 : Number.isInteger(tenths) ? 1 : 2;
     const labels = counts.map((_, k) => (k === nBins ? `${fmtNum(cap, digits)}〜` : fmtNum(start + k * width, digits)));
     const ranges = counts.map((_, k) =>
       k === nBins ? `${fmtNum(cap, digits)} 円以上` : `${fmtNum(start + k * width, digits)}〜${fmtNum(start + (k + 1) * width, digits)} 円未満`,

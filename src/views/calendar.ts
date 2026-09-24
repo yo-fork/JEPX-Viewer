@@ -66,6 +66,10 @@ export class CalendarView extends View {
     });
 
     const finite = Float64Array.from(values.filter(Number.isFinite)).sort();
+    if (finite.length === 0) {
+      this.chart.setEmpty(NO_DATA);
+      return;
+    }
     let min: number;
     let max: number;
     if (metric === 'spread') {

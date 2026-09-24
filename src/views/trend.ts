@@ -10,11 +10,11 @@ import type { TrendGran, TrendStat } from '../state';
 import type { ChartCard } from '../ui/card';
 import { segmented, toolbar, type Segmented } from '../ui/controls';
 import { h } from '../ui/dom';
-import { seriesColor, TOKENS } from '../ui/theme';
+import { seriesColor, seriesDashed, TOKENS } from '../ui/theme';
 import { ttHeader, ttRow } from '../ui/tooltip';
 import { NO_DATA, View } from './base';
 import { axisTooltip, describeSelection, endLabels, grid, labelRoom, lineSeries, PRICE_UNIT, priceText, rangeTag, seriesLegend, styledLine, valueAxis } from './common';
-import { autoGranularity, buildSeriesPoints, periodLabel, TIME_AXIS_LABEL, type SeriesPoints } from './timeseries';
+import { autoGranularity, breakGaps, buildSeriesPoints, periodLabel, TIME_AXIS_LABEL, type SeriesPoints } from './timeseries';
 
 const GRAN_OPTIONS: { value: TrendGran; label: string }[] = [
   { value: 'auto', label: '自動' },
@@ -102,7 +102,7 @@ export class TrendView extends View {
     this.chart.setHeight(440);
     const ends = endLabels(keys.map((k) => SERIES_SHORT[k]), data.map((d) => d.points.map((p) => p[1])), theme, 320);
     const series: Record<string, unknown>[] = keys.map((k, i) =>
-      lineSeries(k, theme, data[i].points, { sampling: 'lttb', z: k === 'system' ? 4 : 3, ...ends[i] }),
+      lineSeries(k, theme, gran === 'slot' ? breakGaps(data[i].points) : data[i].points, { sampling: 'lttb', z: k === 'system' ? 4 : 3, ...ends[i] }),
     );
     let tooltip = axisTooltip(keys, theme, (p) => periodLabel(p.value[0], gran));
     if (withRange) {
@@ -166,21 +166,22 @@ export class TrendView extends View {
     const height = top0 + rows * (panelH + gapV) + sliderH;
     this.chart.setHeight(height);
 
+    const sysIdx = keys.indexOf('system');
+    const stat = gran === 'slot' ? 'mean' : state.trendStat;
+    const sysPoints = sysIdx >= 0 ? data[sysIdx].points : buildSeriesPoints(this.ctx.sel, [src(this.ctx.ds, 'system')], gran, stat)[0].points;
+    // 全図で共通の縦軸（きりのよい目盛り）。各図に重ねるシステムプライスも範囲に含める
     let max = 0;
     let min = 0;
-    for (const d of data) {
-      for (const [, v] of d.points) {
+    for (const pts of [...data.map((d) => d.points), sysPoints]) {
+      for (const [, v] of pts) {
         if (v > max) max = v;
         if (v < min) min = v;
       }
     }
-    // 全図で共通の縦軸（きりのよい目盛り）
     const yStep = niceStep((max - Math.min(0, min)) / 3);
     const yMax = Math.ceil(max / yStep) * yStep;
     const yMin = min < 0 ? Math.floor(min / yStep) * yStep : 0;
-    const sysIdx = keys.indexOf('system');
-    const stat = gran === 'slot' ? 'mean' : state.trendStat;
-    const sysPoints = sysIdx >= 0 ? data[sysIdx].points : buildSeriesPoints(this.ctx.sel, [src(this.ctx.ds, 'system')], gran, stat)[0].points;
+    const line = (pts: [number, number][]) => (gran === 'slot' ? breakGaps(pts) : pts);
 
     const grids: Record<string, unknown>[] = [];
     const xAxes: Record<string, unknown>[] = [];
@@ -217,10 +218,10 @@ export class TrendView extends View {
         style: { text: SERIES_LABEL[k], fill: t.ink, font: `600 12px ${getComputedStyle(document.body).fontFamily}` },
       });
       if (k !== 'system' && sysPoints) {
-        series.push(styledLine('システム', t.neutralSeries, theme, sysPoints, false, { xAxisIndex: i, yAxisIndex: i, sampling: 'lttb', lineStyle: { width: 1, color: t.neutralSeries }, z: 2 }));
+        series.push(styledLine('システム', t.neutralSeries, theme, line(sysPoints), false, { xAxisIndex: i, yAxisIndex: i, sampling: 'lttb', lineStyle: { width: 1, color: t.neutralSeries }, z: 2 }));
         seriesKeyOf.push('system');
       }
-      series.push(lineSeries(k, theme, data[i].points, { xAxisIndex: i, yAxisIndex: i, sampling: 'lttb', z: 3 }));
+      series.push(lineSeries(k, theme, line(data[i].points), { xAxisIndex: i, yAxisIndex: i, sampling: 'lttb', z: 3 }));
       seriesKeyOf.push(k);
     });
 
@@ -235,10 +236,12 @@ export class TrendView extends View {
           formatter: (params: { seriesIndex: number; value: [number, number] }[]) => {
             if (!params.length) return '';
             let html = ttHeader(periodLabel(params[0].value[0], gran));
+            const seen = new Set<PriceKey>();
             for (const p of params) {
               const key = seriesKeyOf[p.seriesIndex];
-              if (!key) continue;
-              html += ttRow(seriesColor(key, theme), `${fmtPrice(p.value[1])} ${PRICE_UNIT}`, SERIES_SHORT[key]);
+              if (!key || seen.has(key)) continue;
+              seen.add(key);
+              html += ttRow(seriesColor(key, theme), `${fmtPrice(p.value[1])} ${PRICE_UNIT}`, SERIES_SHORT[key], seriesDashed(key) ? 'dash' : 'line');
             }
             return html;
           },

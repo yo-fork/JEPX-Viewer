@@ -115,7 +115,7 @@ const oneOf = <T extends string>(allowed: readonly T[]): Codec<T> => ({
 const listOf = <T extends string>(allowed: readonly T[]): Codec<T[]> => ({
   enc: (v) => v.join(','),
   dec: (s) => {
-    const items = s.split(',').filter((x): x is T => (allowed as readonly string[]).includes(x));
+    const items = [...new Set(s.split(','))].filter((x): x is T => (allowed as readonly string[]).includes(x));
     return items.length > 0 ? items : undefined;
   },
 });

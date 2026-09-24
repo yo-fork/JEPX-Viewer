@@ -103,8 +103,12 @@ export function numberField(
     step: opts.step ?? 1,
     inputmode: 'decimal',
     onchange: () => {
-      const v = Number(input.value);
-      if (Number.isFinite(v)) onChange(v);
+      let v = Number(input.value);
+      if (!Number.isFinite(v)) return;
+      if (opts.min !== undefined) v = Math.max(opts.min, v);
+      if (opts.max !== undefined) v = Math.min(opts.max, v);
+      input.value = String(v);
+      onChange(v);
     },
   });
   const el = h('div', { class: 'field' }, h('label', { for: id }, label), h('span', { class: 'input-unit' }, input, opts.unit ?? ''));

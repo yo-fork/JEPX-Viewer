@@ -3,7 +3,7 @@
  */
 import type { Selection } from '../lib/select';
 import type { Dataset } from '../lib/store';
-import type { AppState } from '../state';
+import type { AppState, Extent } from '../state';
 import { ChartCard, type CardOptions } from '../ui/card';
 import { h } from '../ui/dom';
 import type { ThemeName } from '../ui/theme';
@@ -18,6 +18,8 @@ export interface ViewContext {
   ds: Dataset;
   sel: Selection;
   theme: ThemeName;
+  /** 利用できるデータ全体の範囲（未読み込みの年度を含む） */
+  extent: Extent;
 }
 
 export abstract class View {

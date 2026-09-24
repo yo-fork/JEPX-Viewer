@@ -5,7 +5,7 @@ import { aggregate, FISCAL_MONTH_LABELS, fiscalMonthIndex, src } from '../lib/ag
 import { fmtNum, fmtPrice } from '../lib/format';
 import { PRICE_KEYS, SERIES_LABEL, SERIES_SHORT, type PriceKey } from '../lib/series';
 import { accMean, accStd } from '../lib/stats';
-import type { YearMetric } from '../state';
+import { fiscalYearsIn, type YearMetric } from '../state';
 import type { ChartCard } from '../ui/card';
 import { segmented, selectField, toolbar, type Segmented, type SelectField } from '../ui/controls';
 import { h } from '../ui/dom';
@@ -57,8 +57,8 @@ export class YearlyView extends View {
       return;
     }
     const fys = [...new Set([...sel.days].map((i) => sel.ds.fy[i]))].sort((a, b) => a - b);
-    const allFys = new Set(Array.from(sel.ds.fy.filter((_, i) => sel.ds.present[i] === 1)));
-    this.hint.hidden = !(fys.length <= 2 && allFys.size > fys.length);
+    const available = fiscalYearsIn(this.ctx.extent).length;
+    this.hint.hidden = !(fys.length <= 2 && available > fys.length);
     this.renderMonths(fys);
     this.renderFyBars(fys);
     this.renderFyAreas(fys);
@@ -195,6 +195,10 @@ export class YearlyView extends View {
         max = Math.max(max, v);
       });
     });
+    if (raw.length === 0) {
+      this.fyAreas.setEmpty(NO_DATA);
+      return;
+    }
     const lo = Math.floor(min);
     const hi = Math.max(lo + 1, Math.ceil(max));
     for (const [c, r, v] of raw) cells.push({ value: [c, r, v], label: { color: labelOnSeq((v - lo) / (hi - lo), theme) } });

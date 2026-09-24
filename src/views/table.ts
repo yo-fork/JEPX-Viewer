@@ -138,9 +138,10 @@ export class TableView extends View {
       return g.acc.map(accMean);
     });
     const vol = aggregate(sel, { a: ds.values[SERIES_INDEX.volume] }, groupOf, n);
+    const count = aggregate(sel, { a: ds.values[SERIES_INDEX.system] }, groupOf, n);
     return {
       columns: ['区分', ...PRICE_KEYS.map((k) => SERIES_SHORT[k]), '約定総量', 'コマ数'],
-      rows: labels.map((l, r) => [l, ...means.map((m) => m[r]), vol.acc[r].n ? vol.acc[r].sum / 1e6 : '', vol.acc[r].n]),
+      rows: labels.map((l, r) => [l, ...means.map((m) => m[r]), vol.acc[r].n ? vol.acc[r].sum / 1e6 : '', count.acc[r].n]),
       digits: [null, ...PRICE_KEYS.map(() => 2), 1, 0],
     };
   }
@@ -204,7 +205,7 @@ export class TableView extends View {
         '10%点',
         '90%点',
         '0.01円のコマ',
-        `${fmtNum(th, th % 1 ? 1 : 0)}円以上のコマ`,
+        `${th.toLocaleString('ja-JP', { maximumFractionDigits: 2 })}円以上のコマ`,
         ...(withVwap ? ['約定量加重平均'] : []),
       ],
       rows,

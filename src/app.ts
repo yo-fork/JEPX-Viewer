@@ -8,6 +8,7 @@ import { decodeCsvBytes } from './lib/encoding';
 import { fmtNum } from './lib/format';
 import { parseSpotCsv } from './lib/jepxCsv';
 import { select } from './lib/select';
+import { PRICE_KEYS } from './lib/series';
 import { DataStore } from './lib/store';
 import { DEFAULT_STATE, TABS, resolveRange, stateFromHash, stateToHash, type AppState, type Extent, type TabId } from './state';
 import { h } from './ui/dom';
@@ -18,13 +19,15 @@ import { createView } from './views';
 
 const DATA_BASE = new URL('data/', document.baseURI);
 const JEPX_SPOT_URL = 'https://www.jepx.jp/electricpower/market-data/spot/';
+const RETRY_AFTER_MS = 30_000;
 
 export class App implements AppApi {
   private state: AppState;
   private readonly store = new DataStore();
   private manifest: Manifest | null = null;
   private readonly loaded = new Set<number>();
-  private readonly failed = new Set<number>();
+  /** 読み込みに失敗した年度 → 失敗した時刻 */
+  private readonly failed = new Map<number, number>();
   private readonly loading = new Map<number, Promise<void>>();
   private themeMode: ThemeMode;
   private theme: ThemeName;
@@ -125,6 +128,8 @@ export class App implements AppApi {
     this.viewHost = h('main', { id: 'view', class: 'view', role: 'tabpanel', tabindex: '-1' });
     this.workspace = h('div', { class: 'workspace', hidden: true }, tabs, this.filterBar.el, this.viewHost);
     this.emptyEl = this.buildEmptyState();
+    // 取得済みデータ（manifest.json）の有無が分かるまでは空状態を出さない
+    this.emptyEl.hidden = true;
     this.toastHost = h('div', { class: 'toasts', 'aria-live': 'polite' });
     this.dropOverlay = h('div', { class: 'drop-overlay', hidden: true }, h('p', null, 'CSV ファイルをドロップして読み込み'));
 
@@ -153,6 +158,11 @@ export class App implements AppApi {
 
   setState(patch: Partial<AppState>): void {
     const next: AppState = { ...this.state, ...patch };
+    if (patch.series) {
+      // 重複を除き、固定の並び順にする（少なくとも 1 系列は表示する）
+      const series = PRICE_KEYS.filter((k) => patch.series!.includes(k));
+      next.series = series.length > 0 ? series : this.state.series;
+    }
     if (patch.preset !== undefined && patch.preset !== 'custom' && patch.from === undefined) {
       next.from = Number.NaN;
       next.to = Number.NaN;
@@ -195,9 +205,10 @@ export class App implements AppApi {
       this.filterBar.setStatus('データを読み込み中…');
       await pending;
       if (seq !== this.renderSeq) return;
-      this.viewHost.classList.remove('is-loading');
-      this.filterBar.setStatus('');
     }
+    // 追い越された古い render が読み込み表示を残していても、ここで必ず解除する
+    this.viewHost.classList.remove('is-loading');
+    this.filterBar.setStatus('');
 
     const ds = this.store.dataset();
     if (!ds) {
@@ -212,7 +223,7 @@ export class App implements AppApi {
       slotStart: this.state.slotStart,
       slotEnd: this.state.slotEnd,
     });
-    const ctx: ViewContext = { app: this, state: this.state, ds, sel, theme: this.theme };
+    const ctx: ViewContext = { app: this, state: this.state, ds, sel, theme: this.theme, extent };
     const key = `${this.state.tab}|${this.theme}`;
     try {
       if (!this.view || this.viewKey !== key) {
@@ -301,7 +312,7 @@ export class App implements AppApi {
   private extent(): Extent | null {
     let first = Number.POSITIVE_INFINITY;
     let last = Number.NEGATIVE_INFINITY;
-    for (const f of this.manifest?.files ?? []) {
+    for (const f of this.store.isDemo ? [] : (this.manifest?.files ?? [])) {
       const a = parseDateString(f.firstDate);
       const b = parseDateString(f.lastDate);
       if (a !== null) first = Math.min(first, a);
@@ -328,9 +339,14 @@ export class App implements AppApi {
   }
 
   private ensureLoaded(from: number, to: number): Promise<void> | null {
-    if (!this.manifest) return null;
+    // デモ（合成データ）には実データを混ぜない
+    if (!this.manifest || this.store.isDemo) return null;
+    const now = Date.now();
     const need = this.manifest.files.filter((f) => {
-      if (this.loaded.has(f.fy) || this.failed.has(f.fy)) return false;
+      if (this.loaded.has(f.fy)) return false;
+      // 失敗した年度は少し時間をおいてから再試行する
+      const failedAt = this.failed.get(f.fy);
+      if (failedAt !== undefined && now - failedAt < RETRY_AFTER_MS) return false;
       const a = parseDateString(f.firstDate) ?? fiscalYearStart(f.fy);
       const b = parseDateString(f.lastDate) ?? fiscalYearEnd(f.fy);
       return a <= to && b >= from;
@@ -342,7 +358,9 @@ export class App implements AppApi {
   private loadFy(entry: ManifestEntry): Promise<void> {
     let p = this.loading.get(entry.fy);
     if (!p) {
-      p = fetch(new URL(entry.file, DATA_BASE))
+      const url = new URL(entry.file, DATA_BASE);
+      url.searchParams.set('v', this.manifest?.generatedAt ?? '');
+      p = fetch(url)
         .then((res) => {
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
           return res.json();
@@ -350,9 +368,10 @@ export class App implements AppApi {
         .then((json) => {
           this.store.addDays(decodeFyFile(json), 'bundled');
           this.loaded.add(entry.fy);
+          this.failed.delete(entry.fy);
         })
         .catch((err: Error) => {
-          this.failed.add(entry.fy);
+          this.failed.set(entry.fy, Date.now());
           this.toast(`${entry.fy}年度のデータを読み込めませんでした（${err.message}）`, 'error');
         })
         .finally(() => this.loading.delete(entry.fy));
@@ -367,7 +386,6 @@ export class App implements AppApi {
       this.toast('CSV ファイルを指定してください。', 'error');
       return;
     }
-    if (this.store.isDemo) this.store.clear();
     let first = Number.POSITIVE_INFINITY;
     let last = Number.NEGATIVE_INFINITY;
     const done: string[] = [];
@@ -376,6 +394,8 @@ export class App implements AppApi {
       try {
         const { text } = decodeCsvBytes(await file.arrayBuffer());
         const res = parseSpotCsv(text);
+        // 実データを読めたらデモ（合成データ）は破棄する
+        if (this.store.isDemo) this.store.clear();
         this.store.addDays(res.days, 'upload');
         first = Math.min(first, res.firstDay);
         last = Math.max(last, res.lastDay);
@@ -391,11 +411,14 @@ export class App implements AppApi {
       const fy = fiscalYearOfDay(first);
       const oneFy = fiscalYearOfDay(last) === fy;
       this.setState(oneFy ? { preset: `fy${fy}` } : { preset: 'custom', from: first, to: last });
+    } else {
+      this.requestRender();
     }
     if (errors.length > 0) this.toast(errors.join('\n'), 'error');
   }
 
   private loadDemo(): void {
+    if (this.manifest) return;
     const today = todayJst();
     const from = fiscalYearStart(fiscalYearOfDay(today) - 6);
     this.store.clear();

@@ -242,8 +242,10 @@ export async function run(o: FetchOptions): Promise<Manifest> {
 
 // CLI として実行されたとき
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  run(parseArgs(process.argv.slice(2))).catch((err: Error) => {
-    console.error(err.message);
-    process.exit(1);
-  });
+  Promise.resolve()
+    .then(() => run(parseArgs(process.argv.slice(2))))
+    .catch((err: Error) => {
+      console.error(err.message);
+      process.exit(1);
+    });
 }

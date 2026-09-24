@@ -2,7 +2,7 @@
  * 期間別の時系列を作る共通処理（概要・推移・入札量のタブで使う）。
  */
 import { aggregate, buildPeriods, type Granularity, type Periods, type Source } from '../lib/aggregate';
-import { formatDay, MS_PER_DAY, slotStartLabel, wallClockMs, ymdFromDay } from '../lib/dates';
+import { formatDay, MS_PER_DAY, MS_PER_SLOT, slotStartLabel, wallClockMs, ymdFromDay } from '../lib/dates';
 import { SLOTS } from '../lib/series';
 import type { Selection } from '../lib/select';
 import { accMean, quantileSorted } from '../lib/stats';
@@ -48,19 +48,30 @@ export function periodPoints(sel: Selection, source: Source, periods: Periods, s
   return withRange ? { points, low, high } : { points };
 }
 
-/** 30 分値そのまま */
+/** 30 分値そのまま（受渡日ごとに時刻順。日をまたぐ時間帯指定でも時間の前後が入れ替わらない） */
 export function slotPoints(sel: Selection, source: Source): SeriesPoints {
   const points: [number, number][] = [];
   const { a, b } = source;
   for (const i of sel.days) {
     const day = sel.ds.start + i;
-    for (const s of sel.slots) {
+    for (let s = 0; s < SLOTS; s++) {
+      if (!sel.slotMask[s]) continue;
       let v = a[i * SLOTS + s];
       if (b) v -= b[i * SLOTS + s];
       points.push([wallClockMs(day, s), v]);
     }
   }
   return { points };
+}
+
+/** 折れ線用: 30 分より離れた点（対象外の時間帯・日）の間に欠損を挟み、線をつながない */
+export function breakGaps(points: [number, number][]): [number, number][] {
+  const out: [number, number][] = [];
+  for (let k = 0; k < points.length; k++) {
+    if (k > 0 && points[k][0] - points[k - 1][0] > MS_PER_SLOT) out.push([points[k - 1][0] + MS_PER_SLOT, Number.NaN]);
+    out.push(points[k]);
+  }
+  return out;
 }
 
 export function buildSeriesPoints(
