@@ -4,7 +4,6 @@ version: 2
 updates:
   - package-ecosystem: npm
     directory: /
-    target-branch: main
     schedule:
       interval: monthly
     # 公開から 7 日未満の版は提案しない（乗っ取られたパッケージに不正な版が出ても、多くは数日のうちに見つかり取り下げられる）
@@ -22,7 +21,6 @@ updates:
 
   - package-ecosystem: github-actions
     directory: /
-    target-branch: main
     schedule:
       interval: monthly
     cooldown:
