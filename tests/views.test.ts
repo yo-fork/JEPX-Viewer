@@ -51,3 +51,18 @@ describe('URL の状態', () => {
     expect(s.threshold).toBe(30);
   });
 });
+
+describe('新しい表示設定の URL', () => {
+  it('重ね線なし（sr=none）と比較の基準（base）を保存・復元できる', () => {
+    const s = stateFromHash('#tab=trend&split=1&sr=none&base=tokyo');
+    expect(s.splitRefs).toEqual([]);
+    expect(s.areaBase).toBe('tokyo');
+    expect(stateToHash(s)).toContain('sr=none');
+    expect(stateFromHash(stateToHash(s))).toEqual(s);
+    // 既定（システムプライスのみを重ねる・基準はシステムプライス）は URL に載せない
+    const d = stateFromHash('#tab=trend');
+    expect(d.splitRefs).toEqual(['system']);
+    expect(d.areaBase).toBe('system');
+    expect(stateToHash(d)).toBe('#tab=trend');
+  });
+});

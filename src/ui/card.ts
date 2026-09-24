@@ -29,6 +29,8 @@ const MAX_TABLE_ROWS = 2000;
 
 export class ChartCard {
   readonly el: HTMLElement;
+  /** グラフの下に置く補足（表示・非表示でグラフの位置が動かないよう、グラフより後ろに置く） */
+  readonly footer: HTMLDivElement;
   readonly chart: echarts.ECharts;
   private readonly chartEl: HTMLDivElement;
   private readonly tableEl: HTMLDivElement;
@@ -58,6 +60,7 @@ export class ChartCard {
     this.chartEl = h('div', { class: 'chart', style: `height:${opts.height}px`, role: 'img', 'aria-labelledby': titleId });
     this.tableEl = h('div', { class: 'table-wrap', hidden: true });
     this.emptyEl = h('div', { class: 'card-empty', hidden: true });
+    this.footer = h('div', { class: 'card-footer' });
     this.el = h(
       'figure',
       { class: `card${opts.wide ? ' card-wide' : ''}` },
@@ -70,6 +73,7 @@ export class ChartCard {
       this.chartEl,
       this.tableEl,
       this.emptyEl,
+      this.footer,
     );
     parent.append(this.el);
     this.chart = initChart(this.chartEl, opts.theme);

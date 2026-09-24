@@ -537,6 +537,20 @@ input[type='number'] {
   min-width: 0;
 }
 
+.card-footer:empty {
+  display: none;
+}
+
+.zoom-note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .card-empty {
   display: grid;
   place-items: center;

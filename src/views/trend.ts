@@ -97,15 +97,17 @@ export class TrendView extends View {
     this.root.append(toolbar(this.gran.el, this.stat.el, this.split.el, this.refs.el));
     this.note = h('p', { class: 'view-note' });
     this.zoomText = h('span');
+    // 拡大中の表示はグラフの下（カード内）に出す。上に出すとスライダー操作中にグラフが動いてしまう
     this.zoomNote = h(
       'p',
-      { class: 'view-note', hidden: true },
+      { class: 'zoom-note', hidden: true },
       this.zoomText,
       h('button', { type: 'button', class: 'btn btn-sm', onclick: () => this.resetZoom() }, '全体を表示'),
     );
-    this.root.append(this.note, this.zoomNote);
+    this.root.append(this.note);
     const g = this.grid();
     this.chart = this.card(g, { title: '価格の推移', height: 440, wide: true });
+    this.chart.footer.append(this.zoomNote);
     this.chart.chart.on('datazoom', () => this.rememberZoom());
   }
 
@@ -354,19 +356,21 @@ export class TrendView extends View {
           trigger: 'axis',
           formatter: (params: { seriesIndex: number; value: [number, number] }[]) => {
             if (!params.length) return '';
-            let html = ttHeader(periodLabel(params[0].value[0], gran));
-            // 同じ系列は（主線・重ね線とも）1 回だけ表示する
-            const seen = new Set<PriceKey>();
+            // 同じ系列は（主線・重ね線とも）1 回だけ、凡例と同じ固定の順で表示する
+            const value = new Map<PriceKey, number>();
             for (const p of params) {
               const key = seriesKeyOf[p.seriesIndex];
-              if (!key || seen.has(key)) continue;
-              seen.add(key);
-              html += ttRow(seriesColor(key, theme), `${fmtPrice(p.value[1])} ${PRICE_UNIT}`, SERIES_SHORT[key], seriesDashed(key) ? 'dash' : 'line');
+              if (key && !value.has(key)) value.set(key, p.value[1]);
+            }
+            let html = ttHeader(periodLabel(params[0].value[0], gran));
+            for (const key of PRICE_KEYS) {
+              if (!value.has(key)) continue;
+              html += ttRow(seriesColor(key, theme), `${fmtPrice(value.get(key)!)} ${PRICE_UNIT}`, SERIES_SHORT[key], seriesDashed(key) ? 'dash' : 'line');
             }
             return html;
           },
         },
-        axisPointer: { link: [{ xAxisIndex: 'all' }] },
+        axisPointer: { link: [{ xAxisIndex: 'all' }], lineStyle: { color: t.muted, width: 1, type: 'solid' } },
         dataZoom: [
           { type: 'inside', xAxisIndex: axisIdx, throttle: 50, ...range },
           { type: 'slider', xAxisIndex: axisIdx, height: 22, bottom: 8, left: 16, right: 16, showDetail: false, brushSelect: false, ...range },
