@@ -6,6 +6,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+# テストとビルドだけなので、リポジトリの設定に関係なくコードの読み取り権限だけを与える
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
