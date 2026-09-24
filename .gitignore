@@ -1,0 +1,8 @@
+node_modules/
+dist/
+# npm run fetch で取得したデータ（JEPX 公開データ。リポジトリには含めない）
+public/data/
+# npm run sample で生成する合成サンプル CSV
+samples/
+*.log
+.DS_Store

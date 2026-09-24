@@ -1,0 +1,155 @@
+/**
+ * 配色トークン。CSS 変数（styles.css）と同じ値を ECharts 用に JS でも持つ。
+ *
+ * - 系列色は「エンティティに固定」: エリアの表示・非表示を切り替えても色は変わらない
+ * - 東京・関西・九州に、どの 2 本が重なっても色覚多様性に配慮した判別ができる最初の 3 色を割り当てる
+ * - システムプライスは基準線として無彩色（全色相と十分に離れていることを検証済み）
+ * - 9 エリア目の四国は中国と同じ色相の破線（色 × 線種の複合符号化）
+ */
+import type { SeriesKey } from '../lib/series';
+
+export type ThemeName = 'light' | 'dark';
+
+export interface Tokens {
+  page: string;
+  surface: string;
+  raised: string;
+  ink: string;
+  ink2: string;
+  muted: string;
+  grid: string;
+  axis: string;
+  border: string;
+  /** カテゴリ色（固定順） */
+  cat: string[];
+  /** 単一色相の連続スケール（値が小さい→大きい） */
+  seq: string[];
+  /** 順序スケール（古い→新しい）。面に近い端でも 2:1 以上のコントラスト */
+  ordinal: string[];
+  /** 発散スケール（負 → 中立 → 正） */
+  div: [string, string, string];
+  neutralSeries: string;
+  /** 強調しない文脈線（過去の年度など） */
+  deemph: string;
+}
+
+const BLUE = {
+  100: '#cde2fb',
+  150: '#b7d3f6',
+  200: '#9ec5f4',
+  250: '#86b6ef',
+  300: '#6da7ec',
+  350: '#5598e7',
+  400: '#3987e5',
+  450: '#2a78d6',
+  500: '#256abf',
+  550: '#1c5cab',
+  600: '#184f95',
+  650: '#104281',
+  700: '#0d366b',
+};
+
+export const TOKENS: Record<ThemeName, Tokens> = {
+  light: {
+    page: '#f9f9f7',
+    surface: '#fcfcfb',
+    raised: '#ffffff',
+    ink: '#0b0b0b',
+    ink2: '#52514e',
+    // 軸ラベル等の補助テキスト（小さい文字でも 4.5:1 以上になる濃さ）
+    muted: '#6f6e69',
+    grid: '#e1e0d9',
+    axis: '#c3c2b7',
+    border: 'rgba(11,11,11,0.10)',
+    cat: ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#008300', '#4a3aa7', '#e34948'],
+    seq: [BLUE[100], BLUE[200], BLUE[300], BLUE[400], BLUE[500], BLUE[600], BLUE[700]],
+    ordinal: [BLUE[250], BLUE[300], BLUE[350], BLUE[400], BLUE[450], BLUE[500], BLUE[550], BLUE[600], BLUE[650], BLUE[700]],
+    div: ['#2a78d6', '#f0efec', '#e34948'],
+    neutralSeries: '#52514e',
+    deemph: '#c3c2b7',
+  },
+  dark: {
+    page: '#0d0d0d',
+    surface: '#1a1a19',
+    raised: '#242422',
+    ink: '#ffffff',
+    ink2: '#c3c2b7',
+    muted: '#9d9b94',
+    grid: '#2c2c2a',
+    axis: '#383835',
+    border: 'rgba(255,255,255,0.10)',
+    cat: ['#3987e5', '#d95926', '#199e70', '#c98500', '#d55181', '#008300', '#9085e9', '#e66767'],
+    seq: [BLUE[700], BLUE[600], BLUE[500], BLUE[400], BLUE[300], BLUE[200], BLUE[100]],
+    ordinal: [BLUE[600], BLUE[550], BLUE[500], BLUE[450], BLUE[400], BLUE[350], BLUE[300], BLUE[250], BLUE[200], BLUE[100]],
+    div: ['#3987e5', '#383835', '#e66767'],
+    neutralSeries: '#c3c2b7',
+    deemph: '#6b6a65',
+  },
+};
+
+/** 系列 → カテゴリ色スロット（-1 は無彩色） */
+const SERIES_SLOT: Record<SeriesKey, number> = {
+  system: -1,
+  tokyo: 0,
+  kansai: 1,
+  kyushu: 2,
+  hokkaido: 3,
+  tohoku: 4,
+  chubu: 5,
+  hokuriku: 6,
+  chugoku: 7,
+  shikoku: 7,
+  sellBid: 0,
+  buyBid: 1,
+  volume: -1,
+};
+
+export function seriesColor(key: SeriesKey, theme: ThemeName): string {
+  const slot = SERIES_SLOT[key];
+  return slot < 0 ? TOKENS[theme].neutralSeries : TOKENS[theme].cat[slot];
+}
+
+export function seriesDashed(key: SeriesKey): boolean {
+  return key === 'shikoku';
+}
+
+/** 0〜1 の位置で順序スケールの色を取る（n 本のとき均等に） */
+export function ordinalColors(n: number, theme: ThemeName): string[] {
+  const ramp = TOKENS[theme].ordinal;
+  if (n <= 1) return [ramp[ramp.length - 1]];
+  return Array.from({ length: n }, (_, i) => ramp[Math.round((i / (n - 1)) * (ramp.length - 1))]);
+}
+
+export const FONT_FAMILY =
+  'system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", "Yu Gothic UI", Meiryo, sans-serif';
+
+export type ThemeMode = 'auto' | ThemeName;
+const STORAGE_KEY = 'jepx-viewer:theme';
+
+export function loadThemeMode(): ThemeMode {
+  try {
+    const v = localStorage.getItem(STORAGE_KEY);
+    if (v === 'light' || v === 'dark' || v === 'auto') return v;
+  } catch {
+    /* ストレージが使えない環境では既定値 */
+  }
+  return 'auto';
+}
+
+export function saveThemeMode(mode: ThemeMode): void {
+  try {
+    localStorage.setItem(STORAGE_KEY, mode);
+  } catch {
+    /* 保存できなくても動作は継続 */
+  }
+}
+
+export function applyThemeMode(mode: ThemeMode): void {
+  if (mode === 'auto') delete document.documentElement.dataset.theme;
+  else document.documentElement.dataset.theme = mode;
+}
+
+export function effectiveTheme(mode: ThemeMode): ThemeName {
+  if (mode !== 'auto') return mode;
+  return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}

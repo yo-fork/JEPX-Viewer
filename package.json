@@ -1,0 +1,32 @@
+{
+  "name": "jepx-viewer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "JEPX（日本卸電力取引所）スポット市場の約定価格実績を多角的に可視化するビューア",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "fetch": "tsx scripts/fetch-jepx.ts",
+    "sample": "tsx scripts/make-sample-csv.ts"
+  },
+  "dependencies": {
+    "echarts": "^6.1.0"
+  },
+  "devDependencies": {
+    "@holiday-jp/holiday_jp": "^2.5.1",
+    "@types/node": "^24.0.0",
+    "iconv-lite": "^0.7.3",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "undici": "^8.11.0",
+    "vite": "^8.3.0",
+    "vitest": "^5.0.1"
+  }
+}
