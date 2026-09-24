@@ -4,18 +4,21 @@
  *   npm run build:single                    取得済みデータ（public/data）の全年度を埋め込む
  *   npm run build:single -- --from 2021     2021 年度以降だけ埋め込む
  *   npm run build:single -- --no-data       データを埋め込まない（各自が JEPX の CSV を読み込む）
+ *   npm run build:single -- --split         データを HTML に入れず、HTML と同じ場所の data フォルダに出力する（共有フォルダ向け）
  *
- * ファイルから直接開いたページでは、ブラウザは別ファイルのスクリプト・CSS・データを読み込まない。
+ * ファイルから直接開いたページでは、ブラウザは別ファイルのモジュールスクリプト・CSS を読み込まず、fetch も使えない。
  * そこで vite build の出力（dist/index.html と assets/ の JS・CSS）を 1 つの HTML にまとめ、
- * 年度ファイルは <script type="application/json"> として埋め込む（読み出しは src/lib/embedded.ts）。
- * CSP は埋め込んだスクリプト・スタイルのハッシュだけを許可し、通信はすべて禁止する。
+ * 年度ファイルは <script type="application/json"> として埋め込む（読み出しは src/lib/localData.ts）。
+ * --split では埋め込まず、jepxViewerData(…) を呼ぶだけの data/*.js として HTML の隣に書き出す
+ * （通常の <script src> なら、ファイルから開いたページでも同じフォルダから読み込める）。
+ * CSP は埋め込んだスクリプト・スタイルのハッシュ（--split ではローカルのファイルも）だけを許可し、通信はすべて禁止する。
  */
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { FY_FILE_FORMAT, MANIFEST_FORMAT, type Manifest } from '../src/lib/dataFile';
-import { EMBED_ATTR, EMBED_MANIFEST } from '../src/lib/embedded';
+import { dataScriptPath, EMBED_ATTR, LOCAL_MANIFEST, REGISTER_FN, SCRIPTS_META } from '../src/lib/localData';
 
 export interface SingleOptions {
   /** vite build の出力先 */
@@ -27,17 +30,20 @@ export interface SingleOptions {
   from?: number;
   to?: number;
   noData: boolean;
+  /** データを HTML に埋め込まず、出力先と同じ場所の data/ に書き出す */
+  split: boolean;
   log: (msg: string) => void;
 }
 
 export function defaultOptions(): SingleOptions {
-  return { dist: 'dist', data: 'public/data', out: 'dist-single/jepx-viewer.html', noData: false, log: (msg) => console.log(msg) };
+  return { dist: 'dist', data: 'public/data', out: 'dist-single/jepx-viewer.html', noData: false, split: false, log: (msg) => console.log(msg) };
 }
 
 const HELP = `使い方: npm run build:single -- [オプション]
   --from <年度>          埋め込む最初の年度（既定: 取得済みの全年度）
   --to <年度>            埋め込む最後の年度
   --no-data              データを埋め込まない（各自が JEPX の CSV を読み込んで使う）
+  --split                データを HTML と同じ場所の data フォルダに分けて出力する（共有フォルダ向け）
   --out <ファイル>       出力先（既定: dist-single/jepx-viewer.html）
   --data <ディレクトリ>  取得済みデータの場所（既定: public/data）
   --dist <ディレクトリ>  vite build の出力先（既定: dist）`;
@@ -66,6 +72,9 @@ export function parseArgs(argv: string[], base = defaultOptions()): SingleOption
       case '--no-data':
         o.noData = true;
         break;
+      case '--split':
+        o.split = true;
+        break;
       case '--out':
         o.out = next();
         break;
@@ -85,6 +94,7 @@ export function parseArgs(argv: string[], base = defaultOptions()): SingleOption
     }
   }
   if (o.from !== undefined && o.to !== undefined && o.from > o.to) throw new Error('--from が --to より後になっています');
+  if (o.split && o.noData) throw new Error('--split と --no-data は同時に指定できません');
   return o;
 }
 
@@ -107,11 +117,15 @@ export function cspHash(text: string): string {
   return `'sha256-${createHash('sha256').update(text, 'utf8').digest('base64')}'`;
 }
 
-/** 1 ファイル版の CSP。スクリプトとスタイルシートは埋め込んだものだけ、通信・外部の読み込みはすべて禁止 */
-export function singleFileCsp(scriptHash: string, styleHash: string): string {
+/**
+ * 1 ファイル版の CSP。スクリプトとスタイルシートは埋め込んだものだけ、通信・外部の読み込みはすべて禁止。
+ * @param localScripts data/*.js（HTML と同じ場所のファイル）の読み込みも許可する（--split）。ネット上のスクリプトは不可のまま
+ */
+export function singleFileCsp(scriptHash: string, styleHash: string, localScripts = false): string {
   return [
     "default-src 'none'",
-    `script-src ${scriptHash}`,
+    // file: はファイルから開いたとき、'self' は Web サーバーに置いたときの data/*.js
+    `script-src ${scriptHash}${localScripts ? " 'self' file:" : ''}`,
     // ECharts のツールチップやグラフの高さ指定が style 属性を使うので、属性は許可する。
     // <style> 要素は埋め込んだもの（ハッシュ）だけ（style-src-elem 非対応のブラウザは style-src に従う）
     "style-src 'unsafe-inline'",
@@ -131,16 +145,37 @@ function jsonBlock(file: string, value: unknown): string {
   return `<script type="application/json" ${EMBED_ATTR}="${file}">${JSON.stringify(value).replace(/</g, '\\u003c')}</script>\n`;
 }
 
-/** データ用の script 要素（データなしのときは manifest を null にして、1 ファイル版であることだけを示す） */
-export function embedBlocks(data: EmbeddedData | null): string {
-  if (!data) return jsonBlock(EMBED_MANIFEST, null);
-  const blocks = [jsonBlock(EMBED_MANIFEST, data.manifest)];
-  for (const f of data.manifest.files) {
+/** 年度ファイルを名前の順に（名前と中身がそろっていることを確かめてから）返す */
+function fyFiles(data: EmbeddedData): [string, unknown][] {
+  return data.manifest.files.map((f) => {
     if (!/^spot\/fy\d{4}\.json$/.test(f.file)) throw new Error(`年度ファイルの名前が不正です: ${f.file}`);
     if (!data.files.has(f.file)) throw new Error(`年度ファイルがありません: ${f.file}`);
-    blocks.push(jsonBlock(f.file, data.files.get(f.file)));
+    return [f.file, data.files.get(f.file)];
+  });
+}
+
+/** データ用の script 要素（データなしのときは manifest を null にして、1 ファイル版であることだけを示す） */
+export function embedBlocks(data: EmbeddedData | null): string {
+  if (!data) return jsonBlock(LOCAL_MANIFEST, null);
+  return [jsonBlock(LOCAL_MANIFEST, data.manifest), ...fyFiles(data).map(([file, json]) => jsonBlock(file, json))].join('');
+}
+
+/** data/*.js の中身（JSON は JavaScript の式としてそのまま書ける） */
+export function dataScript(file: string, json: unknown): string {
+  return `${REGISTER_FN}(${JSON.stringify(file)}, ${JSON.stringify(json)});\n`;
+}
+
+/** HTML と同じ場所に data/*.js を書き出し、合計バイト数を返す。一覧（manifest.js）は年度ファイルをそろえてから最後に書く */
+async function writeDataScripts(htmlDir: string, data: EmbeddedData): Promise<number> {
+  let bytes = 0;
+  for (const [file, json] of [...fyFiles(data), [LOCAL_MANIFEST, data.manifest] as [string, unknown]]) {
+    const out = path.join(htmlDir, dataScriptPath(file));
+    const text = dataScript(file, json);
+    await mkdir(path.dirname(out), { recursive: true });
+    await writeFile(out, text);
+    bytes += Buffer.byteLength(text);
   }
-  return blocks.join('');
+  return bytes;
 }
 
 const attr = (attrs: string, name: string) => new RegExp(`\\b${name}="([^"]*)"`).exec(attrs)?.[1];
@@ -148,8 +183,14 @@ const attr = (attrs: string, name: string) => new RegExp(`\\b${name}="([^"]*)"`)
 /**
  * vite build の index.html に JS・CSS・データを埋め込み、CSP を 1 ファイル版のものに差し替える。
  * @param readAsset index.html からの相対パスで JS・CSS を読む
+ * @param data 埋め込むデータ（null はデータなし）。'scripts' のときは埋め込まず、HTML と同じ場所の data/*.js から読む
  */
-export async function assembleHtml(indexHtml: string, readAsset: (rel: string) => Promise<string>, data: EmbeddedData | null): Promise<string> {
+export async function assembleHtml(
+  indexHtml: string,
+  readAsset: (rel: string) => Promise<string>,
+  data: EmbeddedData | null | 'scripts',
+): Promise<string> {
+  const split = data === 'scripts';
   // 公開用の CSP は外す（1 ファイル版の CSP に差し替える）
   const base = indexHtml.replace(/<meta http-equiv="Content-Security-Policy"[^>]*>\s*/, () => '');
   if (/<link\b[^>]*\brel="modulepreload"/.test(base)) throw new Error('分割されたスクリプト（modulepreload）には対応していません');
@@ -169,15 +210,19 @@ export async function assembleHtml(indexHtml: string, readAsset: (rel: string) =
   const js = escapeInlineScript(lf(await readAsset(src)));
   const css = lf(await readAsset(href));
   if (/<\/style/i.test(css)) throw new Error('CSS に </style が含まれているため埋め込めません');
-  const csp = singleFileCsp(cspHash(js), cspHash(css));
+  const csp = singleFileCsp(cspHash(js), cspHash(css), split);
 
   // 差し込む位置はすべて元の index.html で決め、後ろから差し込む。埋め込んだ JS・データの中身に
   // </body> などの文字列や置き換えで意味を持つ $& があっても、位置や内容がずれない。
   const edits = [
-    { at: headEnd, end: headEnd, text: `\n    <meta http-equiv="Content-Security-Policy" content="${csp}">` },
+    {
+      at: headEnd,
+      end: headEnd,
+      text: `\n    <meta http-equiv="Content-Security-Policy" content="${csp}">${split ? `\n    <meta name="${SCRIPTS_META}" content="data/">` : ''}`,
+    },
     { at: script.index, end: script.index + script[0].length, text: `<script type="module">${js}</script>` },
     { at: sheet.index, end: sheet.index + sheet[0].length, text: `<style>${css}</style>` },
-    { at: bodyEnd, end: bodyEnd, text: embedBlocks(data) },
+    { at: bodyEnd, end: bodyEnd, text: split ? '' : embedBlocks(data) },
     // 同じ位置なら置き換えを先に、その前への差し込みを後にする
   ].sort((a, b) => b.at - a.at || b.end - a.end);
   let html = base;
@@ -202,10 +247,12 @@ async function loadData(o: SingleOptions): Promise<EmbeddedData> {
     if (json?.format !== FY_FILE_FORMAT) throw new Error(`${f.file} の形式が不正です`);
     files.set(f.file, json);
   }
-  return { manifest: { ...manifest, files: entries }, files };
+  // 手元の CSV から作ったデータの取得元（local:フォルダのパス）には作った人の PC のフォルダ名が入るので、配るファイルには入れない
+  const source = manifest.source?.startsWith('local:') ? 'local' : manifest.source;
+  return { manifest: { ...manifest, source, files: entries }, files };
 }
 
-export async function buildSingle(o: SingleOptions): Promise<{ bytes: number; data: EmbeddedData | null }> {
+export async function buildSingle(o: SingleOptions): Promise<{ bytes: number; dataBytes: number; data: EmbeddedData | null }> {
   const indexHtml = await readFile(path.join(o.dist, 'index.html'), 'utf8').catch(() => {
     throw new Error(`${path.join(o.dist, 'index.html')} がありません。先に npm run build を実行してください`);
   });
@@ -216,16 +263,24 @@ export async function buildSingle(o: SingleOptions): Promise<{ bytes: number; da
     return readFile(file, 'utf8');
   };
   const data = o.noData ? null : await loadData(o);
-  const html = await assembleHtml(indexHtml, readAsset, data);
-  await mkdir(path.dirname(o.out), { recursive: true });
+  const html = await assembleHtml(indexHtml, readAsset, o.split ? 'scripts' : data);
+  const htmlDir = path.dirname(o.out);
+  await mkdir(htmlDir, { recursive: true });
+  // data/*.js を先に書く（HTML を開いたときにデータがそろっているように）
+  const dataBytes = o.split && data ? await writeDataScripts(htmlDir, data) : 0;
   await writeFile(o.out, html);
   const bytes = Buffer.byteLength(html);
   const files = data?.manifest.files ?? [];
   const range = files.length
     ? `${files[0].fy}〜${files[files.length - 1].fy} 年度（${files[0].firstDate}〜${files[files.length - 1].lastDate}）`
     : 'データなし';
-  o.log(`1 ファイル版を作成しました: ${o.out}（${(bytes / 1024 / 1024).toFixed(1)} MB、${range}）`);
-  return { bytes, data };
+  const mb = (n: number) => `${(n / 1024 / 1024).toFixed(1)} MB`;
+  o.log(
+    o.split
+      ? `作成しました: ${o.out}（${mb(bytes)}）と ${path.join(htmlDir, 'data')}（${mb(dataBytes)}、${range}）。2 つは同じ場所に置いてください`
+      : `1 ファイル版を作成しました: ${o.out}（${mb(bytes)}、${range}）`,
+  );
+  return { bytes, dataBytes, data };
 }
 
 // CLI として実行されたとき

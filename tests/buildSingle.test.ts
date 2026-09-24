@@ -3,12 +3,12 @@ import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { assembleHtml, buildSingle, defaultOptions, escapeInlineScript, parseArgs, type EmbeddedData } from '../scripts/build-single';
+import { assembleHtml, buildSingle, dataScript, defaultOptions, escapeInlineScript, parseArgs, type EmbeddedData } from '../scripts/build-single';
 import { writeManifest } from '../scripts/fetch-jepx';
 import { decodeFyFile, encodeFyFile, MANIFEST_FORMAT, type Manifest } from '../src/lib/dataFile';
 import { dayFromYmd } from '../src/lib/dates';
 import { generateDemoDays } from '../src/lib/demo';
-import { isSingleFile, readEmbedded } from '../src/lib/embedded';
+import { dataScriptPath, isDataFile, loadDataScript, localDataMode, readEmbedded, REGISTER_FN } from '../src/lib/localData';
 
 /** vite build が出力する index.html と同じ形 */
 const INDEX_HTML = `<!doctype html>
@@ -128,6 +128,19 @@ describe('assembleHtml', () => {
     expect(blocks(html).map((b) => b.file)).toEqual(['manifest.json', 'spot/fy2023.json', 'spot/fy2024.json']);
   });
 
+  it('--split（scripts）ではデータを埋め込まず、data/*.js だけを追加で許可する', async () => {
+    const html = await assembleHtml(INDEX_HTML, readAsset, 'scripts');
+    expect(blocks(html)).toEqual([]);
+    expect(html).toContain('<meta name="jepx-viewer-data" content="data/">');
+    const csp = cspOf(html);
+    expect(csp).toContain(`script-src 'sha256-${sha(inlineScript(html)!)}' 'self' file:`);
+    expect(csp).toContain("default-src 'none'");
+    expect(csp).not.toContain('strict-dynamic');
+    // 目印は CSP の後ろ（head の中）
+    expect(html.indexOf('jepx-viewer-data')).toBeGreaterThan(html.indexOf('Content-Security-Policy'));
+    expect(html.indexOf('jepx-viewer-data')).toBeLessThan(html.indexOf('</head>'));
+  });
+
   it('データなしでは manifest を null にする', async () => {
     const html = await assembleHtml(INDEX_HTML, readAsset, null);
     expect(blocks(html)).toEqual([{ file: 'manifest.json', json: null }]);
@@ -157,6 +170,9 @@ describe('parseArgs', () => {
     expect(() => parseArgs(['--from', '2024', '--to', '2023'])).toThrow(/--from/);
     expect(() => parseArgs(['--bogus'])).toThrow(/不明なオプション/);
     expect(() => parseArgs(['--out'])).toThrow(/値がありません/);
+    expect(parseArgs(['--split']).split).toBe(true);
+    expect(d.split).toBe(false);
+    expect(() => parseArgs(['--split', '--no-data'])).toThrow(/同時に指定できません/);
   });
 });
 
@@ -173,7 +189,7 @@ describe('buildSingle', () => {
     const days2023 = generateDemoDays(dayFromYmd(2023, 4, 1), dayFromYmd(2023, 4, 3), 1);
     await writeFile(path.join(dir, 'data', 'spot', 'fy2023.json'), JSON.stringify(encodeFyFile(2023, days2023)));
     await writeFile(path.join(dir, 'data', 'spot', 'fy2024.json'), JSON.stringify(encodeFyFile(2024, days2024)));
-    await writeManifest(path.join(dir, 'data'), 'test');
+    await writeManifest(path.join(dir, 'data'), 'local:/home/someone/Downloads/csv');
   });
   afterAll(async () => {
     await rm(dir, { recursive: true, force: true });
@@ -193,9 +209,33 @@ describe('buildSingle', () => {
     const got = blocks(html);
     expect(got.map((b) => b.file)).toEqual(['manifest.json', 'spot/fy2024.json']);
     expect((got[0].json as Manifest).files.map((f) => f.fy)).toEqual([2024]);
+    // 作った人の PC のフォルダ名は配るファイルに入れない
+    expect((got[0].json as Manifest).source).toBe('local');
+    expect(html).not.toContain('/home/someone');
     const decoded = decodeFyFile(got[1].json);
     expect([...decoded.keys()]).toEqual([...days2024.keys()]);
     expect([...decoded.get(dayFromYmd(2024, 4, 2))!]).toEqual([...days2024.get(dayFromYmd(2024, 4, 2))!]);
+  });
+
+  it('--split では HTML の隣に data/*.js を書き、それぞれが jepxViewerData(名前, JSON) を呼ぶ', async () => {
+    const out = path.join(dir, 'share', 'viewer.html');
+    const { bytes, dataBytes } = await buildSingle(opts({ split: true, out }));
+    const html = await readFile(out, 'utf8');
+    expect(blocks(html)).toEqual([]);
+    expect(html).toContain('name="jepx-viewer-data"');
+    expect(dataBytes).toBeGreaterThan(0);
+    expect(bytes).toBe(Buffer.byteLength(html));
+    const calls: [string, unknown][] = [];
+    const run = async (rel: string) => {
+      const src = await readFile(path.join(dir, 'share', rel), 'utf8');
+      Function(REGISTER_FN, src)((name: string, json: unknown) => calls.push([name, json]));
+    };
+    await run('data/manifest.js');
+    await run('data/spot/fy2023.js');
+    await run('data/spot/fy2024.js');
+    expect(calls.map((c) => c[0])).toEqual(['manifest.json', 'spot/fy2023.json', 'spot/fy2024.json']);
+    expect((calls[0][1] as Manifest).files.map((f) => f.file)).toEqual(['spot/fy2023.json', 'spot/fy2024.json']);
+    expect([...decodeFyFile(calls[2][1]).keys()]).toEqual([...days2024.keys()]);
   });
 
   it('--no-data ではデータを読まない。データが無ければ取得方法を案内する', async () => {
@@ -207,19 +247,72 @@ describe('buildSingle', () => {
   });
 });
 
-describe('embedded（ブラウザ側の読み出し）', () => {
-  const fakeDoc = (items: { file: string; text: string }[]) =>
-    ({ querySelectorAll: () => items.map((i) => ({ getAttribute: () => i.file, textContent: i.text })) }) as unknown as Document;
+describe('localData（ブラウザ側の読み出し）', () => {
+  const fakeDoc = (items: { file: string; text: string }[], meta = false) =>
+    ({
+      querySelectorAll: () => items.map((i) => ({ getAttribute: () => i.file, textContent: i.text })),
+      querySelector: (sel: string) => (meta && sel.startsWith('meta') ? {} : null),
+    }) as unknown as Document;
 
-  it('manifest の有無で 1 ファイル版かを判定し、埋め込んだ JSON を読む', () => {
-    expect(isSingleFile(fakeDoc([]))).toBe(false);
+  it('渡し方（埋め込み・data/*.js・通常の Web 版）を判定し、埋め込んだ JSON を読む', () => {
+    expect(localDataMode(fakeDoc([]))).toBeNull();
+    expect(localDataMode(fakeDoc([], true))).toBe('scripts');
     const doc = fakeDoc([
       { file: 'manifest.json', text: 'null' },
       { file: 'spot/fy2024.json', text: '{"fy":2024,"s":"\\u003c/script>"}' },
     ]);
-    expect(isSingleFile(doc)).toBe(true);
+    expect(localDataMode(doc)).toBe('inline');
     expect(readEmbedded('manifest.json', doc)).toBeNull();
     expect(readEmbedded('spot/fy2024.json', doc)).toEqual({ fy: 2024, s: '</script>' });
     expect(() => readEmbedded('spot/fy2020.json', doc)).toThrow(/ありません/);
+  });
+
+  it('data/ の外や別のサイトを指す名前は読まない', () => {
+    expect(dataScriptPath('manifest.json')).toBe('data/manifest.js');
+    expect(dataScriptPath('spot/fy2024.json')).toBe('data/spot/fy2024.js');
+    for (const bad of ['../secret.json', 'spot/../../x.json', 'https://example.com/x.json', '//example.com/x.json', 'spot/fy2024.js', 'spot/fy24.json']) {
+      expect(isDataFile(bad)).toBe(false);
+      expect(() => dataScriptPath(bad)).toThrow(/不正/);
+    }
+  });
+
+  /** <script> を追加すると、files にある中身を実行して onload（無ければ onerror）を呼ぶ document */
+  const scriptDoc = (files: Record<string, string>) => {
+    const loaded: string[] = [];
+    const doc = {
+      baseURI: 'file:///share/jepx/viewer.html',
+      createElement: () => ({ remove: () => {} }),
+      head: {
+        append: (el: { src: string; onload: () => void; onerror: () => void }) => {
+          loaded.push(el.src);
+          const rel = el.src.replace('file:///share/jepx/', '').replace(/\?.*$/, '');
+          queueMicrotask(() => {
+            if (!(rel in files)) return el.onerror();
+            Function(files[rel])();
+            el.onload();
+          });
+        },
+      },
+    } as unknown as Document;
+    return { doc, loaded };
+  };
+
+  it('data/*.js を読み込み、jepxViewerData に渡されたデータを返す', async () => {
+    const fy = { format: 'jepx-viewer/spot-fy@1', fy: 2024, s: '\u2028</script>' };
+    const { doc, loaded } = scriptDoc({
+      'data/spot/fy2024.js': dataScript('spot/fy2024.json', fy),
+      'data/manifest.js': dataScript('manifest.json', MANIFEST),
+      // 名前の違うデータを登録するだけのファイル
+      'data/spot/fy2023.js': dataScript('spot/fy2022.json', {}),
+    });
+    await expect(loadDataScript('spot/fy2024.json', 'v=2026-09-24', doc)).resolves.toEqual(fy);
+    await expect(loadDataScript('manifest.json', '', doc)).resolves.toEqual(MANIFEST);
+    expect(loaded[0]).toBe('file:///share/jepx/data/spot/fy2024.js?v=2026-09-24');
+    await expect(loadDataScript('spot/fy2023.json', '', doc)).rejects.toThrow(/形式が不正/);
+    await expect(loadDataScript('spot/fy2021.json', '', doc)).rejects.toThrow(/読み込めませんでした/);
+    // 不正な名前はスクリプトを追加せずに失敗する
+    const before = loaded.length;
+    await expect(loadDataScript('../x.json', '', doc)).rejects.toThrow(/不正/);
+    expect(loaded).toHaveLength(before);
   });
 });

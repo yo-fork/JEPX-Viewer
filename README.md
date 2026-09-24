@@ -4,7 +4,7 @@ JEPX（日本卸電力取引所）**スポット市場の約定価格実績**を
 
 - JEPX が公開している年度別 CSV（`spot_summary_YYYY.csv`）をそのまま読み込めます（Shift_JIS / UTF-8 自動判定）
 - `npm run fetch` で全年度のデータを自動取得し、起動時に読み込むこともできます
-- `npm run build:single` で、ダブルクリックで開ける 1 ファイル版（HTML 1 つ）も作れます。共有フォルダなどで配れます
+- `npm run build:single` で、ダブルクリックで開ける 1 ファイル版（HTML 1 つ）も作れます。共有フォルダなどで配れ、データを別のフォルダに分けてデータだけを更新することもできます
 - すべての処理はブラウザ内で完結し、読み込んだデータは外部に送信しません
 - 絞り込み条件・表示中のタブは URL に保存されるので、同じ切り口をリンクで共有できます
 
@@ -104,6 +104,7 @@ npm run build:single   # dist-single/jepx-viewer.html に出力
 | --- | --- |
 | `--from <年度>` / `--to <年度>` | 埋め込む年度の範囲（既定: 取得済みの全年度） |
 | `--no-data` | データを埋め込まない（各自が JEPX の CSV を読み込んで使う） |
+| `--split` | データを HTML に入れず、HTML と同じ場所の `data` フォルダに分けて出力する（下記） |
 | `--out <ファイル>` | 出力先（既定: `dist-single/jepx-viewer.html`） |
 
 例: `npm run build:single -- --from 2021`
@@ -112,6 +113,25 @@ npm run build:single   # dist-single/jepx-viewer.html に出力
 - データは作成した時点のものです。最新にするには作り直して配り直します。今年度の CSV を各自が読み込んで最新にすることもできます（読み込んだ CSV の値が優先されます）。
 - 1 ファイル版は外部と一切通信しません（CSP で通信と外部からの読み込みを禁止しています）。
 - データを埋め込んだファイルを社内で配る場合も、JEPX の利用条件と社内のルールを確認してください。
+
+#### データを別のフォルダに分ける（共有フォルダ向け）
+
+`--split` を付けると、データを HTML に入れず、HTML と同じ場所の `data` フォルダに出力します。データを更新するときは `data` フォルダを差し替えるだけで済み、見る人はページを開き直せば最新のデータになります。開いたときに読み込むのは表示している期間の年度だけなので、全年度を置いても速く開けます。
+
+```sh
+npm run fetch
+npm run build:single -- --split
+```
+
+```
+dist-single/
+  jepx-viewer.html     見る人はこれを開く（アプリを更新したときだけ差し替える）
+  data/                データ（manifest.js と年度ごとの spot/fyYYYY.js）
+```
+
+- HTML と `data` フォルダは、同じ場所に並べて置いてください。
+- `--out` に共有フォルダの場所を指定すると、そこへ直接書き込めます（例: `npm run build:single -- --split --out "\\server\share\JEPX\jepx-viewer.html"`）。`npm run fetch` とこのコマンドを Windows のタスク スケジューラなどで定期的に実行すれば、毎日の更新も自動化できます。
+- ファイルから開いたページは JSON を読めないため、データは数値の一覧を登録するだけの JavaScript ファイル（.js）にしています。`data` フォルダの中身もブラウザで実行されるので、共有フォルダは更新する人だけが書き込めるようにしてください（HTML も同じです）。読み込むのは `data` フォルダの決まった名前のファイルだけで、ネット上のスクリプトや通信は CSP で禁止しています。
 
 ## 集計の定義
 
@@ -142,7 +162,7 @@ npm run sample      # 動作確認用の合成 CSV（JEPX と同じ列構成・S
 ```
 scripts/
   fetch-jepx.ts        JEPX からの取得と public/data への変換
-  build-single.ts      1 ファイル版（HTML 1 つ）の作成
+  build-single.ts      ファイルで配る版（HTML 1 つ、または HTML と data フォルダ）の作成
   make-sample-csv.ts   合成サンプル CSV の生成
 src/
   lib/                 データ処理（CSV 解析、祝日、選択・集計、データ形式、デモデータ）

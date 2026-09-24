@@ -4,7 +4,7 @@
 import { decodeFyFile, MANIFEST_FORMAT, type Manifest, type ManifestEntry } from './lib/dataFile';
 import { fiscalYearEnd, fiscalYearOfDay, fiscalYearStart, formatDay, parseDateString, todayJst } from './lib/dates';
 import { generateDemoDays } from './lib/demo';
-import { EMBED_MANIFEST, isSingleFile, readEmbedded } from './lib/embedded';
+import { LOCAL_MANIFEST, loadDataScript, localDataMode, readEmbedded } from './lib/localData';
 import { decodeCsvBytes } from './lib/encoding';
 import { fmtNum } from './lib/format';
 import { parseSpotCsv } from './lib/jepxCsv';
@@ -19,8 +19,11 @@ import type { AppApi, View, ViewContext } from './views/base';
 import { createView } from './views';
 
 const DATA_BASE = new URL('data/', document.baseURI);
-/** 1 ファイル版（npm run build:single）: データは data/ から取得せず、HTML に埋め込んだものを使う */
-const SINGLE_FILE = isSingleFile();
+/**
+ * ファイルから開いて使う版（npm run build:single）: データは fetch で取得せず、HTML に埋め込んだもの（inline）か、
+ * HTML と同じ場所の data/*.js（scripts）を使う。通常の Web 版は null
+ */
+const LOCAL_DATA = localDataMode();
 const JEPX_SPOT_URL = 'https://www.jepx.jp/electricpower/market-data/spot/';
 const RETRY_AFTER_MS = 30_000;
 
@@ -332,9 +335,12 @@ export class App implements AppApi {
   private async loadManifest(): Promise<void> {
     try {
       let json: Manifest | null;
-      if (SINGLE_FILE) {
+      if (LOCAL_DATA === 'inline') {
         // データなしで作った 1 ファイル版では null
-        json = readEmbedded(EMBED_MANIFEST) as Manifest | null;
+        json = readEmbedded(LOCAL_MANIFEST) as Manifest | null;
+      } else if (LOCAL_DATA === 'scripts') {
+        // 一覧はデータを更新するたびに変わるので、毎回読み直す
+        json = (await loadDataScript(LOCAL_MANIFEST, `t=${Date.now()}`)) as Manifest;
       } else {
         const res = await fetch(new URL('manifest.json', DATA_BASE), { cache: 'no-cache' });
         if (!res.ok) return;
@@ -344,6 +350,9 @@ export class App implements AppApi {
       this.manifest = json;
     } catch {
       // 取得済みデータが無い（npm run fetch 未実行）場合はここに来る
+      if (LOCAL_DATA === 'scripts') {
+        this.toast('データ（data フォルダ）を読み込めませんでした。この HTML ファイルと同じ場所に data フォルダがあるか確認してください。', 'error');
+      }
     }
   }
 
@@ -383,9 +392,11 @@ export class App implements AppApi {
     return p;
   }
 
-  /** 年度ファイルの JSON（1 ファイル版は埋め込んだもの、通常は data/ から取得） */
+  /** 年度ファイルの JSON（ファイルから開いて使う版は埋め込んだものか data/*.js、通常は data/ から取得） */
   private async readFy(entry: ManifestEntry): Promise<unknown> {
-    if (SINGLE_FILE) return readEmbedded(entry.file);
+    if (LOCAL_DATA === 'inline') return readEmbedded(entry.file);
+    // データを更新したら（取得日時が変わったら）読み直す
+    if (LOCAL_DATA === 'scripts') return loadDataScript(entry.file, `v=${encodeURIComponent(this.manifest?.generatedAt ?? '')}`);
     const url = new URL(entry.file, DATA_BASE);
     url.searchParams.set('v', this.manifest?.generatedAt ?? '');
     const res = await fetch(url);
@@ -475,8 +486,8 @@ export class App implements AppApi {
           ),
           h('button', { type: 'button', class: 'btn btn-primary', onclick: () => this.fileInput.click() }, 'CSV ファイルを選択'),
         ),
-        // 1 ファイル版を受け取った人はリポジトリを持っていないので、取得コマンドの案内は出さない
-        SINGLE_FILE
+        // ファイルで受け取った人はリポジトリを持っていないので、取得コマンドの案内は出さない
+        LOCAL_DATA
           ? null
           : h(
               'div',
