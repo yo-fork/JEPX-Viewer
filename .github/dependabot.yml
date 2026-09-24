@@ -10,6 +10,10 @@ updates:
     # 公開から 7 日未満の版は提案しない（乗っ取られたパッケージに不正な版が出ても、多くは数日のうちに見つかり取り下げられる）
     cooldown:
       default-days: 7
+    ignore:
+      # 型定義は対応する Node.js（README の「必要なもの」）に合わせるので、新しい Node.js 向けのメジャー更新は提案しない
+      - dependency-name: '@types/node'
+        update-types: ['version-update:semver-major']
     groups:
       # マイナー・パッチ更新は 1 つの PR にまとめる（メジャー更新は互換性の確認が要るので個別の PR）
       npm-minor-and-patch:
