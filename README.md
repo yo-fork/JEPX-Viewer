@@ -86,6 +86,8 @@ npm run preview  # ビルド結果の確認
 
 `npm run fetch` 済みであれば、`dist/data/` に価格データも含まれます。GitHub Pages には `.github/workflows/pages.yml`（手動実行）でデプロイできます。リポジトリの Settings → Pages → Source を「GitHub Actions」にしてから、Actions タブで「Deploy to GitHub Pages」を実行してください。`include_data` をオンにするとビルド時に JEPX からデータを取得して含めます。
 
+公開用ビルドには、スクリプト・通信・画像などの読み込み元を同じサイト内に限る CSP（Content Security Policy）を `<meta>` タグで入れています（設定は `vite.config.ts`。開発サーバーには入れていません）。
+
 > **公開時の注意**: JEPX が公開するデータの利用・再配布については、JEPX の利用条件をご確認ください。価格データを含めずに公開した場合でも、閲覧者が各自ダウンロードした CSV を読み込んで使えます。
 
 ## 集計の定義
@@ -111,6 +113,8 @@ npm test            # 単体テスト（CSV 解析・祝日判定・集計・取
 npm run typecheck   # 型チェック
 npm run sample      # 動作確認用の合成 CSV（JEPX と同じ列構成・Shift_JIS）を samples/ に作成
 ```
+
+依存パッケージと GitHub Actions の新しい版は、Dependabot が毎月まとめて PR で知らせます（`.github/dependabot.yml`。公開から 7 日未満の版は提案しません）。
 
 ```
 scripts/

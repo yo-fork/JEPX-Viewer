@@ -1,0 +1,28 @@
+# 依存パッケージ（npm）と GitHub Actions の新しい版を、毎月まとめて PR で知らせる。
+# 脆弱性の修正はこれとは別に、リポジトリの Settings で Dependabot alerts / security updates を有効にすると随時届く。
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    target-branch: main
+    schedule:
+      interval: monthly
+    # 公開から 7 日未満の版は提案しない（乗っ取られたパッケージに不正な版が出ても、多くは数日のうちに見つかり取り下げられる）
+    cooldown:
+      default-days: 7
+    groups:
+      # マイナー・パッチ更新は 1 つの PR にまとめる（メジャー更新は互換性の確認が要るので個別の PR）
+      npm-minor-and-patch:
+        patterns: ['*']
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: main
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns: ['*']
