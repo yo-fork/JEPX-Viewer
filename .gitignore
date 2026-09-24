@@ -1,5 +1,7 @@
 node_modules/
 dist/
+# npm run build:single で作る 1 ファイル版（データを埋め込むことがあるので、リポジトリには含めない）
+dist-single/
 # npm run fetch で取得したデータ（JEPX 公開データ。リポジトリには含めない）
 public/data/
 # npm run sample で生成する合成サンプル CSV

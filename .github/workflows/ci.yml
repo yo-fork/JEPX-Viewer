@@ -23,3 +23,5 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+      # 実際のビルド結果から 1 ファイル版を作れること（Vite の出力形式が変わったときに気づけるように）
+      - run: npx tsx scripts/build-single.ts --no-data

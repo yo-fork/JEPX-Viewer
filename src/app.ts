@@ -4,6 +4,7 @@
 import { decodeFyFile, MANIFEST_FORMAT, type Manifest, type ManifestEntry } from './lib/dataFile';
 import { fiscalYearEnd, fiscalYearOfDay, fiscalYearStart, formatDay, parseDateString, todayJst } from './lib/dates';
 import { generateDemoDays } from './lib/demo';
+import { EMBED_MANIFEST, isSingleFile, readEmbedded } from './lib/embedded';
 import { decodeCsvBytes } from './lib/encoding';
 import { fmtNum } from './lib/format';
 import { parseSpotCsv } from './lib/jepxCsv';
@@ -18,6 +19,8 @@ import type { AppApi, View, ViewContext } from './views/base';
 import { createView } from './views';
 
 const DATA_BASE = new URL('data/', document.baseURI);
+/** 1 ファイル版（npm run build:single）: データは data/ から取得せず、HTML に埋め込んだものを使う */
+const SINGLE_FILE = isSingleFile();
 const JEPX_SPOT_URL = 'https://www.jepx.jp/electricpower/market-data/spot/';
 const RETRY_AFTER_MS = 30_000;
 
@@ -328,9 +331,15 @@ export class App implements AppApi {
 
   private async loadManifest(): Promise<void> {
     try {
-      const res = await fetch(new URL('manifest.json', DATA_BASE), { cache: 'no-cache' });
-      if (!res.ok) return;
-      const json = (await res.json()) as Manifest;
+      let json: Manifest | null;
+      if (SINGLE_FILE) {
+        // データなしで作った 1 ファイル版では null
+        json = readEmbedded(EMBED_MANIFEST) as Manifest | null;
+      } else {
+        const res = await fetch(new URL('manifest.json', DATA_BASE), { cache: 'no-cache' });
+        if (!res.ok) return;
+        json = (await res.json()) as Manifest;
+      }
       if (json?.format !== MANIFEST_FORMAT || !Array.isArray(json.files) || json.files.length === 0) return;
       this.manifest = json;
     } catch {
@@ -358,13 +367,7 @@ export class App implements AppApi {
   private loadFy(entry: ManifestEntry): Promise<void> {
     let p = this.loading.get(entry.fy);
     if (!p) {
-      const url = new URL(entry.file, DATA_BASE);
-      url.searchParams.set('v', this.manifest?.generatedAt ?? '');
-      p = fetch(url)
-        .then((res) => {
-          if (!res.ok) throw new Error(`HTTP ${res.status}`);
-          return res.json();
-        })
+      p = this.readFy(entry)
         .then((json) => {
           this.store.addDays(decodeFyFile(json), 'bundled');
           this.loaded.add(entry.fy);
@@ -378,6 +381,16 @@ export class App implements AppApi {
       this.loading.set(entry.fy, p);
     }
     return p;
+  }
+
+  /** 年度ファイルの JSON（1 ファイル版は埋め込んだもの、通常は data/ から取得） */
+  private async readFy(entry: ManifestEntry): Promise<unknown> {
+    if (SINGLE_FILE) return readEmbedded(entry.file);
+    const url = new URL(entry.file, DATA_BASE);
+    url.searchParams.set('v', this.manifest?.generatedAt ?? '');
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
   }
 
   private async importFiles(files: File[]): Promise<void> {
@@ -462,13 +475,16 @@ export class App implements AppApi {
           ),
           h('button', { type: 'button', class: 'btn btn-primary', onclick: () => this.fileInput.click() }, 'CSV ファイルを選択'),
         ),
-        h(
-          'div',
-          { class: 'empty-option' },
-          h('h3', null, 'データを自動取得する'),
-          h('p', null, 'リポジトリで次のコマンドを実行すると、JEPX から全年度の CSV を取得して public/data/ に保存し、起動時に自動で読み込みます。'),
-          h('pre', { class: 'code' }, 'npm run fetch\nnpm run dev'),
-        ),
+        // 1 ファイル版を受け取った人はリポジトリを持っていないので、取得コマンドの案内は出さない
+        SINGLE_FILE
+          ? null
+          : h(
+              'div',
+              { class: 'empty-option' },
+              h('h3', null, 'データを自動取得する'),
+              h('p', null, 'リポジトリで次のコマンドを実行すると、JEPX から全年度の CSV を取得して public/data/ に保存し、起動時に自動で読み込みます。'),
+              h('pre', { class: 'code' }, 'npm run fetch\nnpm run dev'),
+            ),
         h(
           'div',
           { class: 'empty-option' },
