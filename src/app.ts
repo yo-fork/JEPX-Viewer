@@ -1,6 +1,7 @@
 /**
  * アプリ本体：画面の骨組み、データの読み込み（取得済みデータ・CSV・デモ）、状態管理と描画の制御。
  */
+import { COMPARE_DAYS, CurveStore } from './lib/curveStore';
 import { decodeFyFile, MANIFEST_FORMAT, type Manifest, type ManifestEntry } from './lib/dataFile';
 import { fiscalYearEnd, fiscalYearOfDay, fiscalYearStart, formatDay, parseDateString, todayJst } from './lib/dates';
 import { generateDemoDays } from './lib/demo';
@@ -31,6 +32,8 @@ export class App implements AppApi {
   private state: AppState;
   private readonly store = new DataStore();
   private manifest: Manifest | null = null;
+  /** 入札カーブ（取得済みデータか、デモの合成データ） */
+  private curves: CurveStore | null = null;
   private readonly loaded = new Set<number>();
   /** 読み込みに失敗した年度 → 失敗した時刻 */
   private readonly failed = new Map<number, number>();
@@ -206,10 +209,12 @@ export class App implements AppApi {
 
     // 概要タブは前年同期との比較に 1 年前のデータも使う
     const pending = this.ensureLoaded(this.state.tab === 'overview' ? range.from - 366 : range.from, range.to);
-    if (pending) {
+    // 入札カーブのタブは、選んだ日（比較する日を含む）のカーブと期間の指標も読み込んでから描く
+    const curvesPending = this.state.tab === 'curves' ? this.prepareCurves(range) : null;
+    if (pending || curvesPending) {
       this.viewHost.classList.add('is-loading');
       this.filterBar.setStatus('データを読み込み中…');
-      await pending;
+      await Promise.all([pending, curvesPending]);
       if (seq !== this.renderSeq) return;
     }
     // 追い越された古い render が読み込み表示を残していても、ここで必ず解除する
@@ -229,7 +234,7 @@ export class App implements AppApi {
       slotStart: this.state.slotStart,
       slotEnd: this.state.slotEnd,
     });
-    const ctx: ViewContext = { app: this, state: this.state, ds, sel, theme: this.theme, extent };
+    const ctx: ViewContext = { app: this, state: this.state, ds, sel, theme: this.theme, extent, curves: this.curves };
     const key = `${this.state.tab}|${this.theme}`;
     try {
       if (!this.view || this.viewKey !== key) {
@@ -348,6 +353,7 @@ export class App implements AppApi {
       }
       if (json?.format !== MANIFEST_FORMAT || !Array.isArray(json.files) || json.files.length === 0) return;
       this.manifest = json;
+      if (json.curves) this.curves = CurveStore.fromIndex(json.curves, (file) => this.readData(file));
     } catch {
       // 取得済みデータが無い（npm run fetch 未実行）場合はここに来る
       if (LOCAL_DATA === 'scripts') {
@@ -373,6 +379,22 @@ export class App implements AppApi {
     return Promise.all(need.map((f) => this.loadFy(f))).then(() => undefined);
   }
 
+  /** 入札カーブのタブで使うカーブ・指標を読み込む（読み込み済みなら null） */
+  private prepareCurves(range: { from: number; to: number }): Promise<void> | null {
+    const cs = this.curves;
+    if (!cs) return null;
+    const date = cs.resolve(this.state.curveDate);
+    const days = this.state.curveCompare === 'days' ? cs.recent(date, COMPARE_DAYS) : [date];
+    const from = Math.max(range.from, cs.metricsFirst);
+    const to = Math.min(range.to, cs.metricsLast);
+    const jobs = [cs.ensureDays(days), from <= to ? cs.ensureMetrics(from, to) : null].filter((p): p is Promise<void> => p !== null);
+    if (jobs.length === 0) return null;
+    return Promise.all(jobs).then(
+      () => undefined,
+      (err: Error) => this.toast(`入札カーブを読み込めませんでした（${err.message}）`, 'error'),
+    );
+  }
+
   private loadFy(entry: ManifestEntry): Promise<void> {
     let p = this.loading.get(entry.fy);
     if (!p) {
@@ -392,12 +414,16 @@ export class App implements AppApi {
     return p;
   }
 
-  /** 年度ファイルの JSON（ファイルから開いて使う版は埋め込んだものか data/*.js、通常は data/ から取得） */
-  private async readFy(entry: ManifestEntry): Promise<unknown> {
-    if (LOCAL_DATA === 'inline') return readEmbedded(entry.file);
+  private readFy(entry: ManifestEntry): Promise<unknown> {
+    return this.readData(entry.file);
+  }
+
+  /** 取得済みデータのファイル（ファイルから開いて使う版は埋め込んだものか data/*.js、通常は data/ から取得） */
+  private async readData(file: string): Promise<unknown> {
+    if (LOCAL_DATA === 'inline') return readEmbedded(file);
     // データを更新したら（取得日時が変わったら）読み直す
-    if (LOCAL_DATA === 'scripts') return loadDataScript(entry.file, `v=${encodeURIComponent(this.manifest?.generatedAt ?? '')}`);
-    const url = new URL(entry.file, DATA_BASE);
+    if (LOCAL_DATA === 'scripts') return loadDataScript(file, `v=${encodeURIComponent(this.manifest?.generatedAt ?? '')}`);
+    const url = new URL(file, DATA_BASE);
     url.searchParams.set('v', this.manifest?.generatedAt ?? '');
     const res = await fetch(url);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -419,7 +445,10 @@ export class App implements AppApi {
         const { text } = decodeCsvBytes(await file.arrayBuffer());
         const res = parseSpotCsv(text);
         // 実データを読めたらデモ（合成データ）は破棄する
-        if (this.store.isDemo) this.store.clear();
+        if (this.store.isDemo) {
+          this.store.clear();
+          this.curves = null;
+        }
         this.store.addDays(res.days, 'upload');
         first = Math.min(first, res.firstDay);
         last = Math.max(last, res.lastDay);
@@ -447,12 +476,15 @@ export class App implements AppApi {
     const from = fiscalYearStart(fiscalYearOfDay(today) - 6);
     this.store.clear();
     this.store.addDays(generateDemoDays(from, today + 1), 'demo');
+    const ds = this.store.dataset();
+    this.curves = ds ? CurveStore.demo(ds) : null;
     this.syncUrl();
     this.requestRender();
   }
 
   private exitDemo(): void {
     this.store.clear();
+    this.curves = null;
     this.state = { ...DEFAULT_STATE, tab: this.state.tab };
     this.syncUrl();
     this.requestRender();

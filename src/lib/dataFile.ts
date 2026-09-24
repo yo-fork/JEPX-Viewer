@@ -32,6 +32,19 @@ export interface Manifest {
   generatedAt: string;
   source: string;
   files: ManifestEntry[];
+  /** 入札カーブ（取得していなければ無い） */
+  curves?: CurveIndex;
+}
+
+/** 取得済みの入札カーブの一覧（curves/ 以下） */
+export interface CurveIndex {
+  /** 指標のある期間（1 ファイル版では、描画用のカーブの日 dates より長いことがある） */
+  firstDate: string;
+  lastDate: string;
+  /** 描画用のカーブ（curves/YYYY/YYYYMMDD.json）がある日（YYYYMMDD） */
+  dates: string[];
+  /** 指標の年度ファイル（curves/fyYYYY.json） */
+  metrics: ManifestEntry[];
 }
 
 /** 日別データを年度ごとに分ける */

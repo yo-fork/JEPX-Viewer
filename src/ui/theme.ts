@@ -26,6 +26,8 @@ export interface Tokens {
   seq: string[];
   /** 順序スケール（古い→新しい）。面に近い端でも 2:1 以上のコントラスト */
   ordinal: string[];
+  /** 橙の順序スケール（買い入札の図用。ordinal と同じ明度の段） */
+  ordinalWarm: string[];
   /** 発散スケール（負 → 中立 → 正。両側は同じ明度の段を対にする） */
   div: string[];
   neutralSeries: string;
@@ -43,6 +45,7 @@ export interface Tokens {
   scatterAlpha: number;
 }
 
+/** 青の段（連続・順序・発散スケールで使う） */
 const BLUE = {
   100: '#cde2fb',
   150: '#b7d3f6',
@@ -57,6 +60,23 @@ const BLUE = {
   600: '#184f95',
   650: '#104281',
   700: '#0d366b',
+};
+
+/** 橙（カテゴリ色の 2 番目の色相）を、青の各段と同じ明度にそろえた段（買い入札の図用） */
+const ORANGE = {
+  100: '#ffd5c6',
+  150: '#ffbfa8',
+  200: '#ffa98a',
+  250: '#f8946f',
+  300: '#f37e52',
+  350: '#ec6732',
+  400: '#e15102',
+  450: '#cb4801',
+  500: '#b43f03',
+  550: '#9e3703',
+  600: '#8a2e01',
+  650: '#752601',
+  700: '#611e01',
 };
 
 export const TOKENS: Record<ThemeName, Tokens> = {
@@ -74,6 +94,7 @@ export const TOKENS: Record<ThemeName, Tokens> = {
     cat: ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#008300', '#4a3aa7', '#e34948'],
     seq: [BLUE[100], BLUE[200], BLUE[300], BLUE[400], BLUE[500], BLUE[600], BLUE[700]],
     ordinal: [BLUE[250], BLUE[300], BLUE[350], BLUE[400], BLUE[450], BLUE[500], BLUE[550], BLUE[600], BLUE[650], BLUE[700]],
+    ordinalWarm: [ORANGE[250], ORANGE[300], ORANGE[350], ORANGE[400], ORANGE[450], ORANGE[500], ORANGE[550], ORANGE[600], ORANGE[650], ORANGE[700]],
     div: ['#2a78d6', '#f0efec', '#e34948'],
     neutralSeries: '#52514e',
     deemph: '#c3c2b7',
@@ -98,6 +119,7 @@ export const TOKENS: Record<ThemeName, Tokens> = {
     cat: ['#3987e5', '#d95926', '#199e70', '#c98500', '#d55181', '#008300', '#9085e9', '#e66767'],
     seq: [BLUE[550], BLUE[500], BLUE[450], BLUE[400], BLUE[350], BLUE[300], BLUE[250], BLUE[200], BLUE[150], BLUE[100]],
     ordinal: [BLUE[500], BLUE[450], BLUE[400], BLUE[350], BLUE[300], BLUE[250], BLUE[200], BLUE[150], BLUE[100]],
+    ordinalWarm: [ORANGE[500], ORANGE[450], ORANGE[400], ORANGE[350], ORANGE[300], ORANGE[250], ORANGE[200], ORANGE[150], ORANGE[100]],
     // 青の 300・450 段と同じ明度の赤を対にし、中央は面より少し明るい無彩色
     div: [BLUE[300], BLUE[450], '#3a3a37', '#d2393a', '#f27b74'],
     // 全エリア色と色覚シミュレーション下でも ΔE 10 以上離れる明るさ（検証済み）
@@ -137,9 +159,13 @@ export function seriesDashed(key: SeriesKey): boolean {
   return key === 'shikoku';
 }
 
-/** 0〜1 の位置で順序スケールの色を取る（n 本のとき均等に） */
-export function ordinalColors(n: number, theme: ThemeName): string[] {
-  const ramp = TOKENS[theme].ordinal;
+/**
+ * 0〜1 の位置で順序スケールの色を取る（n 本のとき均等に）。
+ * 隣の段と見分けられる（明度差 0.06 以上）のは 5 本まで。それより多いときは古いものを deemph にする
+ * @param warm 橙のスケール（買い入札の図）
+ */
+export function ordinalColors(n: number, theme: ThemeName, warm = false): string[] {
+  const ramp = warm ? TOKENS[theme].ordinalWarm : TOKENS[theme].ordinal;
   if (n <= 1) return [ramp[ramp.length - 1]];
   return Array.from({ length: n }, (_, i) => ramp[Math.round((i / (n - 1)) * (ramp.length - 1))]);
 }

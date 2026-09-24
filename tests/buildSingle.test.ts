@@ -3,11 +3,23 @@ import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { assembleHtml, buildSingle, dataScript, defaultOptions, escapeInlineScript, parseArgs, type EmbeddedData } from '../scripts/build-single';
+import {
+  assembleHtml,
+  buildSingle,
+  dataScript,
+  defaultOptions,
+  escapeInlineScript,
+  INLINE_CURVE_DAYS,
+  parseArgs,
+  type EmbeddedData,
+} from '../scripts/build-single';
 import { writeManifest } from '../scripts/fetch-jepx';
+import { curveDayFile, decodeCurveDay, decodeCurveMetrics, encodeCurveDay } from '../src/lib/bidCurves';
 import { decodeFyFile, encodeFyFile, MANIFEST_FORMAT, type Manifest } from '../src/lib/dataFile';
-import { dayFromYmd } from '../src/lib/dates';
+import { dayFromYmd, isoFromDay } from '../src/lib/dates';
 import { generateDemoDays } from '../src/lib/demo';
+import { syntheticCurveDay } from '../src/lib/demoCurves';
+import { SLOTS } from '../src/lib/series';
 import { dataScriptPath, isDataFile, loadDataScript, localDataMode, readEmbedded, REGISTER_FN } from '../src/lib/localData';
 
 /** vite build が出力する index.html と同じ形 */
@@ -173,6 +185,12 @@ describe('parseArgs', () => {
     expect(parseArgs(['--split']).split).toBe(true);
     expect(d.split).toBe(false);
     expect(() => parseArgs(['--split', '--no-data'])).toThrow(/同時に指定できません/);
+    expect(parseArgs(['--curve-days', '14']).curveDays).toBe(14);
+    expect(d.curveDays).toBeUndefined();
+    expect(parseArgs(['--no-curves']).noCurves).toBe(true);
+    expect(() => parseArgs(['--curve-days', '0'])).toThrow(/1 以上/);
+    expect(() => parseArgs(['--curve-days', 'x'])).toThrow(/1 以上/);
+    expect(() => parseArgs(['--curve-days', '3', '--no-curves'])).toThrow(/同時に指定できません/);
   });
 });
 
@@ -244,6 +262,82 @@ describe('buildSingle', () => {
     await expect(buildSingle(opts({ data: path.join(dir, 'none') }))).rejects.toThrow(/npm run fetch/);
     await expect(buildSingle(opts({ from: 2030 }))).rejects.toThrow(/埋め込む年度がありません/);
     await expect(buildSingle(opts({ dist: path.join(dir, 'none') }))).rejects.toThrow(/npm run build/);
+  });
+});
+
+describe('buildSingle（入札カーブ）', () => {
+  let dir = '';
+  // 2024/03/25〜04/03 の 10 日分（2023 年度と 2024 年度にまたがる）
+  const curveDays = Array.from({ length: 10 }, (_, i) => dayFromYmd(2024, 3, 25) + i);
+  const ymd = (day: number) => isoFromDay(day).replace(/-/g, '');
+  beforeAll(async () => {
+    dir = await mkdtemp(path.join(tmpdir(), 'jepx-single-curves-'));
+    await mkdir(path.join(dir, 'dist', 'assets'), { recursive: true });
+    await writeFile(path.join(dir, 'dist', 'index.html'), INDEX_HTML);
+    await writeFile(path.join(dir, 'dist', 'assets', 'index-abc.js'), JS);
+    await writeFile(path.join(dir, 'dist', 'assets', 'index-abc.css'), CSS);
+    const data = path.join(dir, 'data');
+    await mkdir(path.join(data, 'spot'), { recursive: true });
+    await writeFile(path.join(data, 'spot', 'fy2023.json'), JSON.stringify(encodeFyFile(2023, generateDemoDays(dayFromYmd(2024, 3, 25), dayFromYmd(2024, 3, 31), 1))));
+    await writeFile(path.join(data, 'spot', 'fy2024.json'), JSON.stringify(encodeFyFile(2024, generateDemoDays(dayFromYmd(2024, 4, 1), dayFromYmd(2024, 4, 3), 2))));
+    for (const day of curveDays) {
+      const targets = Array.from({ length: SLOTS }, (_, s) => ({ system: 10 + (s % 5), volume: 30000, east: 10, west: s % 2 ? 11 : 10 }));
+      const { raw, groups } = syntheticCurveDay(day, targets);
+      const file = path.join(data, curveDayFile(day));
+      await mkdir(path.dirname(file), { recursive: true });
+      await writeFile(file, JSON.stringify(encodeCurveDay(raw, groups)));
+    }
+    await writeManifest(data, 'test');
+  });
+  afterAll(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+  const opts = (extra: Partial<ReturnType<typeof defaultOptions>>) => ({
+    ...defaultOptions(),
+    dist: path.join(dir, 'dist'),
+    data: path.join(dir, 'data'),
+    out: path.join(dir, 'out', 'single.html'),
+    log: () => {},
+    ...extra,
+  });
+  const embedded = async (extra: Partial<ReturnType<typeof defaultOptions>>) => {
+    await buildSingle(opts(extra));
+    const got = blocks(await readFile(path.join(dir, 'out', 'single.html'), 'utf8'));
+    return { manifest: got[0].json as Manifest, files: new Map(got.slice(1).map((b) => [b.file, b.json])) };
+  };
+
+  it('指標はすべて、1 コマの図に使うカーブは直近の日だけを埋め込む', async () => {
+    const { manifest, files } = await embedded({});
+    const kept = curveDays.slice(-INLINE_CURVE_DAYS);
+    expect(manifest.curves).toMatchObject({ firstDate: '2024-03-25', lastDate: '2024-04-03', dates: kept.map(ymd) });
+    expect(manifest.curves!.metrics.map((m) => m.file)).toEqual(['curves/fy2023.json', 'curves/fy2024.json']);
+    expect([...files.keys()].filter((f) => f.startsWith('curves/'))).toEqual(['curves/fy2023.json', 'curves/fy2024.json', ...kept.map(curveDayFile)]);
+    expect(decodeCurveMetrics(files.get('curves/fy2023.json')).size).toBe(7);
+    expect(decodeCurveDay(files.get(curveDayFile(kept[0]))).day).toBe(kept[0]);
+    expect((await embedded({ curveDays: 3 })).manifest.curves!.dates).toEqual(curveDays.slice(-3).map(ymd));
+  });
+
+  it('--from / --to の年度に入る分だけにし、--no-curves では入れない', async () => {
+    const { manifest, files } = await embedded({ from: 2024 });
+    expect(manifest.curves).toMatchObject({ firstDate: '2024-04-01', lastDate: '2024-04-03', dates: ['20240401', '20240402', '20240403'] });
+    expect([...files.keys()].some((f) => f.includes('fy2023'))).toBe(false);
+    const none = await embedded({ noCurves: true });
+    expect(none.manifest.curves).toBeUndefined();
+    expect([...none.files.keys()].some((f) => f.startsWith('curves/'))).toBe(false);
+  });
+
+  it('--split では取得済みのカーブをすべて data フォルダに書き出す', async () => {
+    const out = path.join(dir, 'share', 'viewer.html');
+    await buildSingle(opts({ split: true, out }));
+    const load = async (rel: string) => {
+      let got: unknown;
+      Function(REGISTER_FN, await readFile(path.join(dir, 'share', rel), 'utf8'))((_: string, json: unknown) => (got = json));
+      return got;
+    };
+    const manifest = (await load('data/manifest.js')) as Manifest;
+    expect(manifest.curves!.dates).toEqual(curveDays.map(ymd));
+    for (const day of curveDays) expect(decodeCurveDay(await load(dataScriptPath(curveDayFile(day)))).day).toBe(day);
+    expect(decodeCurveMetrics(await load('data/curves/fy2024.js')).size).toBe(3);
   });
 });
 

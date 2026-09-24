@@ -251,7 +251,8 @@ input[type='number'] {
   white-space: nowrap;
 }
 
-.seg-btn:hover:not(:disabled) {
+/* 選択中のボタンは、ホバーしても地の色を変えない（白い文字が薄い地に消えないように） */
+.seg-btn:hover:not(:disabled):not([aria-pressed='true']) {
   background: var(--wash);
 }
 
@@ -481,6 +482,29 @@ input[type='number'] {
   font-size: 12px;
 }
 
+/* タブの中を見出しで区切る（入札カーブ） */
+.view-section-title {
+  margin: 8px 0 12px;
+  font-size: 16px;
+  line-height: 1.4;
+}
+
+.card-grid + .view-section-title {
+  margin-top: 28px;
+}
+
+/* 前後の日へ移るボタン付きの日付入力 */
+.date-nav {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+
+.date-nav .btn {
+  padding: 4px 10px;
+}
+
 .card-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -539,6 +563,20 @@ input[type='number'] {
 
 .card-footer:empty {
   display: none;
+}
+
+.card-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px 16px;
+  margin-bottom: 8px;
+}
+
+.card-note {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .zoom-note {

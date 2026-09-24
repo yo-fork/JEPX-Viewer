@@ -5,6 +5,7 @@
 import { fiscalYearEnd, fiscalYearOfDay, fiscalYearStart, isoFromDay, parseDateString } from './lib/dates';
 import type { Granularity } from './lib/aggregate';
 import type { DayType } from './lib/select';
+import { CURVE_METRIC_KEYS, SYSTEM_GROUP, type CurveMetricKey } from './lib/bidCurves';
 import { AREA_KEYS, PRICE_KEYS, type AreaKey, type PriceKey } from './lib/series';
 
 export const TABS = [
@@ -16,6 +17,7 @@ export const TABS = [
   { id: 'distribution', label: '分布' },
   { id: 'area', label: 'エリア比較' },
   { id: 'volume', label: '入札・約定量' },
+  { id: 'curves', label: '入札カーブ' },
   { id: 'yearly', label: '年度比較' },
   { id: 'table', label: '統計表' },
 ] as const;
@@ -42,6 +44,10 @@ export type DistGroup = 'month' | 'fy' | 'dow' | 'hour' | 'area';
 export type YearMetric = 'mean' | 'max' | 'min' | 'floor';
 export type TableUnit = 'day' | 'week' | 'month' | 'fy' | 'year' | 'dow' | 'slot' | 'all';
 export type TableKind = 'areas' | 'stats';
+/** 入札カーブの縦軸（価格）の上限 */
+export type CurveRange = 'auto' | '30' | '50' | '100' | 'all';
+export type CurveCompare = 'days' | 'slots';
+export type CurveSide = 'sell' | 'buy';
 
 export interface AppState {
   tab: TabId;
@@ -73,6 +79,20 @@ export interface AppState {
   pairB: AreaKey;
   /** エリア比較タブの比較の基準（平均差・分断率・月別の差） */
   areaBase: PriceKey;
+  /** 入札カーブを見る受渡日（NaN は最新の日） */
+  curveDate: number;
+  /** 入札カーブを見るコマ（0〜47） */
+  curveSlot: number;
+  /** 入札カーブの対象（-1 はシステムプライス、0 以上は分断エリアのグループ） */
+  curveGroup: number;
+  curveRange: CurveRange;
+  curveCompare: CurveCompare;
+  /** 比較の図で重ねる側 */
+  curveSide: CurveSide;
+  /** 価格帯ごとの入札量の推移で見る側 */
+  curveDepth: CurveSide;
+  /** 入札カーブのヒートマップの指標 */
+  curveMetric: CurveMetricKey;
   yearMetric: YearMetric;
   tableUnit: TableUnit;
   tableKind: TableKind;
@@ -104,6 +124,14 @@ export const DEFAULT_STATE: AppState = {
   pairA: 'tokyo',
   pairB: 'kansai',
   areaBase: 'system',
+  curveDate: Number.NaN,
+  curveSlot: 36,
+  curveGroup: SYSTEM_GROUP,
+  curveRange: 'auto',
+  curveCompare: 'days',
+  curveSide: 'sell',
+  curveDepth: 'sell',
+  curveMetric: 'sell001',
   yearMetric: 'mean',
   tableUnit: 'month',
   tableKind: 'areas',
@@ -182,6 +210,14 @@ const SCHEMA: { [K in keyof AppState]: [string, Codec<AppState[K]>] } = {
   pairA: ['a', oneOf(AREA_KEYS)],
   pairB: ['b', oneOf(AREA_KEYS)],
   areaBase: ['base', oneOf(PRICE_KEYS)],
+  curveDate: ['cd', day],
+  curveSlot: ['cs', intIn(0, 47)],
+  curveGroup: ['cg', intIn(-1, 99)],
+  curveRange: ['cr', oneOf<CurveRange>(['auto', '30', '50', '100', 'all'])],
+  curveCompare: ['cc', oneOf<CurveCompare>(['days', 'slots'])],
+  curveSide: ['csd', oneOf<CurveSide>(['sell', 'buy'])],
+  curveDepth: ['cdp', oneOf<CurveSide>(['sell', 'buy'])],
+  curveMetric: ['cm2', oneOf<CurveMetricKey>(CURVE_METRIC_KEYS)],
   yearMetric: ['ym', oneOf<YearMetric>(['mean', 'max', 'min', 'floor'])],
   tableUnit: ['tu', oneOf<TableUnit>(['day', 'week', 'month', 'fy', 'year', 'dow', 'slot', 'all'])],
   tableKind: ['tk', oneOf<TableKind>(['areas', 'stats'])],

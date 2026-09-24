@@ -40,9 +40,12 @@ export function readEmbedded(file: string, doc: Document = document): unknown {
   return JSON.parse(el.textContent ?? '');
 }
 
-/** データとして読んでよい名前か（manifest が書き換えられても、data/ の外や別のサイトのファイルは読まない） */
+/**
+ * データとして読んでよい名前か（manifest が書き換えられても、data/ の外や別のサイトのファイルは読まない）。
+ * 取引結果の年度ファイル、入札カーブの指標の年度ファイル・1 日分のファイルだけ
+ */
 export function isDataFile(file: string): boolean {
-  return file === LOCAL_MANIFEST || /^spot\/fy\d{4}\.json$/.test(file);
+  return file === LOCAL_MANIFEST || /^(spot|curves)\/fy\d{4}\.json$/.test(file) || /^curves\/\d{4}\/\d{8}\.json$/.test(file);
 }
 
 /** data/*.js の場所（manifest.json → data/manifest.js、spot/fy2024.json → data/spot/fy2024.js） */

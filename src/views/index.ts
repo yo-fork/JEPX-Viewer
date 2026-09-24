@@ -2,6 +2,7 @@ import type { TabId } from '../state';
 import { AreaView } from './area';
 import type { View } from './base';
 import { CalendarView } from './calendar';
+import { CurvesView } from './curves';
 import { DistributionView } from './distribution';
 import { HeatmapView } from './heatmap';
 import { IntradayView } from './intraday';
@@ -20,6 +21,7 @@ const FACTORIES: Record<TabId, () => View> = {
   distribution: () => new DistributionView(),
   area: () => new AreaView(),
   volume: () => new VolumeView(),
+  curves: () => new CurvesView(),
   yearly: () => new YearlyView(),
   table: () => new TableView(),
 };

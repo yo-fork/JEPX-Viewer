@@ -11,7 +11,7 @@ import { accMean, quantileSorted } from '../lib/stats';
 import type { HeatKind } from '../state';
 import type { ChartCard, TableData } from '../ui/card';
 import { segmented, selectField, toolbar, type Segmented, type SelectField } from '../ui/controls';
-import { TOKENS } from '../ui/theme';
+import { TOKENS, type ThemeName } from '../ui/theme';
 import { ttHeader, ttRow } from '../ui/tooltip';
 import { NO_DATA, View } from './base';
 import { describeSelection, monthLabel, PRICE_UNIT, rangeTag } from './common';
@@ -19,7 +19,7 @@ import { describeSelection, monthLabel, PRICE_UNIT, rangeTag } from './common';
 const DOW_COLUMNS = ['月', '火', '水', '木', '金', '土', '日', '祝日'];
 const MAX_DAILY_COLUMNS = 800;
 
-interface Grid {
+export interface Grid {
   xLabels: string[];
   /** ツールチップ用の詳しい列名 */
   xTitles: string[];
@@ -89,77 +89,18 @@ export class HeatmapView extends View {
     const valueLabel = spread ? `${SERIES_LABEL[state.focus]} − システムプライス` : SERIES_LABEL[state.focus];
     this.chart.setSubtitle(`${describeSelection(sel, state)}・${valueLabel}（${PRICE_UNIT}）${g.note ? `・${g.note}` : ''}`);
 
-    // 色の範囲: 外れ値に引っ張られないよう 1〜99% 点（差は 0 を中心に対称）
-    const sorted = Float64Array.from(g.cells.map((c) => c[2])).sort();
-    let min = quantileSorted(sorted, 0.01);
-    let max = quantileSorted(sorted, 0.99);
-    if (spread) {
-      const a = Math.max(Math.abs(min), Math.abs(max), 0.5);
-      min = -a;
-      max = a;
-    } else {
-      min = Math.max(0, Math.floor(min));
-      max = Math.max(min + 1, Math.ceil(max));
-    }
-    const dense = g.xLabels.length > 60;
-    const rowH = g.yIsSlot ? Math.max(6, Math.min(12, 480 / g.yLabels.length)) : 30;
-    this.chart.setHeight(Math.round(g.yLabels.length * rowH + 110));
+    const [min, max] = colorRange(g, spread);
+    this.chart.setHeight(heatmapHeight(g));
     const fmt = spread ? (v: number) => `${fmtSigned(v)} 円` : (v: number) => `${fmtPrice(v)} ${PRICE_UNIT}`;
 
     this.chart.setOption(
-      {
-        grid: { left: 8, right: 16, top: 48, bottom: 8, outerBoundsMode: 'same', outerBoundsContain: 'axisLabel' },
-        tooltip: {
-          trigger: 'item',
-          formatter: (p: { value: [number, number, number] }) => {
-            const [x, y, v] = p.value;
-            return ttHeader(`${g.xTitles[x]}・${g.yTitles[y]}`) + ttRow(t.ink2, fmt(v), valueLabel, 'none');
-          },
-        },
-        xAxis: {
-          type: 'category',
-          data: g.xLabels,
-          splitArea: { show: false },
-          axisLabel: { hideOverlap: true },
-          axisLine: { show: false },
-        },
-        yAxis: {
-          type: 'category',
-          data: g.yLabels,
-          inverse: true,
-          axisLine: { show: false },
-          axisLabel: g.yIsSlot ? { interval: (i: number) => g.yLabels[i].endsWith(':00') && Number(g.yLabels[i].slice(0, 2)) % 3 === 0 } : {},
-        },
-        visualMap: {
-          type: 'continuous',
-          min,
-          max,
-          calculable: true,
-          orient: 'horizontal',
-          right: 8,
-          top: 0,
-          itemWidth: 12,
-          itemHeight: 200,
-          precision: spread ? 1 : 0,
-          inRange: { color: spread ? t.div : t.seq },
-          textStyle: { color: t.muted, fontSize: 11 },
-        },
-        series: [
-          {
-            type: 'heatmap',
-            data: g.cells,
-            progressive: 0,
-            itemStyle: dense ? { borderWidth: 0 } : { borderColor: t.surface, borderWidth: g.yIsSlot ? 1 : 2 },
-            emphasis: { itemStyle: { borderColor: t.ink, borderWidth: 1 } },
-          },
-        ],
-      },
+      heatmapOption(g, { theme, min, max, colors: spread ? t.div : t.seq, precision: spread ? 1 : 0, fmt, valueLabel }),
       gridTable(g, `jepx_heatmap_${state.heatKind}_${state.focus}${spread ? '_spread' : ''}_${rangeTag(sel)}.csv`),
     );
   }
 }
 
-function buildGrid(sel: Selection, source: Source, kind: HeatKind): Grid {
+export function buildGrid(sel: Selection, source: Source, kind: HeatKind): Grid {
   const ds = sel.ds;
   const slotLabels = sel.slots.map(slotStartLabel);
   const slotTitles = sel.slots.map(slotRangeLabel);
@@ -252,8 +193,84 @@ function buildGrid(sel: Selection, source: Source, kind: HeatKind): Grid {
 }
 
 /** 格子をそのまま表に（行 = 横軸の項目、列 = 縦軸の項目） */
-function gridTable(g: Grid, filename: string): TableData {
+export function gridTable(g: Grid, filename: string): TableData {
   const rows: (string | number)[][] = g.xLabels.map((x) => [x, ...g.yLabels.map(() => '')]);
   for (const [x, y, v] of g.cells) rows[x][y + 1] = v;
   return { columns: ['', ...g.yLabels], rows, digits: [null, ...g.yLabels.map(() => 2)], filename };
+}
+
+/** 色の範囲: 外れ値に引っ張られないよう 1〜99% 点（symmetric なら 0 を中心に対称、そうでなければ整数に丸める） */
+export function colorRange(g: Grid, symmetric: boolean, round = true): [number, number] {
+  const sorted = Float64Array.from(g.cells.map((c) => c[2])).sort();
+  let min = quantileSorted(sorted, 0.01);
+  let max = quantileSorted(sorted, 0.99);
+  if (symmetric) {
+    const a = Math.max(Math.abs(min), Math.abs(max), 0.5);
+    return [-a, a];
+  }
+  if (!round) return [min, max > min ? max : min + 1];
+  min = Math.max(0, Math.floor(min));
+  max = Math.max(min + 1, Math.ceil(max));
+  return [min, max];
+}
+
+/** 格子の行数に合わせたグラフの高さ */
+export function heatmapHeight(g: Grid): number {
+  const rowH = g.yIsSlot ? Math.max(6, Math.min(12, 480 / g.yLabels.length)) : 30;
+  return Math.round(g.yLabels.length * rowH + 110);
+}
+
+export function heatmapOption(
+  g: Grid,
+  o: { theme: ThemeName; min: number; max: number; colors: string[]; precision: number; fmt: (v: number) => string; valueLabel: string },
+): Record<string, unknown> {
+  const t = TOKENS[o.theme];
+  const dense = g.xLabels.length > 60;
+  return {
+    grid: { left: 8, right: 16, top: 48, bottom: 8, outerBoundsMode: 'same', outerBoundsContain: 'axisLabel' },
+    tooltip: {
+      trigger: 'item',
+      formatter: (p: { value: [number, number, number] }) => {
+        const [x, y, v] = p.value;
+        return ttHeader(`${g.xTitles[x]}・${g.yTitles[y]}`) + ttRow(t.ink2, o.fmt(v), o.valueLabel, 'none');
+      },
+    },
+    xAxis: {
+      type: 'category',
+      data: g.xLabels,
+      splitArea: { show: false },
+      axisLabel: { hideOverlap: true },
+      axisLine: { show: false },
+    },
+    yAxis: {
+      type: 'category',
+      data: g.yLabels,
+      inverse: true,
+      axisLine: { show: false },
+      axisLabel: g.yIsSlot ? { interval: (i: number) => g.yLabels[i].endsWith(':00') && Number(g.yLabels[i].slice(0, 2)) % 3 === 0 } : {},
+    },
+    visualMap: {
+      type: 'continuous',
+      min: o.min,
+      max: o.max,
+      calculable: true,
+      orient: 'horizontal',
+      right: 8,
+      top: 0,
+      itemWidth: 12,
+      itemHeight: 200,
+      precision: o.precision,
+      inRange: { color: o.colors },
+      textStyle: { color: t.muted, fontSize: 11 },
+    },
+    series: [
+      {
+        type: 'heatmap',
+        data: g.cells,
+        progressive: 0,
+        itemStyle: dense ? { borderWidth: 0 } : { borderColor: t.surface, borderWidth: g.yIsSlot ? 1 : 2 },
+        emphasis: { itemStyle: { borderColor: t.ink, borderWidth: 1 } },
+      },
+    ],
+  };
 }

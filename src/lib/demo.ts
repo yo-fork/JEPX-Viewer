@@ -40,7 +40,7 @@ const MONTH_FACTOR = [1.24, 1.16, 0.97, 0.86, 0.82, 0.9, 1.08, 1.2, 1.02, 0.9, 0
 /** 太陽光の影響の強さ（1〜12 月） */
 const SOLAR_MONTH = [0.35, 0.5, 0.8, 1.0, 1.0, 0.7, 0.55, 0.55, 0.7, 0.85, 0.7, 0.4];
 
-function mulberry32(seed: number): () => number {
+export function mulberry32(seed: number): () => number {
   let a = seed >>> 0;
   return () => {
     a = (a + 0x6d2b79f5) >>> 0;
@@ -51,7 +51,7 @@ function mulberry32(seed: number): () => number {
   };
 }
 
-function gaussian(rand: () => number): number {
+export function gaussian(rand: () => number): number {
   const u = Math.max(rand(), 1e-12);
   const v = rand();
   return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);

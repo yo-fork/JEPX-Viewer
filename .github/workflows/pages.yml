@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       include_data:
-        description: 'JEPX から価格データを取得してサイトに含める（公開する場合は JEPX の利用条件を確認してください）'
+        description: 'JEPX から価格データと入札カーブ（直近 90 日分）を取得してサイトに含める（公開する場合は JEPX の利用条件を確認してください）'
         type: boolean
         default: false
 
@@ -28,13 +28,15 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      # 過去年度のファイルはキャッシュから復元し、今年度・前年度だけを取り直す
+      # 過去年度のファイルと取得済みの日の入札カーブはキャッシュから復元し、今年度・前年度と新しい日の入札カーブだけを取り直す
       - uses: actions/cache@v6
         if: ${{ inputs.include_data }}
         with:
-          path: public/data/spot
-          key: jepx-spot-${{ github.run_id }}
-          restore-keys: jepx-spot-
+          path: |
+            public/data/spot
+            public/data/curves
+          key: jepx-data-${{ github.run_id }}
+          restore-keys: jepx-data-
       - name: Fetch JEPX spot market data
         if: ${{ inputs.include_data }}
         run: npm run fetch

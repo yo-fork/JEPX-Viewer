@@ -1,6 +1,7 @@
 /**
  * ビュー（タブ）の共通基盤。
  */
+import type { CurveStore } from '../lib/curveStore';
 import type { Selection } from '../lib/select';
 import type { Dataset } from '../lib/store';
 import type { AppState, Extent } from '../state';
@@ -20,6 +21,8 @@ export interface ViewContext {
   theme: ThemeName;
   /** 利用できるデータ全体の範囲（未読み込みの年度を含む） */
   extent: Extent;
+  /** 入札カーブ（取得していなければ null） */
+  curves: CurveStore | null;
 }
 
 export abstract class View {

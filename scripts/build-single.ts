@@ -6,9 +6,12 @@
  *   npm run build:single -- --no-data       データを埋め込まない（各自が JEPX の CSV を読み込む）
  *   npm run build:single -- --split         データを HTML に入れず、HTML と同じ場所の data フォルダに出力する（共有フォルダ向け）
  *
+ * 入札カーブ（npm run fetch で取得したもの）は、指標をすべてと、1 コマの図に使うカーブを直近 7 日分入れる
+ * （1 日分が数百 KB あるため。--curve-days で変えられる）。--split では取得済みのカーブをすべて data フォルダに書き出す。
+ *
  * ファイルから直接開いたページでは、ブラウザは別ファイルのモジュールスクリプト・CSS を読み込まず、fetch も使えない。
  * そこで vite build の出力（dist/index.html と assets/ の JS・CSS）を 1 つの HTML にまとめ、
- * 年度ファイルは <script type="application/json"> として埋め込む（読み出しは src/lib/localData.ts）。
+ * 年度ファイル・入札カーブのファイルは <script type="application/json"> として埋め込む（読み出しは src/lib/localData.ts）。
  * --split では埋め込まず、jepxViewerData(…) を呼ぶだけの data/*.js として HTML の隣に書き出す
  * （通常の <script src> なら、ファイルから開いたページでも同じフォルダから読み込める）。
  * CSP は埋め込んだスクリプト・スタイルのハッシュ（--split ではローカルのファイルも）だけを許可し、通信はすべて禁止する。
@@ -17,8 +20,13 @@ import { createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { FY_FILE_FORMAT, MANIFEST_FORMAT, type Manifest } from '../src/lib/dataFile';
+import { CURVE_DAY_FORMAT, CURVE_METRICS_FORMAT, curveDayFile } from '../src/lib/bidCurves';
+import { FY_FILE_FORMAT, MANIFEST_FORMAT, type CurveIndex, type Manifest } from '../src/lib/dataFile';
+import { fiscalYearOfDay, parseDateString } from '../src/lib/dates';
 import { dataScriptPath, EMBED_ATTR, LOCAL_MANIFEST, REGISTER_FN, SCRIPTS_META } from '../src/lib/localData';
+
+/** 1 ファイル版に入れる、1 コマの図に使う入札カーブの日数（入札カーブのタブの「直近 7 日」の比較に足りる分） */
+export const INLINE_CURVE_DAYS = 7;
 
 export interface SingleOptions {
   /** vite build の出力先 */
@@ -32,11 +40,23 @@ export interface SingleOptions {
   noData: boolean;
   /** データを HTML に埋め込まず、出力先と同じ場所の data/ に書き出す */
   split: boolean;
+  /** 1 コマの図に使う入札カーブを直近何日分入れるか（省略時は INLINE_CURVE_DAYS 日、--split は取得済みのすべて） */
+  curveDays?: number;
+  /** 入札カーブを入れない */
+  noCurves: boolean;
   log: (msg: string) => void;
 }
 
 export function defaultOptions(): SingleOptions {
-  return { dist: 'dist', data: 'public/data', out: 'dist-single/jepx-viewer.html', noData: false, split: false, log: (msg) => console.log(msg) };
+  return {
+    dist: 'dist',
+    data: 'public/data',
+    out: 'dist-single/jepx-viewer.html',
+    noData: false,
+    split: false,
+    noCurves: false,
+    log: (msg) => console.log(msg),
+  };
 }
 
 const HELP = `使い方: npm run build:single -- [オプション]
@@ -44,6 +64,8 @@ const HELP = `使い方: npm run build:single -- [オプション]
   --to <年度>            埋め込む最後の年度
   --no-data              データを埋め込まない（各自が JEPX の CSV を読み込んで使う）
   --split                データを HTML と同じ場所の data フォルダに分けて出力する（共有フォルダ向け）
+  --curve-days <日数>    1 コマの図に使う入札カーブを直近何日分入れるか（既定: 7 日。--split では取得済みのすべて）
+  --no-curves            入札カーブを入れない
   --out <ファイル>       出力先（既定: dist-single/jepx-viewer.html）
   --data <ディレクトリ>  取得済みデータの場所（既定: public/data）
   --dist <ディレクトリ>  vite build の出力先（既定: dist）`;
@@ -75,6 +97,15 @@ export function parseArgs(argv: string[], base = defaultOptions()): SingleOption
       case '--split':
         o.split = true;
         break;
+      case '--curve-days': {
+        const n = Number(next());
+        if (!Number.isInteger(n) || n < 1) throw new Error('--curve-days には 1 以上の日数を指定してください');
+        o.curveDays = n;
+        break;
+      }
+      case '--no-curves':
+        o.noCurves = true;
+        break;
       case '--out':
         o.out = next();
         break;
@@ -95,12 +126,13 @@ export function parseArgs(argv: string[], base = defaultOptions()): SingleOption
   }
   if (o.from !== undefined && o.to !== undefined && o.from > o.to) throw new Error('--from が --to より後になっています');
   if (o.split && o.noData) throw new Error('--split と --no-data は同時に指定できません');
+  if (o.noCurves && o.curveDays !== undefined) throw new Error('--curve-days と --no-curves は同時に指定できません');
   return o;
 }
 
 export interface EmbeddedData {
   manifest: Manifest;
-  /** manifest の file → 年度ファイルの JSON */
+  /** データファイルの名前（public/data からの相対パス）→ JSON */
   files: Map<string, unknown>;
 }
 
@@ -145,19 +177,32 @@ function jsonBlock(file: string, value: unknown): string {
   return `<script type="application/json" ${EMBED_ATTR}="${file}">${JSON.stringify(value).replace(/</g, '\\u003c')}</script>\n`;
 }
 
-/** 年度ファイルを名前の順に（名前と中身がそろっていることを確かめてから）返す */
-function fyFiles(data: EmbeddedData): [string, unknown][] {
-  return data.manifest.files.map((f) => {
-    if (!/^spot\/fy\d{4}\.json$/.test(f.file)) throw new Error(`年度ファイルの名前が不正です: ${f.file}`);
-    if (!data.files.has(f.file)) throw new Error(`年度ファイルがありません: ${f.file}`);
-    return [f.file, data.files.get(f.file)];
+function checkName(name: string, pattern: RegExp, what: string): string {
+  if (!pattern.test(name)) throw new Error(`${what}の名前が不正です: ${name}`);
+  return name;
+}
+
+/**
+ * manifest に載っているデータファイル（取引結果の年度ファイル、入札カーブの指標の年度ファイル・1 日分のファイル）を、
+ * 名前と中身がそろっていることを確かめてから返す
+ */
+function dataFiles(data: EmbeddedData): [string, unknown][] {
+  const { files, curves } = data.manifest;
+  const names = files.map((f) => checkName(f.file, /^spot\/fy\d{4}\.json$/, '年度ファイル'));
+  if (curves) {
+    names.push(...curves.metrics.map((m) => checkName(m.file, /^curves\/fy\d{4}\.json$/, '入札カーブの指標のファイル')));
+    names.push(...curves.dates.map((d) => curveDayFile(parseDateString(checkName(d, /^\d{8}$/, '入札カーブの日付'))!)));
+  }
+  return names.map((file) => {
+    if (!data.files.has(file)) throw new Error(`データファイルがありません: ${file}`);
+    return [file, data.files.get(file)];
   });
 }
 
 /** データ用の script 要素（データなしのときは manifest を null にして、1 ファイル版であることだけを示す） */
 export function embedBlocks(data: EmbeddedData | null): string {
   if (!data) return jsonBlock(LOCAL_MANIFEST, null);
-  return [jsonBlock(LOCAL_MANIFEST, data.manifest), ...fyFiles(data).map(([file, json]) => jsonBlock(file, json))].join('');
+  return [jsonBlock(LOCAL_MANIFEST, data.manifest), ...dataFiles(data).map(([file, json]) => jsonBlock(file, json))].join('');
 }
 
 /** data/*.js の中身（JSON は JavaScript の式としてそのまま書ける） */
@@ -165,10 +210,10 @@ export function dataScript(file: string, json: unknown): string {
   return `${REGISTER_FN}(${JSON.stringify(file)}, ${JSON.stringify(json)});\n`;
 }
 
-/** HTML と同じ場所に data/*.js を書き出し、合計バイト数を返す。一覧（manifest.js）は年度ファイルをそろえてから最後に書く */
+/** HTML と同じ場所に data/*.js を書き出し、合計バイト数を返す。一覧（manifest.js）はデータファイルをそろえてから最後に書く */
 async function writeDataScripts(htmlDir: string, data: EmbeddedData): Promise<number> {
   let bytes = 0;
-  for (const [file, json] of [...fyFiles(data), [LOCAL_MANIFEST, data.manifest] as [string, unknown]]) {
+  for (const [file, json] of [...dataFiles(data), [LOCAL_MANIFEST, data.manifest] as [string, unknown]]) {
     const out = path.join(htmlDir, dataScriptPath(file));
     const text = dataScript(file, json);
     await mkdir(path.dirname(out), { recursive: true });
@@ -230,7 +275,34 @@ export async function assembleHtml(
   return html;
 }
 
-/** 取得済みデータから、埋め込む年度の manifest と年度ファイルを読む */
+async function readJson(o: SingleOptions, file: string, format: string): Promise<unknown> {
+  const json = JSON.parse(await readFile(path.join(o.data, file), 'utf8')) as { format?: string };
+  if (json?.format !== format) throw new Error(`${file} の形式が不正です`);
+  return json;
+}
+
+/**
+ * 入れる入札カーブを選んで読む: 指標は対象の年度すべて、描画用のカーブは直近 curveDays 日分。
+ * 一覧の firstDate・lastDate は指標のある期間、dates は入れたカーブの日
+ */
+async function loadCurves(o: SingleOptions, index: CurveIndex | undefined, files: Map<string, unknown>): Promise<CurveIndex | undefined> {
+  if (o.noCurves || !index) return undefined;
+  const inRange = (fy: number) => (o.from === undefined || fy >= o.from) && (o.to === undefined || fy <= o.to);
+  const metrics = index.metrics.filter((m) => inRange(m.fy)).sort((a, b) => a.fy - b.fy);
+  const all = index.dates
+    .filter((d) => /^\d{8}$/.test(d))
+    .map((d) => [d, parseDateString(d)] as const)
+    .filter((x): x is readonly [string, number] => x[1] !== null && inRange(fiscalYearOfDay(x[1])))
+    .sort((a, b) => a[1] - b[1]);
+  if (metrics.length === 0 || all.length === 0) return undefined;
+  const keep = o.curveDays ?? (o.split ? all.length : INLINE_CURVE_DAYS);
+  const days = all.slice(Math.max(0, all.length - keep));
+  for (const m of metrics) files.set(m.file, await readJson(o, m.file, CURVE_METRICS_FORMAT));
+  for (const [, day] of days) files.set(curveDayFile(day), await readJson(o, curveDayFile(day), CURVE_DAY_FORMAT));
+  return { firstDate: metrics[0].firstDate, lastDate: metrics[metrics.length - 1].lastDate, dates: days.map(([d]) => d), metrics };
+}
+
+/** 取得済みデータから、埋め込む年度の manifest と年度ファイル・入札カーブを読む */
 async function loadData(o: SingleOptions): Promise<EmbeddedData> {
   let manifest: Manifest;
   try {
@@ -242,14 +314,12 @@ async function loadData(o: SingleOptions): Promise<EmbeddedData> {
   const entries = manifest.files.filter((f) => (o.from === undefined || f.fy >= o.from) && (o.to === undefined || f.fy <= o.to));
   if (entries.length === 0) throw new Error('埋め込む年度がありません（--from / --to と取得済みの年度を確認してください）');
   const files = new Map<string, unknown>();
-  for (const f of entries) {
-    const json = JSON.parse(await readFile(path.join(o.data, f.file), 'utf8')) as { format?: string };
-    if (json?.format !== FY_FILE_FORMAT) throw new Error(`${f.file} の形式が不正です`);
-    files.set(f.file, json);
-  }
+  for (const f of entries) files.set(f.file, await readJson(o, f.file, FY_FILE_FORMAT));
+  const curves = await loadCurves(o, manifest.curves, files);
   // 手元の CSV から作ったデータの取得元（local:フォルダのパス）には作った人の PC のフォルダ名が入るので、配るファイルには入れない
   const source = manifest.source?.startsWith('local:') ? 'local' : manifest.source;
-  return { manifest: { ...manifest, source, files: entries }, files };
+  const { curves: _all, ...rest } = manifest;
+  return { manifest: { ...rest, source, files: entries, ...(curves ? { curves } : {}) }, files };
 }
 
 export async function buildSingle(o: SingleOptions): Promise<{ bytes: number; dataBytes: number; data: EmbeddedData | null }> {
@@ -274,11 +344,15 @@ export async function buildSingle(o: SingleOptions): Promise<{ bytes: number; da
   const range = files.length
     ? `${files[0].fy}〜${files[files.length - 1].fy} 年度（${files[0].firstDate}〜${files[files.length - 1].lastDate}）`
     : 'データなし';
+  const curves = data?.manifest.curves;
+  const curveText = curves
+    ? `・入札カーブ ${curves.dates.length} 日分（${curves.dates[0].replace(/^(\d{4})(\d{2})(\d{2})$/, '$1-$2-$3')}〜、指標は ${curves.firstDate}〜${curves.lastDate}）`
+    : '';
   const mb = (n: number) => `${(n / 1024 / 1024).toFixed(1)} MB`;
   o.log(
     o.split
-      ? `作成しました: ${o.out}（${mb(bytes)}）と ${path.join(htmlDir, 'data')}（${mb(dataBytes)}、${range}）。2 つは同じ場所に置いてください`
-      : `1 ファイル版を作成しました: ${o.out}（${mb(bytes)}、${range}）`,
+      ? `作成しました: ${o.out}（${mb(bytes)}）と ${path.join(htmlDir, 'data')}（${mb(dataBytes)}、${range}${curveText}）。2 つは同じ場所に置いてください`
+      : `1 ファイル版を作成しました: ${o.out}（${mb(bytes)}、${range}${curveText}）`,
   );
   return { bytes, dataBytes, data };
 }
