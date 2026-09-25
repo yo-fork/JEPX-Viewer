@@ -36,7 +36,8 @@ function jepxLikeCsv(rows: string[][]): string {
 
 function row(date: string, code: number, system: string, areaOffset = 0): string[] {
   const areas = AREA_HEADERS.map((_, i) => (Number(system) + (i === 8 ? -areaOffset : 0)).toFixed(2));
-  return [date, String(code), '25000000', '22000000', '18000000', system, ...areas, ...new Array(20).fill('9.99')];
+  // α 値・回避可能原価（読み飛ばす）と、ブロック入札の量（売りの入札・約定、買いの入札・約定）
+  return [date, String(code), '25000000', '22000000', '18000000', system, ...areas, ...new Array(15).fill('9.99'), '10000000', '2000000', '3000000', '2500000'];
 }
 
 describe('CSV パーサ', () => {
@@ -64,7 +65,7 @@ describe('文字コード判定', () => {
 });
 
 describe('JEPX スポット CSV', () => {
-  it('Shift_JIS の CSV から主要列を読み取り、付帯列は無視する', () => {
+  it('Shift_JIS の CSV から主要列とブロック入札の量を読み取り、付帯列は無視する', () => {
     const csv = jepxLikeCsv([row('2024/04/01', 1, '10.50'), row('2024/04/01', 2, '11.25', 3), row('2024/04/02', 48, '0.01')]);
     const { text } = decodeCsvBytes(iconv.encode(csv, 'Shift_JIS'));
     const res = parseSpotCsv(text);
@@ -83,12 +84,18 @@ describe('JEPX スポット CSV', () => {
       'chugoku',
       'shikoku',
       'kyushu',
+      'sellBlockBid',
+      'sellBlockVolume',
+      'buyBlockBid',
+      'buyBlockVolume',
     ]);
     expect(res.warnings).toEqual([]);
     const d1 = res.days.get(dayFromYmd(2024, 4, 1))!;
     expect(d1[SERIES_INDEX.system * SLOTS + 0]).toBe(10.5);
     expect(d1[SERIES_INDEX.kyushu * SLOTS + 1]).toBeCloseTo(8.25);
     expect(d1[SERIES_INDEX.volume * SLOTS + 0]).toBe(18000000);
+    expect([d1[SERIES_INDEX.sellBid * SLOTS], d1[SERIES_INDEX.sellBlockBid * SLOTS], d1[SERIES_INDEX.sellBlockVolume * SLOTS]]).toEqual([25000000, 10000000, 2000000]);
+    expect([d1[SERIES_INDEX.buyBlockBid * SLOTS], d1[SERIES_INDEX.buyBlockVolume * SLOTS]]).toEqual([3000000, 2500000]);
     expect(Number.isNaN(d1[SERIES_INDEX.system * SLOTS + 2])).toBe(true);
     const d2 = res.days.get(dayFromYmd(2024, 4, 2))!;
     expect(d2[SERIES_INDEX.system * SLOTS + 47]).toBe(0.01);

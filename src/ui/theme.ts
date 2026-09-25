@@ -148,6 +148,10 @@ const SERIES_SLOT: Record<SeriesKey, number> = {
   sellBid: 0,
   buyBid: 1,
   volume: -1,
+  sellBlockBid: 0,
+  sellBlockVolume: 0,
+  buyBlockBid: 1,
+  buyBlockVolume: 1,
 };
 
 export function seriesColor(key: SeriesKey, theme: ThemeName): string {

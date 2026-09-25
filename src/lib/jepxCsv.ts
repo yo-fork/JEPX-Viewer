@@ -3,8 +3,9 @@
  *
  * 列名は年度によって追加・変更があるため、完全一致ではなくキーワードで列を特定する。
  *   受渡日, 時刻コード, 売り入札量(kWh), 買い入札量(kWh), 約定総量(kWh),
- *   システムプライス(円/kWh), エリアプライス北海道(円/kWh) … エリアプライス九州(円/kWh), …
- * 回避可能原価・α値・ブロック入札などの列は読み飛ばす。
+ *   システムプライス(円/kWh), エリアプライス北海道(円/kWh) … エリアプライス九州(円/kWh),
+ *   売りブロック入札総量(kWh), 売りブロック約定総量(kWh), 買いブロック入札総量(kWh), 買いブロック約定総量(kWh), …
+ * 回避可能原価・α値などの列は読み飛ばす。ブロック入札の量は、入札カーブの単エリアの推定に使う。
  */
 import { parseCsv, toCsv } from './csv';
 import { formatDay, parseDateString } from './dates';
@@ -39,6 +40,10 @@ const SERIES_MATCHERS: [SeriesKey, Matcher][] = [
   ['volume', (h) => /約定(総)?量/.test(h) && !h.includes('ブロック')],
   ['system', (h) => h.includes('システムプライス')],
   ...AREAS.map((a): [SeriesKey, Matcher] => [a.key, (h) => h.includes('エリアプライス') && h.includes(a.label)]),
+  ['sellBlockBid', (h) => /売り?ブロック入札(総)?量/.test(h)],
+  ['sellBlockVolume', (h) => /売り?ブロック約定(総)?量/.test(h)],
+  ['buyBlockBid', (h) => /買い?ブロック入札(総)?量/.test(h)],
+  ['buyBlockVolume', (h) => /買い?ブロック約定(総)?量/.test(h)],
 ];
 
 function findColumn(headers: string[], tests: Matcher[]): number {
@@ -154,6 +159,10 @@ export const SPOT_CSV_COLUMNS: [string, SeriesKey][] = [
   ['約定総量(kWh)', 'volume'],
   ['システムプライス(円/kWh)', 'system'],
   ...AREAS.map((a): [string, SeriesKey] => [`エリアプライス${a.label}(円/kWh)`, a.key]),
+  ['売りブロック入札総量(kWh)', 'sellBlockBid'],
+  ['売りブロック約定総量(kWh)', 'sellBlockVolume'],
+  ['買いブロック入札総量(kWh)', 'buyBlockBid'],
+  ['買いブロック約定総量(kWh)', 'buyBlockVolume'],
 ];
 
 export function formatSpotCsv(days: DayMap, slotFilter?: (day: number, slot: number) => boolean): string {

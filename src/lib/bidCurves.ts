@@ -388,6 +388,76 @@ export function rowsFromSteps(sell: ArrayLike<number>, buy: ArrayLike<number>): 
   return prices.map((price, k) => ({ price, sell: s[k], buy: b[k] }));
 }
 
+/** 階段状のカーブ（売りは価格の昇順、買いは降順に [価格, 累積量, …]） */
+export interface StepCurve {
+  sell: ArrayLike<number>;
+  buy: ArrayLike<number>;
+}
+
+/** 階段状のカーブの差（total − Σ parts）。売り・買いそれぞれ、価格の点（昇順）ごとの値で、負にもなる */
+export interface CurveDifference {
+  sellPrices: number[];
+  sell: Float64Array;
+  buyPrices: number[];
+  buy: Float64Array;
+}
+
+export function curveDifference(total: StepCurve, parts: readonly StepCurve[]): CurveDifference {
+  const side = (pick: (c: StepCurve) => ArrayLike<number>, volumesAt: typeof sellVolumesAt) => {
+    const prices = stepPrices(pick(total), ...parts.map(pick));
+    const v = volumesAt(pick(total), prices);
+    for (const part of parts) {
+      const x = volumesAt(pick(part), prices);
+      for (let k = 0; k < prices.length; k++) v[k] -= x[k];
+    }
+    return { prices, v };
+  };
+  const s = side((c) => c.sell, sellVolumesAt);
+  const b = side((c) => c.buy, buyVolumesAt);
+  return { sellPrices: s.prices, sell: s.v, buyPrices: b.prices, buy: b.v };
+}
+
+/**
+ * 市場分断したコマの「システムプライスのカーブ − 公表されている分断エリアのカーブの合計」（単エリアのカーブの推定に使う）。
+ * 描画用に間引いたカーブどうしの差では、間引いた分（各カーブの合計量の 0.1%。全国のカーブなら数十 MW）の誤差が残るので、
+ * 間引く前のカーブから 1MW 単位で求め、この差の量に対して間引いて持つ。
+ * 差は負にもなるので、累積の量として減らないようにならしてから、少ない方の端（最も安い売りか最も高い買い）が 0 になるよう
+ * offset を足した階段状のカーブにする（両端の点は 0 でも持つ）
+ */
+export interface StepResidual {
+  offset: number;
+  sell: Float64Array;
+  buy: Float64Array;
+}
+
+export function residualSteps(system: CurveRow[], parts: CurveRow[][]): { offset: number; sell: number[]; buy: number[] } {
+  const exact = (rows: CurveRow[]) => simplifyCurve(rows, 0.5);
+  const d = curveDifference(exact(system), parts.map(exact));
+  const sell = Float64Array.from(d.sell);
+  for (let k = 1; k < sell.length; k++) sell[k] = Math.max(sell[k], sell[k - 1]);
+  const buy = Float64Array.from(d.buy);
+  for (let k = buy.length - 2; k >= 0; k--) buy[k] = Math.max(buy[k], buy[k + 1]);
+  const ends = [sell.length > 0 ? sell[0] : 0, buy.length > 0 ? buy[buy.length - 1] : 0];
+  const offset = Math.max(0, Math.round(-Math.min(0, ...ends)));
+  const side = (prices: number[], v: Float64Array, descending: boolean): number[] => {
+    const n = prices.length;
+    if (n === 0) return [];
+    const tol = Math.max(1, Math.round(v[descending ? 0 : n - 1] + offset) * SIMPLIFY_RATIO);
+    const out: number[] = [];
+    let kept = -1;
+    for (let i = 0; i < n; i++) {
+      const k = descending ? n - 1 - i : i;
+      const x = Math.round(v[k] + offset);
+      if (kept < 0 || x - kept >= tol || (i === n - 1 && x > kept)) {
+        out.push(round2(prices[k]), x);
+        kept = x;
+      }
+    }
+    return out;
+  };
+  return { offset, sell: side(d.sellPrices, sell, false), buy: side(d.buyPrices, buy, true) };
+}
+
 // ---- ファイル形式（public/data/curves） ----
 
 export const CURVE_DAY_FORMAT = 'jepx-viewer/curve-day@1';
@@ -400,8 +470,11 @@ export const CURVE_METRICS_FORMAT = 'jepx-viewer/curve-metrics@1';
 export interface CurveDayFile {
   format: typeof CURVE_DAY_FORMAT;
   date: string;
-  /** 48 コマ（データの無いコマは null）。groups の先頭はシステムプライス */
-  slots: ({ groups: AreaGroup[]; sell: number[][]; buy: number[][] } | null)[];
+  /**
+   * 48 コマ（データの無いコマは null）。groups の先頭はシステムプライス。
+   * residual は市場分断したコマの「システムプライス − 分断エリアの合計」（StepResidual。前の版のファイルには無い）
+   */
+  slots: ({ groups: AreaGroup[]; sell: number[][]; buy: number[][]; residual?: { offset: number; sell: number[]; buy: number[] } } | null)[];
   /** システムプライスのカーブの指標（CURVE_METRICS の順、各 48 コマ、欠損は null） */
   metrics: Record<CurveMetricKey, (number | null)[]>;
 }
@@ -425,6 +498,8 @@ export interface CurveDay {
   day: number;
   /** 48 コマ。先頭はシステムプライス */
   slots: (CurveGroup[] | null)[];
+  /** 48 コマの「システムプライス − 分断エリアの合計」（間引く前のカーブから。市場分断していないコマと、前の版のファイルでは null） */
+  residuals?: (StepResidual | null)[];
 }
 
 export const SYSTEM_LABEL = 'システムプライス';
@@ -487,7 +562,12 @@ export function encodeCurveDay(raw: RawCurveDay, groups?: AreaGroup[][], tol?: n
       ...ids.map((id) => named.get(id) ?? { id, label: `分断エリア ${id}`, areas: [] }),
     ];
     const curves = gs.map((g) => simplifyCurve(m.get(g.id)!, tol));
-    return { groups: gs, sell: curves.map((c) => encodeSteps(c.sell, false)), buy: curves.map((c) => encodeSteps(c.buy, true)) };
+    const slot: NonNullable<CurveDayFile['slots'][number]> = { groups: gs, sell: curves.map((c) => encodeSteps(c.sell, false)), buy: curves.map((c) => encodeSteps(c.buy, true)) };
+    if (ids.length > 0) {
+      const r = residualSteps(system, ids.map((id) => m.get(id)!));
+      slot.residual = { offset: r.offset, sell: encodeSteps(r.sell, false), buy: encodeSteps(r.buy, true) };
+    }
+    return slot;
   });
   return { format: CURVE_DAY_FORMAT, date: isoFromDay(raw.day), slots, metrics };
 }
@@ -522,6 +602,10 @@ export function decodeCurveDay(json: unknown): CurveDay {
       const f = file.slots[s];
       if (!f) return null;
       return f.groups.map((g, k) => ({ ...g, sell: decodeSteps(f.sell[k] ?? [], false), buy: decodeSteps(f.buy[k] ?? [], true) }));
+    }),
+    residuals: Array.from({ length: SLOTS }, (_, s) => {
+      const r = file.slots[s]?.residual;
+      return r ? { offset: r.offset, sell: decodeSteps(r.sell, false), buy: decodeSteps(r.buy, true) } : null;
     }),
   };
 }

@@ -18,12 +18,15 @@ export const AREAS = [
 export type AreaKey = (typeof AREAS)[number]['key'];
 export type PriceKey = 'system' | AreaKey;
 export type VolumeKey = 'sellBid' | 'buyBid' | 'volume';
-export type SeriesKey = PriceKey | VolumeKey;
+/** ブロック入札の量（取引結果の付帯列。入札カーブの単エリアの推定に使う） */
+export type BlockKey = 'sellBlockBid' | 'sellBlockVolume' | 'buyBlockBid' | 'buyBlockVolume';
+export type SeriesKey = PriceKey | VolumeKey | BlockKey;
 
 export const AREA_KEYS: AreaKey[] = AREAS.map((a) => a.key);
 export const PRICE_KEYS: PriceKey[] = ['system', ...AREA_KEYS];
 export const VOLUME_KEYS: VolumeKey[] = ['sellBid', 'buyBid', 'volume'];
-export const SERIES_KEYS: SeriesKey[] = [...PRICE_KEYS, ...VOLUME_KEYS];
+export const BLOCK_KEYS: BlockKey[] = ['sellBlockBid', 'sellBlockVolume', 'buyBlockBid', 'buyBlockVolume'];
+export const SERIES_KEYS: SeriesKey[] = [...PRICE_KEYS, ...VOLUME_KEYS, ...BLOCK_KEYS];
 export const SERIES_COUNT = SERIES_KEYS.length;
 
 /** 1 日あたりのコマ数（30 分 × 48） */
@@ -40,6 +43,10 @@ export const SERIES_LABEL: Record<SeriesKey, string> = {
   sellBid: '売り入札量',
   buyBid: '買い入札量',
   volume: '約定総量',
+  sellBlockBid: '売りブロック入札総量',
+  sellBlockVolume: '売りブロック約定総量',
+  buyBlockBid: '買いブロック入札総量',
+  buyBlockVolume: '買いブロック約定総量',
 };
 
 /** チップや凡例用の短い表記 */

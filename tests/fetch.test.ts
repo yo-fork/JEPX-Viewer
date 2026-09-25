@@ -130,6 +130,9 @@ describe('データ取得スクリプト', () => {
     const expected = curveFixture(dayFromYmd(2024, 4, 2))!;
     const split = expected.groups.findIndex((g) => g.length > 0);
     expect(day.slots[split]!.map((g) => g.label)).toEqual(['システムプライス', ...expected.groups[split].map((g) => g.label)]);
+    // 市場分断したコマには、間引く前のカーブから求めた「システムプライス − 分断エリアの合計」も入れる
+    expect(day.residuals![split]).not.toBeNull();
+    expect(day.residuals![expected.groups.findIndex((g) => g.length === 0)]).toBeNull();
     const metrics = decodeCurveMetrics(JSON.parse(await readFile(path.join(out, 'curves', 'fy2024.json'), 'utf8')));
     expect(metrics.size).toBe(3);
 
@@ -138,6 +141,26 @@ describe('データ取得スクリプト', () => {
     const again = await run({ ...opts, from: 2025, to: 2025 });
     expect(requests.slice(before).filter((r) => r.includes('spot_bid_curves'))).toEqual([expect.stringContaining('20240331')]);
     expect(again.curves!.dates).toHaveLength(3);
+  });
+
+  it('--keep-csv では、入札カーブと分断エリアの CSV も raw/curves に保存する（あとで --from-dir で変換し直せる）', async () => {
+    const out = path.join(workdir, 'keep');
+    await run({
+      ...defaultOptions(),
+      from: 2024,
+      to: 2024,
+      out,
+      keepCsv: true,
+      urlTemplate: `${baseUrl}/csv_read.php?file=spot_summary_{fy}.csv`,
+      curvesUrlTemplate: `${baseUrl}/csv_read.php?dir={dir}&file={file}`,
+      curvesFrom: dayFromYmd(2024, 4, 1),
+      curvesTo: dayFromYmd(2024, 4, 1),
+      delayMs: 0,
+      log: () => {},
+    });
+    for (const f of ['spot_summary_2024.csv', 'curves/spot_bid_curves_20240401.csv', 'curves/spot_splitting_areas_20240401.csv']) {
+      expect(existsSync(path.join(out, 'raw', f))).toBe(true);
+    }
   });
 
   it('ダウンロード済みの CSV（--from-dir）を変換できる（入札カーブの CSV も）', async () => {

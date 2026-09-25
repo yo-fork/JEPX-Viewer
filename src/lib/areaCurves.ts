@@ -6,39 +6,44 @@
  * - 1 エリアだけで分断した「単エリア」は JEPX がカーブを出さないので、システムプライスのカーブから
  *   公表されている分断エリアのカーブを引いて推定する。
  *
- * システムプライスのカーブは全エリアの入札そのものだが、分断エリアのカーブには、連系線で他の分断エリアとやりとりする量が
- * 送る側では買い、受ける側では売りとして、価格によらない量で入っているとみられる（分断エリアのカーブが約定価格で交わるのはそのため。
- * 公表されている分断エリアの入札量の合計が、システムプライスより多くなることもある）。引くと、その分だけ売り・買いとも引き過ぎになる。
- * - 引き過ぎは価格によらない量なので、売り・買いに同じ量を足して 0 以上に戻す。同じ量なので交点の価格は変わらない。
- *   足す量そのもの（単エリアの、最も安い売り・最も高い買いの量）は分からないので、少ない方の端を 0 にする
- * - 単エリアが 1 つなら、足したカーブはそのエリアの約定価格で交わるはず。ずれが残れば売りか買いの一方に足して合わせる
- * - 単エリアが複数なら、エリアごとには分けられないので、合わせたカーブ（補正なし）にする
- * - 引いた差が価格によらずほぼ一定（単エリアの入札の形が残らない）なら、推定できないとする
+ * JEPX の実データ（2022〜2026 年）で確かめたカーブの作り:
+ * - システムプライスのカーブには、単エリアを含む全エリアの入札が入っている（引いた差が、単エリアの入札の分だけ価格によって変わる）
+ * - 分断エリアのカーブには、連系線で他の分断エリアとやりとりする量が、送る側では買い（最も高い価格）、受ける側では売り（0 円）として
+ *   入っている。単エリアの無い分断では、システムプライス − 分断エリアの合計は、どの価格でも同じ量になる。
+ *   公表されている分断エリアの入札量の合計が、システムプライスより多くなることもある
+ * - ブロック入札は、システムプライスの計算と市場分断の計算とで約定するものが違い、カーブには約定したものだけが価格によらない量で入っている。
+ *   その差は、取引結果の入札量・ブロック入札の量と、システムプライスのカーブの入札量の合計から分かる
+ *
+ * そこで、単エリアのカーブは次のように推定する（単エリアが 1 つなら、こうして作ったカーブはそのエリアの約定価格で交わる）。
+ * 1. システムプライスのカーブから、公表されている分断エリアのカーブを引く（負にもなる）
+ * 2. ブロック入札の約定の違いを差し引く（取引結果にブロック入札の量が無ければ、代わりに 4. で合わせる）
+ * 3. 連系線でやりとりする量は分からないので、売り・買いに同じ量を足して 0 以上に戻す。同じ量なので交点の価格は変わらない。
+ *    足す量そのものは分からないため、少ない方の端（最も安い売りか最も高い買い）を 0 にする
+ * 4. 単エリアが 1 つなら、約定価格とのずれが残れば売りか買いの一方に足して合わせる
+ * 単エリアが複数ならエリアごとには分けられないので、合わせたカーブ（4. はしない）にする。
+ * 引いた差が価格によらずほぼ一定（単エリアの入札の形が残らない）なら、推定できないとする。
  */
 import {
   buyVolumeAt,
-  buyVolumesAt,
   crossing,
+  curveDifference,
   rowsFromSteps,
   sellVolumeAt,
-  sellVolumesAt,
-  stepPrices,
   SYSTEM_GROUP,
   SYSTEM_LABEL,
   type CurveDay,
+  type CurveDifference,
   type CurveGroup,
+  type StepCurve,
+  type StepResidual,
 } from './bidCurves';
 import { AREA_KEYS, SERIES_LABEL, type AreaKey } from './series';
+
+export { curveDifference, type CurveDifference, type StepCurve } from './bidCurves';
 
 /** 入札カーブを見る対象（システムプライスか、エリア） */
 export type CurveTarget = 'system' | AreaKey;
 export const CURVE_TARGETS: CurveTarget[] = ['system', ...AREA_KEYS];
-
-/** 階段状のカーブ（売りは価格の昇順、買いは降順に [価格, 累積量, …]） */
-export interface StepCurve {
-  sell: ArrayLike<number>;
-  buy: ArrayLike<number>;
-}
 
 /** そのコマの市場分断の様子 */
 export type SlotSplit =
@@ -61,27 +66,22 @@ export function slotSplit(groups: readonly CurveGroup[]): SlotSplit {
   return { kind: 'split', published, singles: AREA_KEYS.filter((a) => !covered.has(a)) };
 }
 
-/** 階段状のカーブの差（total − Σ parts）。売り・買いそれぞれ、価格の点（昇順）ごとの値で、負にもなる */
-export interface CurveDifference {
-  sellPrices: number[];
-  sell: Float64Array;
-  buyPrices: number[];
-  buy: Float64Array;
-}
-
-export function curveDifference(total: StepCurve, parts: readonly StepCurve[]): CurveDifference {
-  const side = (pick: (c: StepCurve) => ArrayLike<number>, volumesAt: typeof sellVolumesAt) => {
-    const prices = stepPrices(pick(total), ...parts.map(pick));
-    const v = volumesAt(pick(total), prices);
-    for (const part of parts) {
-      const x = volumesAt(pick(part), prices);
-      for (let k = 0; k < prices.length; k++) v[k] -= x[k];
-    }
-    return { prices, v };
-  };
-  const s = side((c) => c.sell, sellVolumesAt);
-  const b = side((c) => c.buy, buyVolumesAt);
-  return { sellPrices: s.prices, sell: s.v, buyPrices: b.prices, buy: b.v };
+/** 保存しておいた「システムプライス − 分断エリアの合計」（間引く前のカーブから求めたもの）を、価格の点ごとの値に戻す */
+export function residualDifference(r: StepResidual): CurveDifference {
+  const sellPrices: number[] = [];
+  const sell: number[] = [];
+  for (let i = 0; i < r.sell.length; i += 2) {
+    sellPrices.push(r.sell[i]);
+    sell.push(r.sell[i + 1] - r.offset);
+  }
+  // 買いは価格の降順なので、昇順に並べ直す
+  const buyPrices: number[] = [];
+  const buy: number[] = [];
+  for (let i = r.buy.length - 2; i >= 0; i -= 2) {
+    buyPrices.push(r.buy[i]);
+    buy.push(r.buy[i + 1] - r.offset);
+  }
+  return { sellPrices, sell: Float64Array.from(sell), buyPrices, buy: Float64Array.from(buy) };
 }
 
 export interface LiftedCurve {
@@ -128,6 +128,44 @@ export function liftDifference(d: CurveDifference): LiftedCurve {
     sellRange: sell.length > 0 ? sell[sell.length - 1] - sell[0] : 0,
     buyRange: buy.length > 0 ? buy[0] - buy[buy.length - 1] : 0,
   };
+}
+
+/** 取引結果の売り・買い入札量とブロック入札の量（MW。分からなければ NaN） */
+export interface SpotBids {
+  sellBid: number;
+  buyBid: number;
+  sellBlockBid: number;
+  sellBlockVolume: number;
+  buyBlockBid: number;
+  buyBlockVolume: number;
+}
+
+/**
+ * ブロック入札の約定の違い（MW）: システムプライスの計算で、市場分断の計算より多く約定した売りのブロック入札（sell）と、
+ * 少なく約定した買いのブロック入札（buy）。どちらも負にもなる
+ */
+export interface BlockGap {
+  sell: number;
+  buy: number;
+}
+
+/** ブロック入札の約定の違いの説明（「システムプライスの計算のほうが、売りが 142 MW 多く、買いが 758 MW 少なく約定」） */
+export function blockGapText(g: BlockGap, fmt: (mw: number) => string = (mw) => `${Math.round(mw).toLocaleString('ja-JP')} MW`): string {
+  if (g.sell === 0 && g.buy === 0) return 'システムプライスの計算と市場分断の計算とで同じだけ約定';
+  const side = (label: string, mw: number) => (mw === 0 ? `${label}は同じだけ` : `${label}が ${fmt(Math.abs(mw))} ${mw > 0 ? '多く' : '少なく'}`);
+  // buy は「少なく約定した買い」なので、符号を逆にして言う
+  return `システムプライスの計算のほうが、${side('売り', g.sell)}、${side('買い', -g.buy)}約定`;
+}
+
+/**
+ * 取引結果とシステムプライスのカーブから、ブロック入札の約定の違いを求める（取引結果にブロック入札の量が無ければ null）。
+ * システムプライスのカーブの入札量の合計 = 取引結果の入札量 − システムプライスの計算で約定しなかったブロック入札。
+ * 約定したブロック入札の量（取引結果）は市場分断の計算のもの
+ */
+export function blockGap(system: StepCurve, spot: SpotBids): BlockGap | null {
+  const sell = spot.sellBlockBid - spot.sellBlockVolume - (spot.sellBid - totalOf(system.sell));
+  const buy = spot.buyBid - totalOf(system.buy) - (spot.buyBlockBid - spot.buyBlockVolume);
+  return Number.isFinite(sell) && Number.isFinite(buy) ? { sell: Math.round(sell), buy: Math.round(buy) } : null;
 }
 
 /**
@@ -177,9 +215,15 @@ export interface AreaCurve {
   subtracted?: string[];
   /** 推定: 引いた後に売り・買いの両方に足した量（MW） */
   lift?: number;
-  /** single: 補正する前のカーブ（引いて足しただけ）の交点の価格（交わらなければ NaN） */
+  /** 推定: 差し引いたブロック入札の約定の違い（取引結果にブロック入札の量が無ければ無し） */
+  blocks?: BlockGap;
+  /** 推定: 引いた差の価格による変わり方（MW。単エリアの入札の分） */
+  ranges?: { sell: number; buy: number };
+  /** 推定: 間引く前のカーブから求めた差を使った（前の版のファイルでは、描画用に間引いたカーブどうしの差） */
+  exact?: boolean;
+  /** single: 補正する前のカーブ（引いてブロック入札の違いを差し引き、足しただけ）の交点の価格（交わらなければ NaN） */
   rawCrossing?: number;
-  /** single: 約定価格で交わるように足した側と量（約定価格が分からなければ無し） */
+  /** single: 約定価格で交わるように足した側と量（もう約定価格で交わっていれば量は 0。約定価格が分からなければ無し） */
   correction?: { side: 'sell' | 'buy'; mw: number; price: number };
   /** 推定・unavailable: 売り・買いの入札量の合計 */
   totals?: CurveTotals;
@@ -190,25 +234,28 @@ export interface AreaCurve {
  * 描画用に間引いたカーブの差なので、間引いた分（各カーブの合計量の 0.1%）より十分大きくとる
  */
 export const MIN_RESIDUAL_SHARE = 0.005;
-const MIN_RESIDUAL_MW = 100;
-
-/**
- * システムプライスのカーブの入札量の合計と、取引結果の売り・買い入札量（kWh を MW にしたもの）を同じとみなす差（MW）。
- * 描画用のカーブの量は 1MW 単位に丸めてある
- */
-export const TOTALS_TOLERANCE_MW = 1;
-export const sameTotal = (curveMw: number, spotMw: number): boolean => Math.abs(curveMw - spotMw) <= TOTALS_TOLERANCE_MW;
+export const MIN_RESIDUAL_MW = 100;
+/** 同じ価格とみなす差（価格は 0.01 円単位） */
+const PRICE_EPS = 0.005;
 
 /** 階段状のカーブの入札量の合計（売りは最も高い価格、買いは最も安い価格での累積。どちらも最後の点） */
 export const totalOf = (steps: ArrayLike<number>): number => (steps.length >= 2 ? steps[steps.length - 1] : 0);
 
 export const areaLabel = (a: AreaKey): string => SERIES_LABEL[a];
 
+/** 単エリアの推定に使う、取引結果と保存しておいた差 */
+export interface EstimateInputs {
+  /** 取引結果の入札量・ブロック入札の量（ブロック入札の約定の違いを差し引くのに使う） */
+  spot?: SpotBids | null;
+  /** 間引く前のカーブから求めた「システムプライス − 分断エリアの合計」（CurveDay.residuals） */
+  residual?: StepResidual | null;
+}
+
 /**
  * そのコマで target の価格を決めたカーブ。
  * @param priceOf エリアの約定価格（分からなければ NaN）。単エリアの補正に使う
  */
-export function areaCurve(groups: readonly CurveGroup[], target: CurveTarget, priceOf: (area: AreaKey) => number): AreaCurve | null {
+export function areaCurve(groups: readonly CurveGroup[], target: CurveTarget, priceOf: (area: AreaKey) => number, inputs: EstimateInputs = {}): AreaCurve | null {
   const system = groups.find((g) => g.id === SYSTEM_GROUP);
   if (!system) return null;
   const sys: AreaCurve = { kind: 'system', sell: system.sell, buy: system.buy, label: SYSTEM_LABEL, areas: AREA_KEYS };
@@ -219,7 +266,14 @@ export function areaCurve(groups: readonly CurveGroup[], target: CurveTarget, pr
   const own = split.published.find((g) => g.areas.includes(target));
   if (own) return { kind: 'group', sell: own.sell, buy: own.buy, label: own.label, areas: own.areas };
 
-  const est = liftDifference(curveDifference(system, split.published));
+  const exact = !!inputs.residual;
+  const diff = inputs.residual ? residualDifference(inputs.residual) : curveDifference(system, split.published);
+  const blocks = inputs.spot ? blockGap(system, inputs.spot) : null;
+  if (blocks) {
+    for (let k = 0; k < diff.sell.length; k++) diff.sell[k] -= blocks.sell;
+    for (let k = 0; k < diff.buy.length; k++) diff.buy[k] += blocks.buy;
+  }
+  const est = liftDifference(diff);
   const subtracted = split.published.map((g) => g.label);
   const label = split.singles.map(areaLabel).join('・');
   const sum = (f: (g: CurveGroup) => ArrayLike<number>) => split.published.reduce((v, g) => v + totalOf(f(g)), 0);
@@ -230,15 +284,18 @@ export function areaCurve(groups: readonly CurveGroup[], target: CurveTarget, pr
     publishedBuy: sum((g) => g.buy),
   };
   const minMw = Math.max(MIN_RESIDUAL_MW, MIN_RESIDUAL_SHARE * Math.max(totals.systemSell, totals.systemBuy));
-  if (est.sellRange < minMw && est.buyRange < minMw) {
-    return { kind: 'unavailable', sell: new Float64Array(0), buy: new Float64Array(0), label, areas: split.singles, subtracted, totals };
+  const ranges = { sell: est.sellRange, buy: est.buyRange };
+  if (ranges.sell < minMw && ranges.buy < minMw) {
+    return { kind: 'unavailable', sell: new Float64Array(0), buy: new Float64Array(0), label, areas: split.singles, subtracted, totals, ranges };
   }
-  const base = { sell: est.sell, buy: est.buy, subtracted, lift: est.lift, totals };
+  const base = { sell: est.sell, buy: est.buy, subtracted, lift: est.lift, totals, ranges, exact, ...(blocks ? { blocks } : {}) };
   if (split.singles.length > 1) return { kind: 'combined', ...base, label, areas: split.singles };
   const rawCrossing = crossing(rowsFromSteps(est.sell, est.buy))?.price ?? Number.NaN;
   const single = { kind: 'single' as const, ...base, label: areaLabel(target), areas: [target], rawCrossing };
   const price = priceOf(target);
   if (!Number.isFinite(price)) return single;
+  // もう約定価格で交わっていれば足さない（交点の段で売りと買いの量が違うのは、約定価格の入札が一部だけ約定したため）
+  if (Math.abs(rawCrossing - price) < PRICE_EPS) return { ...single, correction: { side: 'buy', mw: 0, price } };
   const c = correctToPrice(est, price);
   return { ...single, sell: c.sell, buy: c.buy, correction: { side: c.side, mw: c.mw, price } };
 }

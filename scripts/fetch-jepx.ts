@@ -525,7 +525,10 @@ async function fetchCurves(o: FetchOptions, dispatcher: EnvHttpProxyAgent, pace:
     await pace();
     try {
       const bytes = await download(curveUrl(o, 'spot_splitting_areas', day), dispatcher);
-      if (bytes && bytes.length > 0) groups = parseSplittingAreasCsv(decodeCsvBytes(bytes).text).get(day);
+      if (bytes && bytes.length > 0) {
+        if (o.keepCsv) await writeFile(path.join(o.out, 'raw', 'curves', `spot_splitting_areas_${ymd8(day)}.csv`), bytes);
+        groups = parseSplittingAreasCsv(decodeCsvBytes(bytes).text).get(day);
+      }
     } catch (err) {
       o.log(`${label}: 分断エリアの名前を取得できませんでした（${(err as Error).message}）`);
     }

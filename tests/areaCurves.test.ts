@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { aloneSlots, areaCurve, correctToPrice, curveDifference, liftDifference, sameTotal, slotSplit } from '../src/lib/areaCurves';
-import { buyVolumeAt, crossing, decodeCurveDay, encodeCurveDay, rowsFromSteps, sellVolumeAt, SYSTEM_GROUP, type CurveGroup } from '../src/lib/bidCurves';
+import { aloneSlots, areaCurve, blockGap, blockGapText, correctToPrice, curveDifference, liftDifference, residualDifference, slotSplit, type SpotBids } from '../src/lib/areaCurves';
+import { buyAtOrAbove, buyVolumeAt, crossing, decodeCurveDay, encodeCurveDay, rowsFromSteps, sellAtOrBelow, sellVolumeAt, SYSTEM_GROUP, type CurveGroup, type RawCurveDay } from '../src/lib/bidCurves';
 import { dayFromYmd } from '../src/lib/dates';
 import { syntheticCurveDay, type SlotTarget } from '../src/lib/demoCurves';
 import type { AreaKey } from '../src/lib/series';
@@ -51,15 +51,83 @@ describe('correctToPrice', () => {
   });
 });
 
-it('システムプライスのカーブの合計と取引結果の入札量は 1MW 以内なら同じとみなす', () => {
-  expect([sameTotal(44731, 44730.8), sameTotal(44731, 44729.9), sameTotal(44731, 44729.5)]).toEqual([true, false, false]);
-});
-
 /** 合成の 1 コマを、保存・読み込みしたときと同じ形（描画用のカーブ）にする */
 function slotGroups(target: SlotTarget): CurveGroup[] {
   const { raw, groups } = syntheticCurveDay(dayFromYmd(2025, 5, 3), [target]);
   return decodeCurveDay(JSON.parse(JSON.stringify(encodeCurveDay(raw, groups)))).slots[0]!;
 }
+
+const saved = (raw: RawCurveDay, groups?: Parameters<typeof encodeCurveDay>[1]) => decodeCurveDay(JSON.parse(JSON.stringify(encodeCurveDay(raw, groups))));
+const lastOf = (a: ArrayLike<number>) => a[a.length - 1];
+
+describe('間引く前のカーブから求めた「システムプライス − 分断エリアの合計」', () => {
+  const base = { tohoku: 12, tokyo: 12, chubu: 9, hokuriku: 9, kansai: 9, chugoku: 9, shikoku: 9 };
+  it('市場分断したコマに 1MW 単位で持ち、少ない方の端が 0 になるよう offset を足してある', () => {
+    const { raw, groups } = syntheticCurveDay(dayFromYmd(2025, 5, 3), [{ system: 10, volume: 30000, areas: { ...base, hokkaido: 15, kyushu: 9 } }]);
+    const day = saved(raw, groups);
+    const r = day.residuals![0]!;
+    expect(r.offset).toBeGreaterThan(0);
+    expect(Math.min(r.sell[1], r.buy[1])).toBe(0);
+    const m = raw.slots[0];
+    const sys = m.get(SYSTEM_GROUP)!;
+    const parts = [...m.keys()].filter((k) => k !== SYSTEM_GROUP).map((k) => m.get(k)!);
+    const d = residualDifference(r);
+    // 残した点では、生のカーブの差と丸めの分（各カーブ 0.5MW）ほどしか違わない
+    d.sellPrices.forEach((p, k) => expect(Math.abs(d.sell[k] - (sellAtOrBelow(sys, p) - parts.reduce((v, rows) => v + sellAtOrBelow(rows, p), 0)))).toBeLessThanOrEqual(2));
+    d.buyPrices.forEach((p, k) => expect(Math.abs(d.buy[k] - (buyAtOrAbove(sys, p) - parts.reduce((v, rows) => v + buyAtOrAbove(rows, p), 0)))).toBeLessThanOrEqual(2));
+    // 分断していないコマには無い
+    expect(saved(syntheticCurveDay(dayFromYmd(2025, 5, 3), [{ system: 10, volume: 30000 }]).raw).residuals![0]).toBeNull();
+  });
+
+  it('ブロック入札の約定の違いを取引結果から求めて差し引くと、補正しなくても約定価格で交わる', () => {
+    const { raw, groups } = syntheticCurveDay(dayFromYmd(2025, 5, 3), [{ system: 10, volume: 30000, areas: { ...base, hokkaido: 15, kyushu: 9 } }]);
+    // 実データと同じく、システムプライスの計算のほうが売りのブロック入札が 300MW 多く、買いが 500MW 少なく約定したとする
+    // （約定したブロック入札は、カーブに価格によらない量で入っている）
+    const sys = raw.slots[0].get(SYSTEM_GROUP)!;
+    raw.slots[0].set(
+      SYSTEM_GROUP,
+      sys.map((r, i) => ({ price: r.price, sell: i === 0 ? r.sell : r.sell + 300, buy: r.buy - 500 })),
+    );
+    const day = saved(raw, groups);
+    const gs = day.slots[0]!;
+    const system = gs.find((g) => g.id === SYSTEM_GROUP)!;
+    // 取引結果: 約定しなかったブロック入札は（市場分断の計算で）売り 5,000MW・買い 800MW
+    const spot: SpotBids = {
+      sellBid: lastOf(system.sell) + 5000 - 300,
+      buyBid: lastOf(system.buy) + 800 + 500,
+      sellBlockBid: 6000,
+      sellBlockVolume: 1000,
+      buyBlockBid: 1000,
+      buyBlockVolume: 200,
+    };
+    expect(blockGap(system, spot)).toEqual({ sell: 300, buy: 500 });
+    expect(blockGapText({ sell: 142, buy: 758 })).toBe('システムプライスの計算のほうが、売りが 142 MW 多く、買いが 758 MW 少なく約定');
+    expect(blockGapText({ sell: -1652, buy: 0 })).toBe('システムプライスの計算のほうが、売りが 1,652 MW 少なく、買いは同じだけ約定');
+    const price = (a: AreaKey) => (a === 'hokkaido' ? 15 : Number.NaN);
+    const c = areaCurve(gs, 'hokkaido', price, { spot, residual: day.residuals![0] })!;
+    expect([c.kind, c.blocks, c.exact]).toEqual(['single', { sell: 300, buy: 500 }, true]);
+    // 合成のカーブは 0.25 円おきの段
+    expect(Math.abs(c.rawCrossing! - 15)).toBeLessThanOrEqual(0.25);
+    expect(c.correction!.mw).toBeLessThan(50);
+    // 取引結果にブロック入札の量が無ければ、約定価格で交わるよう一方に足して合わせる（ブロック入札の違いの分だけ多く足す）
+    const without = areaCurve(gs, 'hokkaido', price, { spot: { ...spot, sellBlockBid: Number.NaN }, residual: day.residuals![0] })!;
+    expect(without.blocks).toBeUndefined();
+    expect(without.correction!.mw).toBeGreaterThan(700);
+    // 保存しておいた差が無い（前の版のファイル）ときは、描画用のカーブどうしの差から
+    const old = areaCurve(gs, 'hokkaido', price, { spot })!;
+    expect([old.exact, old.blocks]).toEqual([false, { sell: 300, buy: 500 }]);
+    expect(Math.abs(old.rawCrossing! - 15)).toBeLessThanOrEqual(0.5);
+  });
+
+  it('約定価格でもう交わっていれば補正しない', () => {
+    const { raw, groups } = syntheticCurveDay(dayFromYmd(2025, 5, 3), [{ system: 10, volume: 30000, areas: { ...base, hokkaido: 15, kyushu: 9 } }]);
+    const day = saved(raw, groups);
+    const probe = areaCurve(day.slots[0]!, 'hokkaido', () => Number.NaN, { residual: day.residuals![0] })!;
+    const c = areaCurve(day.slots[0]!, 'hokkaido', (a) => (a === 'hokkaido' ? probe.rawCrossing! : Number.NaN), { residual: day.residuals![0] })!;
+    expect(c.correction).toEqual({ side: 'buy', mw: 0, price: probe.rawCrossing });
+    expect(f(c.sell)).toEqual(f(probe.sell));
+  });
+});
 
 describe('areaCurve', () => {
   const base = { tohoku: 12, tokyo: 12, chubu: 9, hokuriku: 9, kansai: 9, chugoku: 9, shikoku: 9 };

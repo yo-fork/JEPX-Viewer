@@ -7,28 +7,36 @@
  *   npm run check:curves -- --date 2026-09-26 --slot 9     1 コマの数字を詳しく（--slot は 1〜48 のコマ）
  *   npm run check:curves -- --data <ディレクトリ>            取得済みデータの場所（既定: public/data）
  *
- * 市場分断したときの入札カーブの作り（システムプライスのカーブに単エリアの入札が入っているか、分断エリアのカーブに
- * 連系線でやりとりする量が入っているか）と、単エリアのカーブの推定が合っているかを、手元のデータで確かめる（src/lib/curveCheck.ts）。
+ * 市場分断したときの入札カーブの作り（分断エリアのカーブに連系線でやりとりする量が入っているか、システムプライスのカーブに
+ * 単エリアの入札が入っているか）と、単エリアのカーブの推定が約定価格で交わるかを、手元のデータで確かめる（src/lib/curveCheck.ts）。
  */
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { areaCurve, slotSplit, totalOf } from '../src/lib/areaCurves';
+import { areaCurve, blockGapText, residualDifference, slotSplit, totalOf, type SpotBids } from '../src/lib/areaCurves';
 import {
-  buyVolumeAt,
   crossing,
-  CURVE_METRIC_INDEX,
   curveDayFile,
+  curveDifference,
   decodeCurveDay,
-  decodeCurveMetrics,
   rowsFromSteps,
-  sellVolumeAt,
   SYSTEM_GROUP,
+  type CurveDay,
   type CurveGroup,
-  type CurveMetricDays,
-  type CurveMetricKey,
 } from '../src/lib/bidCurves';
-import { checkSlot, median, PRICE_TOLERANCES, share, SLOT_KIND_LABEL, SLOT_KINDS, withinPrice, type SlotCheck, type SlotInput } from '../src/lib/curveCheck';
+import {
+  checkSlot,
+  isFlat,
+  median,
+  PRICE_TOLERANCES,
+  share,
+  SLOT_KIND_LABEL,
+  SLOT_KINDS,
+  varies,
+  withinPrice,
+  type SlotCheck,
+  type SlotInput,
+} from '../src/lib/curveCheck';
 import { decodeFyFile, MANIFEST_FORMAT, type Manifest } from '../src/lib/dataFile';
 import { formatDay, isoFromDay, parseDateString, slotRangeLabel } from '../src/lib/dates';
 import { fmtNum, fmtPct, fmtPrice, fmtSigned } from '../src/lib/format';
@@ -43,9 +51,6 @@ export interface CheckOptions {
   /** 1 コマを詳しく見るとき（0 始まり。--date と一緒に指定する） */
   slot: number | null;
 }
-
-/** システムプライスのカーブの合計と取引結果の入札量を「同じ」とみなす差（MW）。間引く前のカーブの量は 0.1MW 単位 */
-const SAME_MW = 1;
 
 export function parseCheckArgs(argv: string[]): CheckOptions {
   const o: CheckOptions = { data: 'public/data', from: null, to: null, slot: null };
@@ -112,13 +117,18 @@ function table(header: string[], rows: string[][], indent = '  ', left: number[]
   return [line(header), ...rows.map(line)];
 }
 
-const mw = (v: number, digits = 0) => (Number.isFinite(v) ? `${fmtNum(v, digits)}` : '—');
+const mw = (v: number, digits = 0) => (Number.isFinite(v) ? fmtNum(v, digits) : '—');
 const signedMw = (v: number, digits = 0) => (Number.isFinite(v) ? fmtSigned(v, digits) : '—');
-const gw = (v: number) => (Number.isFinite(v) ? `${fmtSigned(v / 1000, 2)} GW` : '—');
+const gw = (v: number) => (Number.isFinite(v) ? `${fmtNum(v / 1000, 2)} GW` : '—');
+const signedGw = (v: number) => (Number.isFinite(v) ? `${fmtSigned(v / 1000, 2)} GW` : '—');
 const yen = (v: number) => (Number.isFinite(v) ? `${fmtSigned(v, 2)} 円` : '—');
 const pct = (v: number) => fmtPct(v);
-const within = (values: number[]) => PRICE_TOLERANCES.map((t) => `${t} 円以内 ${pct(share(values, withinPrice(t)))}`).join('・');
-const same = (v: number) => Math.abs(v) <= SAME_MW;
+const TOL_LABEL = (t: number) => (t <= 0.01 ? '同じ' : `${t} 円以内`);
+const within = (values: number[]) => PRICE_TOLERANCES.map((t) => `${TOL_LABEL(t)} ${pct(share(values, withinPrice(t)))}`).join('・');
+const kindText = (c: SlotCheck) => (c.singles.length > 0 ? `${SLOT_KIND_LABEL[c.kind]}（${c.singles.map((a) => SERIES_LABEL[a]).join('・')}）` : SLOT_KIND_LABEL[c.kind]);
+/** ブロック入札の約定の違い（システムプライスの計算で多く約定した売り、少なく約定した買い） */
+const blocksText = (c: SlotCheck) =>
+  c.blocks ? `売り ${signedMw(c.blocks.sell)}・買い ${signedMw(-c.blocks.buy)} MW` : '（取引結果にブロック入札の量なし）';
 
 // ---- 読み込み ----
 
@@ -128,7 +138,6 @@ async function readJson(file: string): Promise<unknown> {
 
 interface Loaded {
   spot: DayMap;
-  metrics: CurveMetricDays;
   days: number[];
 }
 
@@ -143,33 +152,26 @@ async function load(o: CheckOptions): Promise<Loaded> {
   if (!manifest.curves || manifest.curves.dates.length === 0) throw new Error('入札カーブがありません。npm run fetch で取得してください');
   const spot: DayMap = new Map();
   for (const e of manifest.files) for (const [d, v] of decodeFyFile(await readJson(path.join(o.data, e.file)))) spot.set(d, v);
-  const metrics: CurveMetricDays = new Map();
-  for (const e of manifest.curves.metrics) for (const [d, v] of decodeCurveMetrics(await readJson(path.join(o.data, e.file)))) metrics.set(d, v);
   const days = manifest.curves.dates
     .map((s) => parseDateString(s))
     .filter((d): d is number => d !== null && (o.from === null || d >= o.from) && (o.to === null || d <= o.to))
     .sort((a, b) => a - b);
-  return { spot, metrics, days };
+  return { spot, days };
 }
 
 /** 受渡日・コマの確かめる材料 */
-function slotInput(l: Loaded, day: number, slot: number, groups: CurveGroup[]): SlotInput {
-  const vals = l.spot.get(day);
+function slotInput(l: Loaded, day: CurveDay, slot: number): SlotInput {
+  const vals = l.spot.get(day.day);
   const at = (k: SeriesKey) => (vals ? vals[SERIES_INDEX[k] * SLOTS + slot] : Number.NaN);
-  const m = l.metrics.get(day);
-  const metric = (k: CurveMetricKey) => {
-    const v = m ? m[CURVE_METRIC_INDEX[k] * SLOTS + slot] : Number.NaN;
-    return Number.isFinite(v) ? v : undefined;
-  };
-  return {
-    groups,
-    price: (k: PriceKey) => at(k),
+  const spot: SpotBids = {
     sellBid: kwhToMw(at('sellBid')),
     buyBid: kwhToMw(at('buyBid')),
-    systemSell: metric('sellTotal'),
-    systemBuy: metric('buyTotal'),
-    systemClear: metric('clearPrice'),
+    sellBlockBid: kwhToMw(at('sellBlockBid')),
+    sellBlockVolume: kwhToMw(at('sellBlockVolume')),
+    buyBlockBid: kwhToMw(at('buyBlockBid')),
+    buyBlockVolume: kwhToMw(at('buyBlockVolume')),
   };
+  return { groups: day.slots[slot]!, residual: day.residuals?.[slot], price: (k: PriceKey) => at(k), spot };
 }
 
 interface Checked {
@@ -183,89 +185,81 @@ interface Checked {
 function summary(list: Checked[]): string[] {
   const out: string[] = [];
   const of = (kind: string) => list.filter((x) => x.c.kind === kind).map((x) => x.c);
-  const kinds = SLOT_KINDS.filter((k) => of(k).length > 0);
-
-  out.push('', '■ システムプライスのカーブの入札量の合計と、取引結果の売り・買い入札量（全国）');
-  out.push(`  差 = カーブ − 取引結果。${SAME_MW}MW 以内なら「同じ」。同じなら、システムプライスのカーブには（単エリアを含む）全エリアの入札が入っている`);
-  out.push(
-    ...table(
-      ['コマ', 'コマ数', '売りが同じ', '買いが同じ', '売りの差（中央値）', '買いの差（中央値）', '売りの差（最大）', '買いの差（最大）'],
-      kinds.map((k) => {
-        const cs = of(k);
-        const maxAbs = (f: (c: SlotCheck) => number) => {
-          const v = cs.map(f).filter(Number.isFinite);
-          return v.length === 0 ? Number.NaN : v.reduce((a, b) => (Math.abs(b) > Math.abs(a) ? b : a));
-        };
-        return [
-          SLOT_KIND_LABEL[k],
-          fmtNum(cs.length),
-          pct(share(cs.map((c) => c.sellDiff), same)),
-          pct(share(cs.map((c) => c.buyDiff), same)),
-          `${signedMw(median(cs.map((c) => c.sellDiff)), 1)} MW`,
-          `${signedMw(median(cs.map((c) => c.buyDiff)), 1)} MW`,
-          `${signedMw(maxAbs((c) => c.sellDiff), 1)} MW`,
-          `${signedMw(maxAbs((c) => c.buyDiff), 1)} MW`,
-        ];
-      }),
-    ),
-  );
-
-  const splits = list.filter((x) => x.c.groupCross.length > 0).map((x) => x.c);
-  out.push('', '■ 交点と約定価格の差（交点 − 約定価格）');
-  out.push(`  システムプライスのカーブ（${fmtNum(list.length)} コマ）: ${within(list.map((x) => x.c.systemCross))}`);
-  if (splits.length > 0) {
-    out.push(`  公表されている分断エリアのカーブ（${fmtNum(splits.reduce((n, c) => n + c.groupCross.length, 0))} 本）: ${within(splits.flatMap((c) => c.groupCross))}`);
-    out.push('  分断エリアのカーブが約定価格で交わるなら、連系線でやりとりする量（送る側は買い、受ける側は売り）も入っている');
-    out.push('  （描画用に間引いたカーブの交点なので、段 1 つ分ほどずれることがある）');
+  const splitKinds = (['split', 'single', 'singles'] as const).filter((k) => of(k).length > 0);
+  const counts = SLOT_KINDS.filter((k) => of(k).length > 0).map((k) => `${SLOT_KIND_LABEL[k]} ${fmtNum(of(k).length)}`);
+  out.push(`  ${counts.join('・')}`);
+  const approx = list.filter((x) => x.c.kind !== 'none' && x.c.kind !== 'unnamed' && !x.c.exact).length;
+  if (approx > 0) {
+    out.push(
+      `  （${fmtNum(approx)} コマは前の版で変換したファイルのため、描画用に間引いたカーブどうしの差から確かめています。` +
+        'npm run fetch で変換し直すと、間引く前のカーブから求めた差を使います）',
+    );
   }
 
-  const excessKinds = (['split', 'single', 'singles'] as const).filter((k) => of(k).length > 0);
-  if (excessKinds.length > 0) {
-    out.push('', '■ 公表されている分断エリアのカーブの合計 − システムプライスのカーブ（入札量の合計の中央値）');
-    out.push('  単エリアが無いのに正で、価格によらずほぼ一定（右の 2 列が小さい）なら、分断エリアのカーブに連系線でやりとりする量が入っている');
+  if (splitKinds.length > 0) {
+    out.push('', '■ システムプライス − 公表されている分断エリアのカーブの合計');
+    out.push('  単エリアが無いのに価格によらず一定なら、分断エリアのカーブには連系線でやりとりする量（とブロック入札の約定の違い）が価格によらない量で入っている。');
+    out.push('  単エリアがあって価格によって変わるなら、システムプライスのカーブにその単エリアの入札が入っている');
     out.push(
       ...table(
-        ['コマ', 'コマ数', '売り', '買い', '価格による変わり方（売り）', '価格による変わり方（買い）'],
-        excessKinds.map((k) => {
+        ['コマ', 'コマ数', '価格によらず一定', '価格によって変わる', '変わり方の中央値（売り / 買い）', '分断エリアの合計 − システム（売り / 買い）'],
+        splitKinds.map((k) => {
           const cs = of(k);
           return [
             SLOT_KIND_LABEL[k],
             fmtNum(cs.length),
-            gw(median(cs.map((c) => c.excessSell))),
-            gw(median(cs.map((c) => c.excessBuy))),
-            `${fmtNum(median(cs.map((c) => c.rangeSell)) / 1000, 2)} GW`,
-            `${fmtNum(median(cs.map((c) => c.rangeBuy)) / 1000, 2)} GW`,
+            pct(cs.filter(isFlat).length / cs.length),
+            pct(cs.filter(varies).length / cs.length),
+            `${gw(median(cs.map((c) => c.rangeSell)))} / ${gw(median(cs.map((c) => c.rangeBuy)))}`,
+            `${signedGw(median(cs.map((c) => c.excessSell)))} / ${signedGw(median(cs.map((c) => c.excessBuy)))}`,
           ];
         }),
       ),
     );
   }
 
+  const splits = list.filter((x) => x.c.groupCross.length > 0).map((x) => x.c);
+  if (splits.length > 0) {
+    out.push('', '■ 公表されている分断エリアのカーブの交点 − そのエリアの約定価格');
+    out.push(`  ${fmtNum(splits.reduce((n, c) => n + c.groupCross.length, 0))} 本: ${within(splits.flatMap((c) => c.groupCross))}`);
+    out.push('  （描画用に間引いたカーブの交点なので、段 1 つ分ほどずれることがある）');
+  }
+
   const singles = list.filter((x) => x.c.estimate);
   if (singles.length > 0) {
-    const est = singles.map((x) => x.c.estimate!);
-    const ok = est.filter((e) => e.available);
-    out.push('', '■ 単エリアが 1 つのコマの推定（システムプライス − 分断エリア、売り・買いに同じ量を足しただけのカーブ）');
-    out.push(`  ${fmtNum(est.length)} コマ: 推定できた ${fmtNum(ok.length)}・推定できない（引いた差が価格によらずほぼ一定）${fmtNum(est.length - ok.length)}`);
+    const ok = singles.filter((x) => x.c.estimate!.available).map((x) => x.c);
+    out.push('', '■ 単エリアが 1 つのコマの推定（システムプライス − 分断エリア − ブロック入札の約定の違い、売り・買いに同じ量を足したもの）');
+    out.push(`  ${fmtNum(singles.length)} コマ: 推定できた ${fmtNum(ok.length)}・推定できない（引いた差が価格によらずほぼ一定）${fmtNum(singles.length - ok.length)}`);
     if (ok.length > 0) {
-      out.push(`  交点 − 単エリアの約定価格: ${within(ok.map((e) => e.cross))}`);
-      out.push(`  約定価格で交わるように足した量の中央値 ${mw(median(ok.map((e) => e.correction)))} MW、売り・買いに足した量の中央値 ${mw(median(ok.map((e) => e.lift)))} MW`);
+      const withBlocks = ok.filter((c) => c.blocks);
+      const fixed = ok.filter((c) => c.estimate!.correction > 0);
+      out.push(
+        `  補正しなくても約定価格で売りと買いが釣り合う: ${fmtNum(ok.length - fixed.length)} コマ（${pct((ok.length - fixed.length) / ok.length)}）。` +
+          `約定価格で交わるように足したのは ${fmtNum(fixed.length)} コマ（足した量の中央値 ${mw(median(fixed.map((c) => c.estimate!.correction)))} MW、` +
+          `最大 ${mw(Math.max(0, ...fixed.map((c) => c.estimate!.correction)))} MW）`,
+      );
+      out.push(`  補正する前の交点 − 単エリアの約定価格: ${within(ok.map((c) => c.estimate!.cross))}（売りと買いが同じ量の価格が幅を持つときは、その安い端）`);
+      if (withBlocks.length < ok.length) {
+        out.push(`  （うち ${fmtNum(ok.length - withBlocks.length)} コマは取引結果にブロック入札の量が無く、ブロック入札の約定の違いを差し引いていない）`);
+      }
     }
     const months = [...new Set(singles.map((x) => isoFromDay(x.day).slice(0, 7)))].sort();
     if (months.length > 1) {
       out.push('', '■ 月ごと（単エリアが 1 つのコマ）');
       out.push(
         ...table(
-          ['月', 'コマ数', '売りの合計が同じ', '買いの合計が同じ', '交点が 0.1 円以内', '推定できない'],
+          ['月', 'コマ数', '差が価格によって変わる', '補正なしで約定価格で釣り合う', '推定できない'],
           months.map((m) => {
-            const xs = singles.filter((x) => isoFromDay(x.day).startsWith(m));
-            const avail = xs.filter((x) => x.c.estimate!.available);
+            const xs = singles.filter((x) => isoFromDay(x.day).startsWith(m)).map((x) => x.c);
+            const avail = xs.filter((c) => c.estimate!.available);
             return [
               m,
               fmtNum(xs.length),
-              pct(share(xs.map((x) => x.c.sellDiff), same)),
-              pct(share(xs.map((x) => x.c.buyDiff), same)),
-              pct(share(avail.map((x) => x.c.estimate!.cross), withinPrice(0.1))),
+              pct(xs.filter(varies).length / xs.length),
+              pct(share(
+                avail.map((c) => c.estimate!.correction),
+                (v) => v === 0,
+              )),
               fmtNum(xs.length - avail.length),
             ];
           }),
@@ -278,85 +272,111 @@ function summary(list: Checked[]): string[] {
 
 /** 1 日分のコマごとの一覧 */
 function slotList(list: Checked[]): string[] {
-  const kindText = (c: SlotCheck) => (c.singles.length > 0 ? `${SLOT_KIND_LABEL[c.kind]}（${c.singles.map((a) => SERIES_LABEL[a]).join('・')}）` : SLOT_KIND_LABEL[c.kind]);
   return [
     '',
-    '■ コマごと（差 = システムプライスのカーブの合計 − 取引結果、MW）',
+    '■ コマごと',
     ...table(
-      ['コマ', '時刻', '分断', '売りの差', '買いの差', '分断エリア − システム（買い）', '単エリアの推定: 交点 − 約定価格'],
+      ['コマ', '時刻', '分断', '差の変わり方（売り / 買い）', 'ブロック入札の約定の違い', '推定: 交点 − 約定価格', '補正'],
       list.map(({ slot, c }) => [
         String(slot + 1),
         slotRangeLabel(slot),
         kindText(c),
-        signedMw(c.sellDiff, 1),
-        signedMw(c.buyDiff, 1),
-        Number.isFinite(c.excessBuy) ? signedMw(c.excessBuy) : '',
+        Number.isFinite(c.rangeSell) ? `${mw(c.rangeSell)} / ${mw(c.rangeBuy)} MW` : '',
+        c.kind === 'none' ? '' : blocksText(c),
         c.estimate ? (c.estimate.available ? yen(c.estimate.cross) : '推定できない') : '',
+        c.estimate?.available ? `${mw(c.estimate.correction)} MW` : '',
       ]),
       '  ',
-      [1, 2],
+      [1, 2, 4],
     ),
+    '  差の変わり方 = システムプライス − 分断エリアの合計の、価格による変わり方。ブロック入札の約定の違い = システムプライスの計算で多く約定した量（負は少なく）',
   ];
 }
 
-/** 残りの価格の目安（円/kWh） */
-const DETAIL_PRICES = [0, 0.01, 1, 3, 5, 7.5, 10, 12.5, 15, 20, 25, 30, 40, 50, 75, 100, 200, 500, 999.99];
+/** 差を見る価格の目安（円/kWh） */
+const DETAIL_PRICES = [0, 0.01, 1, 3, 5, 7.5, 10, 12.5, 15, 20, 25, 30, 40, 50, 75, 100, 200, 500, 999];
 
 /** 1 コマの数字を詳しく */
-function detail(l: Loaded, day: number, slot: number, groups: CurveGroup[]): string[] {
-  const input = slotInput(l, day, slot, groups);
+function detail(l: Loaded, day: CurveDay, slot: number): string[] {
+  const input = slotInput(l, day, slot);
+  const groups = input.groups;
   const c = checkSlot(input)!;
   const system = groups.find((g) => g.id === SYSTEM_GROUP)!;
   const published = groups.filter((g) => g.id !== SYSTEM_GROUP);
   const split = slotSplit(groups);
+  const vals = l.spot.get(day.day);
+  const at = (k: SeriesKey) => (vals ? vals[SERIES_INDEX[k] * SLOTS + slot] : Number.NaN);
   const out: string[] = [];
-  const head = c.singles.length > 0 ? `${SLOT_KIND_LABEL[c.kind]}（${c.singles.map((a) => SERIES_LABEL[a]).join('・')}）` : SLOT_KIND_LABEL[c.kind];
-  out.push('', `■ ${formatDay(day, true)} ${slotRangeLabel(slot)}（${slot + 1} コマ目）: ${head}`);
+  out.push('', `■ ${formatDay(day.day, true)} ${slotRangeLabel(slot)}（${slot + 1} コマ目）: ${kindText(c)}`);
   out.push(`  約定価格（円/kWh）: ${(['system', ...AREA_KEYS] as PriceKey[]).map((k) => `${k === 'system' ? 'システム' : SERIES_LABEL[k]} ${fmtPrice(input.price(k))}`).join('、')}`);
-  const priceOfGroup = (g: CurveGroup) => (g.areas.length > 0 ? input.price(g.areas[0]) : Number.NaN);
-  const crossOf = (g: CurveGroup) => crossing(rowsFromSteps(g.sell, g.buy))?.price ?? Number.NaN;
-  const rows: string[][] = [
-    ['システムプライス', mw(input.systemSell ?? totalOf(system.sell), 1), mw(input.systemBuy ?? totalOf(system.buy), 1), fmtPrice(input.systemClear ?? crossOf(system)), fmtPrice(input.price('system'))],
-    ['取引結果の入札量', mw(input.sellBid, 1), mw(input.buyBid, 1), '', ''],
-  ];
-  for (const g of published) rows.push([`${g.id}: ${g.label}`, mw(totalOf(g.sell)), mw(totalOf(g.buy)), fmtPrice(crossOf(g)), fmtPrice(priceOfGroup(g))]);
+  const crossOf = (g: CurveGroup) => crossing(rowsFromSteps(g.sell, g.buy));
+  const rows: string[][] = [['システムプライス', mw(totalOf(system.sell)), mw(totalOf(system.buy)), fmtPrice(crossOf(system)?.price ?? Number.NaN), fmtPrice(input.price('system'))]];
+  for (const g of published) rows.push([`${g.id}: ${g.label}`, mw(totalOf(g.sell)), mw(totalOf(g.buy)), fmtPrice(crossOf(g)?.price ?? Number.NaN), fmtPrice(g.areas.length > 0 ? input.price(g.areas[0]) : Number.NaN)]);
   if (published.length > 0) {
     rows.push(['分断エリアの合計', mw(published.reduce((v, g) => v + totalOf(g.sell), 0)), mw(published.reduce((v, g) => v + totalOf(g.buy), 0)), '', '']);
     rows.push(['分断エリアの合計 − システム', signedMw(c.excessSell), signedMw(c.excessBuy), '', '']);
   }
+  out.push('  入札量の合計（MW）と交点（円/kWh）', ...table(['カーブ', '売り', '買い', '交点', '約定価格'], rows, '    '));
   out.push(
-    '  入札量の合計（MW）と交点（円/kWh）。分断エリアは描画用に間引いたカーブから（量は 1MW 単位）',
-    ...table(['カーブ', '売り', '買い', '交点', '約定価格'], rows, '    '),
+    '  取引結果（MW）',
+    ...table(
+      ['', '入札量', 'ブロック入札', 'ブロック入札の約定', '約定総量'],
+      [
+        ['売り', mw(input.spot.sellBid, 1), mw(input.spot.sellBlockBid, 1), mw(input.spot.sellBlockVolume, 1), mw(kwhToMw(at('volume')), 1)],
+        ['買い', mw(input.spot.buyBid, 1), mw(input.spot.buyBlockBid, 1), mw(input.spot.buyBlockVolume, 1), ''],
+      ],
+      '    ',
+    ),
   );
+  if (c.blocks) {
+    out.push(
+      `  ブロック入札の約定の違い: ${blockGapText(c.blocks)}` +
+        '（システムプライスのカーブの入札量の合計と、取引結果の入札量 − 約定しなかったブロック入札 の差）',
+    );
+  }
   if (published.length === 0) return out;
 
-  const top = Math.max(system.sell.length >= 2 ? system.sell[system.sell.length - 2] : 0, system.buy.length >= 2 ? system.buy[0] : 0);
+  const d = input.residual ? residualDifference(input.residual) : curveDifference(system, published);
+  const valueAt = (prices: number[], v: Float64Array, p: number, descending: boolean) => {
+    // 売りはその価格以下で最も高い点、買いはその価格以上で最も安い点の値（段の間は前の点の値のまま）
+    let out = Number.NaN;
+    if (!descending) prices.forEach((q, k) => (q <= p + 1e-9 ? (out = v[k]) : null));
+    else for (let k = prices.length - 1; k >= 0; k--) if (prices[k] >= p - 1e-9) out = v[k];
+    return out;
+  };
   const marks = [input.price('system'), ...c.singles.map((a) => input.price(a))].filter(Number.isFinite);
-  const prices = [...new Set([...DETAIL_PRICES, ...marks, top].map((p) => Math.round(p * 100) / 100))].filter((p) => p <= top + 1e-9).sort((a, b) => a - b);
-  const resid = (p: number) => [
-    sellVolumeAt(system.sell, p) - published.reduce((v, g) => v + sellVolumeAt(g.sell, p), 0),
-    buyVolumeAt(system.buy, p) - published.reduce((v, g) => v + buyVolumeAt(g.buy, p), 0),
-  ];
+  const prices = [...new Set([...DETAIL_PRICES, ...marks].map((p) => Math.round(p * 100) / 100))].sort((a, b) => a - b);
   out.push(
-    '  システムプライス − 分断エリアの合計（MW）: 価格によって変わるなら、単エリアの入札が入っている。価格によらず一定の分は連系線でやりとりする量',
+    `  システムプライス − 分断エリアの合計（MW。${input.residual ? '間引く前のカーブから' : '描画用に間引いたカーブどうしの差'}）: ` +
+      '価格によって変わる分が単エリアの入札で、価格によらない分は連系線でやりとりする量とブロック入札の約定の違い',
     ...table(
       ['価格（円/kWh）', '売り（この価格以下）', '買い（この価格以上）'],
-      prices.map((p) => {
-        const [s, b] = resid(p);
-        return [fmtPrice(p), signedMw(s), signedMw(b)];
-      }),
+      prices.map((p) => [fmtPrice(p), signedMw(valueAt(d.sellPrices, d.sell, p, false)), signedMw(valueAt(d.buyPrices, d.buy, p, true))]),
       '    ',
     ),
   );
   if (split.kind === 'split' && split.singles.length === 1) {
     const area = split.singles[0];
-    const ac = areaCurve(groups, area, input.price)!;
     const name = SERIES_LABEL[area];
+    const ac = areaCurve(groups, area, input.price, { spot: input.spot, residual: input.residual })!;
     if (ac.kind !== 'single') {
       out.push(`  ${name}のカーブは推定できません（引いた差が価格によらずほぼ一定）`);
-    } else {
-      const corr = ac.correction ? `、約定価格で交わるように${ac.correction.side === 'sell' ? '売り' : '買い'}に ${mw(ac.correction.mw)} MW を足して補正` : '';
-      out.push(`  推定した${name}のカーブ: 売り・買いに ${mw(ac.lift ?? 0)} MW を足すと交点は ${fmtPrice(ac.rawCrossing ?? Number.NaN)} 円/kWh（約定価格 ${fmtPrice(input.price(area))} 円/kWh）${corr}`);
+      return out;
+    }
+    const corr = ac.correction && ac.correction.mw > 0 ? `。約定価格で交わるように${ac.correction.side === 'sell' ? '売り' : '買い'}に ${mw(ac.correction.mw)} MW を足して補正` : '';
+    out.push(
+      `  推定した${name}のカーブ: ${c.blocks ? 'ブロック入札の約定の違いを差し引き、' : ''}売り・買いに ${mw(ac.lift ?? 0)} MW を足すと、` +
+        `交点は ${fmtPrice(ac.rawCrossing ?? Number.NaN)} 円/kWh（約定価格 ${fmtPrice(input.price(area))} 円/kWh）${corr}`,
+    );
+    // 約定総量 = 分断エリアの交点の量の合計 + 単エリアの売りの量（システムプライス − 分断エリア − ブロック入札の違い）
+    if (c.blocks) {
+      const crossVolume = split.published.reduce((v, g) => v + (crossOf(g)?.volume ?? Number.NaN), 0);
+      const p = input.price(area);
+      const own = valueAt(d.sellPrices, d.sell, p, false) - c.blocks.sell;
+      out.push(
+        `  約定総量との突き合わせ: 分断エリアの交点の量の合計 ${mw(crossVolume)} + ${name}の売りの差（約定価格で、ブロック入札の違いを除く）${signedMw(own)} = ${mw(crossVolume + own)} MW` +
+          `（取引結果の約定総量 ${mw(kwhToMw(at('volume')), 1)} MW。分断エリアの交点は描画用に間引いたカーブから）`,
+      );
     }
   }
   return out;
@@ -368,26 +388,24 @@ export async function checkCurves(o: CheckOptions): Promise<string[]> {
   const list: Checked[] = [];
   let unread = 0;
   let detailLines: string[] = [];
-  for (const day of l.days) {
-    let slots: (CurveGroup[] | null)[];
+  for (const dayNum of l.days) {
+    let day: CurveDay;
     try {
-      slots = decodeCurveDay(await readJson(path.join(o.data, curveDayFile(day)))).slots;
+      day = decodeCurveDay(await readJson(path.join(o.data, curveDayFile(dayNum))));
     } catch {
       unread++;
       continue;
     }
-    slots.forEach((groups, slot) => {
+    day.slots.forEach((groups, slot) => {
       if (!groups) return;
-      const c = checkSlot(slotInput(l, day, slot, groups));
-      if (c) list.push({ day, slot, c });
-      if (o.slot === slot) detailLines = detail(l, day, slot, groups);
+      const c = checkSlot(slotInput(l, day, slot));
+      if (c) list.push({ day: dayNum, slot, c });
+      if (o.slot === slot) detailLines = detail(l, day, slot);
     });
   }
   const first = l.days[0];
   const last = l.days[l.days.length - 1];
-  const out = [
-    `入札カーブの確認: ${o.data}（${formatDay(first)}〜${formatDay(last)} の ${fmtNum(l.days.length - unread)} 日・${fmtNum(list.length)} コマ）`,
-  ];
+  const out = [`入札カーブの確認: ${o.data}（${formatDay(first)}〜${formatDay(last)} の ${fmtNum(l.days.length - unread)} 日・${fmtNum(list.length)} コマ）`];
   if (unread > 0) out.push(`  読めなかった日: ${fmtNum(unread)} 日`);
   if (list.length === 0) return out;
   if (o.slot !== null) {
