@@ -10,7 +10,7 @@ import type { Selection } from '../lib/select';
 import { accMean, quantileSorted } from '../lib/stats';
 import type { HeatKind, ScaleMode } from '../state';
 import type { ChartCard, TableData } from '../ui/card';
-import { segmented, selectField, toolbar, type Segmented, type SelectField } from '../ui/controls';
+import { segmented, selectField, toolbar, type Option, type Segmented, type SelectField } from '../ui/controls';
 import { TOKENS, type ThemeName } from '../ui/theme';
 import { ttHeader, ttRow } from '../ui/tooltip';
 import { NO_DATA, View } from './base';
@@ -18,6 +18,14 @@ import { CommonRange, describeSelection, monthLabel, PRICE_UNIT, rangeTag, SCALE
 
 const DOW_COLUMNS = ['月', '火', '水', '木', '金', '土', '日', '祝日'];
 const MAX_DAILY_COLUMNS = 800;
+
+/** ヒートマップの格子（エリア比較タブの値差のヒートマップでも使う） */
+export const HEAT_KIND_OPTIONS: Option<HeatKind>[] = [
+  { value: 'dateSlot', label: '日付 × 時間帯' },
+  { value: 'monthSlot', label: '月 × 時間帯' },
+  { value: 'dowSlot', label: '曜日 × 時間帯' },
+  { value: 'fyMonth', label: '年度 × 月' },
+];
 
 export interface Grid {
   xLabels: string[];
@@ -42,17 +50,7 @@ export class HeatmapView extends View {
 
   protected build(): void {
     const s = this.ctx.state;
-    this.kind = segmented(
-      '格子',
-      [
-        { value: 'dateSlot', label: '日付 × 時間帯' },
-        { value: 'monthSlot', label: '月 × 時間帯' },
-        { value: 'dowSlot', label: '曜日 × 時間帯' },
-        { value: 'fyMonth', label: '年度 × 月' },
-      ],
-      s.heatKind,
-      (v) => this.set({ heatKind: v }),
-    );
+    this.kind = segmented('格子', HEAT_KIND_OPTIONS, s.heatKind, (v) => this.set({ heatKind: v }));
     this.focus = selectField('対象', PRICE_KEYS.map((k) => ({ value: k, label: SERIES_LABEL[k] })), s.focus, (v) => this.set({ focus: v }));
     this.value = segmented(
       '値',

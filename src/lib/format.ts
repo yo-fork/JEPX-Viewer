@@ -30,6 +30,15 @@ export function fmtPct(ratio: number, digits = 1): string {
   return Number.isFinite(ratio) ? `${fmtNum(ratio * 100, digits)}%` : '—';
 }
 
+/** 刻み幅を表すのに要る小数の桁数（2.5 なら 1、0.025 なら 3） */
+export function stepDigits(step: number): number {
+  for (let d = 0; d < 4; d++) {
+    const x = step * 10 ** d;
+    if (Math.abs(x - Math.round(x)) < 1e-6) return d;
+  }
+  return 4;
+}
+
 /** kWh → 百万kWh */
 export const MKWH = 1e6;
 
