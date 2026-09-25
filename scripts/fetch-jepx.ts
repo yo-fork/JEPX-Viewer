@@ -7,17 +7,18 @@
  *   npm run fetch -- --no-curves              入札カーブを取得しない
  *   npm run fetch -- --force                  取得済みの年度・日も取り直す
  *   npm run fetch -- --keep-csv               元の CSV も public/data/raw/ に保存する
- *   npm run fetch -- --from-dir ./csv         手元の CSV（ブラウザでダウンロードしたもの）を変換する（通信なし）
+ *   npm run fetch -- --from-dir ./csv         手元の CSV（ダウンロード・保存しておいたもの）を変換する（通信なし）
  *
  * 社内プロキシ環境では HTTPS_PROXY / HTTP_PROXY / NO_PROXY 環境変数がそのまま使われる。
  * JEPX のサイトに負荷をかけないよう、取得は 1 件ずつ間隔（--delay）を空けて行う。
  */
-import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, open, readdir, readFile, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { EnvHttpProxyAgent, fetch } from 'undici';
 import {
+  curveCsvKind,
   curveDayFile,
   curveMetricsFile,
   decodeCurveMetrics,
@@ -70,6 +71,8 @@ export interface FetchOptions {
   /** 入札カーブを取得する受渡日の範囲 */
   curvesFrom: number;
   curvesTo: number;
+  /** --curves-from / --curves-to を指定した（--from-dir では、指定したときだけ受渡日で絞る） */
+  curvesRangeSet: boolean;
   curvesUrlTemplate: string;
 }
 
@@ -88,6 +91,7 @@ export function defaultOptions(): FetchOptions {
     curves: true,
     curvesFrom: tomorrow - (DEFAULT_CURVE_DAYS - 1),
     curvesTo: tomorrow,
+    curvesRangeSet: false,
     curvesUrlTemplate: DEFAULT_CURVES_URL_TEMPLATE,
   };
 }
@@ -133,9 +137,11 @@ export function parseArgs(argv: string[], base = defaultOptions()): FetchOptions
         break;
       case '--curves-from':
         o.curvesFrom = date(a, next());
+        o.curvesRangeSet = true;
         break;
       case '--curves-to':
         o.curvesTo = date(a, next());
+        o.curvesRangeSet = true;
         break;
       case '--no-curves':
         o.curves = false;
@@ -166,7 +172,7 @@ const HELP = `使い方: npm run fetch -- [オプション]
   --out <ディレクトリ>   出力先（既定: public/data）
   --force                取得済みの年度・日も取り直す
   --keep-csv             元の CSV を <出力先>/raw/ に保存する
-  --from-dir <ディレクトリ>  ダウンロード済みの CSV を変換する（通信しない）
+  --from-dir <ディレクトリ>  手元の CSV を変換する（通信しない。サブフォルダも含め、ファイル名は問わず中身で判定）
   --url-template <URL>   取引結果の取得元 URL（{fy} が年度に置き換わる）
   --curves-url-template <URL>  入札カーブの取得元 URL（{dir}・{file} が置き換わる）
   --delay <ミリ秒>       連続取得の間隔（既定: 1500）`;
@@ -283,25 +289,64 @@ export async function writeManifest(out: string, source: string, touchedCurveFys
   return manifest;
 }
 
-/** ダウンロード済みの CSV を変換する（入札カーブの CSV があればそれも）。入札カーブを保存した年度を返す */
+/** ファイルの先頭の数 KB（列名の行を含む）を文字列にする（CSV の種類の判定用） */
+async function readHead(file: string, size = 8192): Promise<string> {
+  const fh = await open(file, 'r');
+  try {
+    const buf = new Uint8Array(size);
+    const { bytesRead } = await fh.read(buf, 0, size, 0);
+    let end = bytesRead;
+    if (bytesRead === size) {
+      // 途中で切れた文字で文字コードの判定を誤らないよう、最後の改行までにする（UTF-8・Shift_JIS とも 0x0A は文字の途中に現れない）
+      const lf = buf.lastIndexOf(0x0a, bytesRead - 1);
+      if (lf > 0) end = lf + 1;
+    }
+    return decodeCsvBytes(buf.subarray(0, end)).text;
+  } finally {
+    await fh.close();
+  }
+}
+
+/**
+ * 手元の CSV（サブフォルダも含む）を変換する。入札カーブを保存した年度を返す。
+ * 取引結果・入札カーブ・分断エリアのどれかは、ファイル名ではなく列名で見分ける（保存したときの名前は問わない）。
+ * 入札カーブは受渡日の列で日を決めるので、1 つの CSV に何日分入っていてもよい（同じ日が複数あれば、名前順で後のファイル）。
+ * 入札カーブは --curves-from / --curves-to を指定したときだけ受渡日で絞る（既定はすべて）。
+ * 読めない CSV は飛ばして最後にまとめて知らせ、1 件も変換できなければエラーにする。
+ */
 async function convertDir(o: FetchOptions): Promise<Set<number>> {
   const dir = o.fromDir!;
-  const all = (await readdir(dir)).filter((f) => /\.csv$/i.test(f)).sort();
-  const curveDay = (f: string, kind: string) => {
-    const m = new RegExp(`${kind}_(\\d{8})\\.csv$`, 'i').exec(f);
-    return m ? parseDateString(m[1]) : null;
+  const names = (await readdir(dir, { recursive: true })).filter((f) => /\.csv$/i.test(f)).sort();
+  if (names.length === 0) throw new Error(`${dir} に CSV ファイルがありません`);
+  const read = async (name: string) => decodeCsvBytes(await readFile(path.join(dir, name))).text;
+  const failed: string[] = [];
+  const fail = (name: string, err: unknown) => {
+    failed.push(name);
+    o.log(`${name}: 読み込めませんでした（${(err as Error).message}）`);
   };
-  const curveFiles = all.filter((f) => curveDay(f, 'spot_bid_curves') !== null);
-  const splitFiles = all.filter((f) => curveDay(f, 'spot_splitting_areas') !== null);
-  const names = all.filter((f) => !curveFiles.includes(f) && !splitFiles.includes(f));
-  if (names.length === 0 && curveFiles.length === 0) throw new Error(`${dir} に CSV ファイルがありません`);
 
+  // 1 周目: 取引結果と分断エリアの名前を読み、入札カーブの CSV（大きいので 2 周目に 1 つずつ読む）を見つける
   const days: DayMap = new Map();
+  const groups = new Map<number, AreaGroup[][]>();
+  const curveFiles: string[] = [];
   for (const name of names) {
-    const { text } = decodeCsvBytes(await readFile(path.join(dir, name)));
-    const res = parseSpotCsv(text);
-    for (const [day, vals] of res.days) days.set(day, vals);
-    o.log(`${name}: ${isoFromDay(res.firstDay)}〜${isoFromDay(res.lastDay)}（${res.rowCount} コマ）${res.warnings.length ? ` ※${res.warnings.join(' / ')}` : ''}`);
+    try {
+      const kind = curveCsvKind(await readHead(path.join(dir, name)));
+      if (kind === 'bidCurves') {
+        curveFiles.push(name);
+        continue;
+      }
+      const text = await read(name);
+      if (kind === 'splittingAreas') {
+        for (const [day, g] of parseSplittingAreasCsv(text)) groups.set(day, g);
+      } else {
+        const res = parseSpotCsv(text);
+        for (const [day, vals] of res.days) days.set(day, vals);
+        o.log(`${name}: ${isoFromDay(res.firstDay)}〜${isoFromDay(res.lastDay)}（${res.rowCount} コマ）${res.warnings.length ? ` ※${res.warnings.join(' / ')}` : ''}`);
+      }
+    } catch (err) {
+      fail(name, err);
+    }
   }
   for (const [fy, fyDays] of splitByFiscalYear(days)) {
     if (fy < o.from || fy > o.to) continue;
@@ -309,20 +354,32 @@ async function convertDir(o: FetchOptions): Promise<Set<number>> {
     o.log(`→ ${fyPath(o.out, fy)}（${fyDays.size} 日）`);
   }
 
+  // 2 周目: 入札カーブ
   const touched = new Set<number>();
-  for (const name of curveFiles) {
-    const day = curveDay(name, 'spot_bid_curves')!;
-    const raw = parseBidCurveCsv(decodeCsvBytes(await readFile(path.join(dir, name))).text).get(day);
-    if (!raw) {
-      o.log(`${name}: ${isoFromDay(day)} の入札カーブがありません`);
+  let outside = 0;
+  if (!o.curves && curveFiles.length > 0) o.log(`入札カーブの CSV ${curveFiles.length} 件は、--no-curves のため変換しません`);
+  for (const name of o.curves ? curveFiles : []) {
+    let parsed: Map<number, RawCurveDay>;
+    try {
+      parsed = parseBidCurveCsv(await read(name));
+    } catch (err) {
+      fail(name, err);
       continue;
     }
-    const split = splitFiles.find((f) => curveDay(f, 'spot_splitting_areas') === day);
-    const groups = split ? parseSplittingAreasCsv(decodeCsvBytes(await readFile(path.join(dir, split))).text).get(day) : undefined;
-    const { slots } = await writeCurveDayFile(o.out, raw, groups);
-    touched.add(fiscalYearOfDay(day));
-    o.log(`${name}: 入札カーブ ${slots} コマ`);
+    for (const [day, raw] of parsed) {
+      if (o.curvesRangeSet && (day < o.curvesFrom || day > o.curvesTo)) {
+        outside++;
+        continue;
+      }
+      const g = groups.get(day);
+      const { bytes, slots } = await writeCurveDayFile(o.out, raw, g);
+      touched.add(fiscalYearOfDay(day));
+      o.log(`${name}: ${isoFromDay(day)} の入札カーブ ${slots} コマ（${Math.round(bytes / 1024)} KB）${g ? '' : '・分断エリアの名前なし'}`);
+    }
   }
+  if (outside > 0) o.log(`入札カーブ: --curves-from / --curves-to の範囲外の ${outside} 日は変換しませんでした`);
+  if (failed.length > 0) o.log(`読み込めなかった CSV: ${failed.length} 件（${failed.join(', ')}）`);
+  if (days.size === 0 && touched.size === 0) throw new Error(`${dir} に変換できる CSV がありません`);
   return touched;
 }
 
@@ -447,11 +504,14 @@ export async function run(o: FetchOptions): Promise<Manifest> {
   const manifest = await writeManifest(o.out, o.fromDir ? `local:${o.fromDir}` : JEPX_SPOT_PAGE, touched);
   const first = manifest.files[0];
   const last = manifest.files[manifest.files.length - 1];
-  o.log(
-    manifest.files.length
-      ? `manifest.json を更新しました: ${manifest.files.length} 年度（${first.firstDate}〜${last.lastDate}）`
-      : 'データが 1 件もありません。ネットワーク接続や取得元 URL を確認してください。',
-  );
+  if (manifest.files.length > 0) {
+    o.log(`manifest.json を更新しました: ${manifest.files.length} 年度（${first.firstDate}〜${last.lastDate}）`);
+  } else if (manifest.curves) {
+    // 画面は取引結果の期間で開くので、入札カーブだけでは表示できない
+    o.log(`manifest.json を更新しました: 取引結果のデータがまだありません。入札カーブのタブを見るには、npm run fetch で取引結果も取得してください（出力先: ${o.out}）`);
+  } else {
+    o.log('データが 1 件もありません。ネットワーク接続や取得元 URL を確認してください。');
+  }
   if (manifest.curves) o.log(`入札カーブ: ${manifest.curves.dates.length} 日（${manifest.curves.firstDate}〜${manifest.curves.lastDate}）`);
   return manifest;
 }

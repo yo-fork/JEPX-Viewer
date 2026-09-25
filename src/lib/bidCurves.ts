@@ -6,6 +6,7 @@
  *   spot_splitting_areas_YYYYMMDD.csv  電力受渡日, 商品コード, エリアグループ, 分断エリア連番
  * 商品コード 1〜48 は 30 分のコマ。分断エリア連番が空の行はシステムプライスの入札カーブ、数字の行は
  * 市場分断したときのエリアグループ（名前は splitting_areas で分かる）の入札カーブ。
+ * 手元で保存した CSV には、システムプライスの分断エリア連番を -1 にしたものもあるので、-1 もシステムプライスとして読む。
  *
  * 画面では、描画用に間引いたカーブ（1 日 1 ファイル）と、間引く前のカーブから計算した指標（年度ごと）を使う。
  */
@@ -14,7 +15,7 @@ import { isoFromDay, parseDateString } from './dates';
 import { normalizeHeader, parseNumber, parseSlot } from './jepxCsv';
 import { AREAS, SLOTS, type AreaKey } from './series';
 
-/** システムプライスの入札カーブのグループ番号（CSV では分断エリア連番が空） */
+/** システムプライスの入札カーブのグループ番号（CSV では分断エリア連番が空か -1） */
 export const SYSTEM_GROUP = -1;
 
 /** 入札カーブの 1 点。売り・買いの量は、その価格まで（売り）・その価格以上（買い）の累積（MW） */
@@ -51,14 +52,36 @@ function headerRow(rows: string[][], required: Matcher[]): number {
 const isDate: Matcher = (h) => h.includes('受渡日');
 const isSlot: Matcher = (h) => h.includes('商品コード') || h.includes('時刻コード');
 const isGroup: Matcher = (h) => h.includes('分断エリア');
+const isPrice: Matcher = (h) => h.includes('入札価格');
+const isSell: Matcher = (h) => /売り?入札量/.test(h);
+const isBuy: Matcher = (h) => /買い?入札量/.test(h);
+const isLabel: Matcher = (h) => h.includes('エリアグループ');
+const BID_COLUMNS = [isDate, isSlot, isPrice, isSell, isBuy];
+const SPLIT_COLUMNS = [isDate, isSlot, isLabel, isGroup];
+
+export type CurveCsvKind = 'bidCurves' | 'splittingAreas';
+
+/** 入札カーブ・分断エリアの CSV かどうかを列名で見分ける（どちらでもなければ null） */
+export function curveCsvKind(text: string): CurveCsvKind | null {
+  // 列名の行は先頭にあるので、先頭の数行だけを見る
+  const rows = parseCsv(text.split(/\r?\n/, 12).join('\n'));
+  if (headerRow(rows, BID_COLUMNS) >= 0) return 'bidCurves';
+  if (headerRow(rows, SPLIT_COLUMNS) >= 0) return 'splittingAreas';
+  return null;
+}
+
+/** 分断エリア連番の値からグループ番号を読む。空（JEPX の形式）と -1 はシステムプライス。番号でなければ null */
+function parseGroupId(cell: string | undefined): number | null {
+  const s = (cell ?? '').normalize('NFKC').trim();
+  if (s === '' || s === '-1') return SYSTEM_GROUP;
+  const id = Number(s);
+  return Number.isInteger(id) && id >= 0 ? id : null;
+}
 
 /** 入札カーブの CSV を受渡日ごとに読む（通常は 1 ファイル 1 日） */
 export function parseBidCurveCsv(text: string): Map<number, RawCurveDay> {
   const rows = parseCsv(text);
-  const isPrice: Matcher = (h) => h.includes('入札価格');
-  const isSell: Matcher = (h) => /売り?入札量/.test(h);
-  const isBuy: Matcher = (h) => /買い?入札量/.test(h);
-  const hi = headerRow(rows, [isDate, isSlot, isPrice, isSell, isBuy]);
+  const hi = headerRow(rows, BID_COLUMNS);
   if (hi < 0) throw new BidCurveCsvError('入札カーブの CSV ではありません（入札価格・売入札量累積・買入札量累積の列が見つかりません）');
   const hs = rows[hi].map(normalizeHeader);
   const col = { date: find(hs, isDate), slot: find(hs, isSlot), price: find(hs, isPrice), sell: find(hs, isSell), buy: find(hs, isBuy), group: find(hs, isGroup) };
@@ -71,9 +94,8 @@ export function parseBidCurveCsv(text: string): Map<number, RawCurveDay> {
     const slot = parseSlot(row[col.slot] ?? '');
     const price = parseNumber(row[col.price]);
     if (day === null || slot === null || Number.isNaN(price)) continue;
-    const g = col.group >= 0 ? (row[col.group] ?? '').trim() : '';
-    const group = g === '' ? SYSTEM_GROUP : Number(g);
-    if (!Number.isInteger(group)) continue;
+    const group = col.group >= 0 ? parseGroupId(row[col.group]) : SYSTEM_GROUP;
+    if (group === null) continue;
     let d = out.get(day);
     if (!d) {
       d = { day, slots: Array.from({ length: SLOTS }, () => new Map()) };
@@ -106,8 +128,7 @@ export function parseAreaGroupLabel(label: string): AreaKey[] {
 /** 分断エリアの CSV を読む。受渡日 → コマごとのエリアグループ（システムプライスの行は除く） */
 export function parseSplittingAreasCsv(text: string): Map<number, AreaGroup[][]> {
   const rows = parseCsv(text);
-  const isLabel: Matcher = (h) => h.includes('エリアグループ');
-  const hi = headerRow(rows, [isDate, isSlot, isLabel, isGroup]);
+  const hi = headerRow(rows, SPLIT_COLUMNS);
   if (hi < 0) throw new BidCurveCsvError('分断エリアの CSV ではありません（エリアグループ・分断エリア連番の列が見つかりません）');
   const hs = rows[hi].map(normalizeHeader);
   const col = { date: find(hs, isDate), slot: find(hs, isSlot), label: find(hs, isLabel), group: find(hs, isGroup) };
@@ -116,10 +137,8 @@ export function parseSplittingAreasCsv(text: string): Map<number, AreaGroup[][]>
     const row = rows[r];
     const day = parseDateString(row[col.date] ?? '');
     const slot = parseSlot(row[col.slot] ?? '');
-    const g = (row[col.group] ?? '').trim();
-    if (day === null || slot === null || g === '') continue;
-    const id = Number(g);
-    if (!Number.isInteger(id)) continue;
+    const id = parseGroupId(row[col.group]);
+    if (day === null || slot === null || id === null || id === SYSTEM_GROUP) continue;
     let d = out.get(day);
     if (!d) {
       d = Array.from({ length: SLOTS }, () => []);

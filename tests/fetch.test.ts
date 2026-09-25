@@ -6,7 +6,16 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import iconv from 'iconv-lite';
 import { defaultOptions, parseArgs, run } from '../scripts/fetch-jepx';
-import { decodeCurveDay, decodeCurveMetrics, formatBidCurveCsv, formatSplittingAreasCsv } from '../src/lib/bidCurves';
+import {
+  curveDayFile,
+  decodeCurveDay,
+  decodeCurveMetrics,
+  encodeCurveDay,
+  formatBidCurveCsv,
+  formatSplittingAreasCsv,
+  parseBidCurveCsv,
+  parseSplittingAreasCsv,
+} from '../src/lib/bidCurves';
 import { decodeFyFile, type Manifest } from '../src/lib/dataFile';
 import { dayFromYmd } from '../src/lib/dates';
 import { generateDemoDays } from '../src/lib/demo';
@@ -146,11 +155,75 @@ describe('データ取得スクリプト', () => {
     expect(existsSync(path.join(out, 'curves', 'fy2023.json'))).toBe(true);
   });
 
+  it('--from-dir は名前の違う CSV・サブフォルダ・複数日の CSV・分断エリア連番が -1 のシステムプライスも変換する', async () => {
+    const saved = path.join(workdir, 'saved');
+    await mkdir(path.join(saved, '2023'), { recursive: true });
+    const minusOne = (csv: string) => csv.replace(/,\r\n/g, ',-1\r\n');
+    const d2 = dayFromYmd(2023, 4, 2);
+    const d3 = dayFromYmd(2023, 4, 3);
+    const [f2, f3] = [curveFixture(d2)!, curveFixture(d3)!];
+    const sjis = (csv: string) => iconv.encode(csv, 'Shift_JIS');
+    await writeFile(path.join(saved, 'kakaku.csv'), sjis(formatSpotCsv(FIXTURES.get(2023)!)));
+    await writeFile(path.join(saved, '2023', '入札カーブ_0402.csv'), sjis(minusOne(formatBidCurveCsv(f2.raw))));
+    await writeFile(path.join(saved, '2023', '分断_0402.csv'), sjis(minusOne(formatSplittingAreasCsv(d2, f2.groups))));
+    // 2 日分を 1 つの CSV に（2 日目は列名の行なし）。分断エリアの名前は無い
+    const [head, ...rest] = minusOne(formatBidCurveCsv(f3.raw)).split('\r\n');
+    await writeFile(path.join(saved, 'curves.csv'), sjis([minusOne(formatBidCurveCsv(f2.raw)).trimEnd(), ...rest].join('\r\n')));
+    expect(head).toContain('入札価格');
+    await writeFile(path.join(saved, 'memo.csv'), 'メモ,です\r\n');
+
+    const out = path.join(workdir, 'saved-out');
+    const logs: string[] = [];
+    const manifest = await run({ ...defaultOptions(), out, fromDir: saved, log: (m) => logs.push(m) });
+    expect(manifest.files.map((x) => x.fy)).toEqual([2023]);
+    expect(manifest.curves?.dates).toEqual(['20230402', '20230403']);
+    // JEPX の形式（連番が空）の CSV から作ったものと同じになる
+    const jepx = encodeCurveDay(parseBidCurveCsv(formatBidCurveCsv(f2.raw)).get(d2)!, parseSplittingAreasCsv(formatSplittingAreasCsv(d2, f2.groups)).get(d2));
+    expect(JSON.parse(await readFile(path.join(out, curveDayFile(d2)), 'utf8'))).toEqual(JSON.parse(JSON.stringify(jepx)));
+    const day3 = decodeCurveDay(JSON.parse(await readFile(path.join(out, curveDayFile(d3)), 'utf8')));
+    const split = day3.slots.findIndex((g) => g !== null && g.length > 1);
+    if (split >= 0) expect(day3.slots[split]![1].label).toMatch(/^分断エリア \d+$/);
+    expect(logs.some((l) => l.includes('分断エリアの名前なし'))).toBe(true);
+    expect(logs).toContain('読み込めなかった CSV: 1 件（memo.csv）');
+
+    // --curves-from / --curves-to を指定したときだけ受渡日で絞る
+    const only = await run({ ...defaultOptions(), out: path.join(workdir, 'saved-out2'), fromDir: saved, curvesFrom: d3, curvesTo: d3, curvesRangeSet: true, log: () => {} });
+    expect(only.curves?.dates).toEqual(['20230403']);
+    await expect(run({ ...defaultOptions(), out: path.join(workdir, 'none'), fromDir: path.join(saved, '2023'), curves: false, log: () => {} })).rejects.toThrow(/変換できる CSV がありません/);
+  });
+
+  it('--from-dir: UTF-8 で保存した大きな分断エリアの CSV も、先頭で種類を見分けて読む', async () => {
+    const dir = path.join(workdir, 'utf8');
+    await mkdir(dir, { recursive: true });
+    const d2 = dayFromYmd(2023, 4, 2);
+    const f2 = curveFixture(d2)!;
+    expect(f2.groups.some((g) => g.length > 0)).toBe(true);
+    await writeFile(path.join(dir, 'bid.csv'), formatBidCurveCsv(f2.raw));
+    // 30 日分の分断エリア（8KB を超える）。判定で読む先頭 8192 バイトの境目が、全角文字の途中になるようにずらす
+    const days = Array.from({ length: 30 }, (_, i) => d2 - 15 + i);
+    const [header, ...rows] = days.flatMap((d, i) => formatSplittingAreasCsv(d, f2.groups).trimEnd().split('\r\n').slice(i === 0 ? 0 : 1));
+    let bytes = Buffer.from('');
+    for (let pad = 0; pad < 8; pad++) {
+      bytes = Buffer.from([header, ...rows].join('\r\n').replace('\r\n', `${' '.repeat(pad)}\r\n`), 'utf8');
+      if (bytes[8192] >= 0x80 && bytes[8192] <= 0xbf) break;
+    }
+    expect(bytes.length).toBeGreaterThan(8192);
+    expect(bytes[8192] >= 0x80 && bytes[8192] <= 0xbf).toBe(true);
+    await writeFile(path.join(dir, 'areas.csv'), bytes);
+    const logs: string[] = [];
+    await run({ ...defaultOptions(), out: path.join(workdir, 'utf8-out'), fromDir: dir, log: (m) => logs.push(m) });
+    expect(logs.some((l) => l.includes('読み込めなかった'))).toBe(false);
+    const day = decodeCurveDay(JSON.parse(await readFile(path.join(workdir, 'utf8-out', curveDayFile(d2)), 'utf8')));
+    const s = f2.groups.findIndex((g) => g.length > 0);
+    expect(day.slots[s]!.slice(1).map((g) => g.label)).toEqual(f2.groups[s].map((g) => g.label));
+  });
+
   it('コマンドライン引数を解釈する', () => {
     const o = parseArgs(['--from', '2016', '--to', '2020', '--force', '--keep-csv', '--out', 'x', '--delay', '0']);
     expect(o).toMatchObject({ from: 2016, to: 2020, force: true, keepCsv: true, out: 'x', delayMs: 0, curves: true });
     const c = parseArgs(['--curves-from', '2025-04-01', '--curves-to', '2025/04/30', '--no-curves']);
-    expect(c).toMatchObject({ curvesFrom: dayFromYmd(2025, 4, 1), curvesTo: dayFromYmd(2025, 4, 30), curves: false });
+    expect(c).toMatchObject({ curvesFrom: dayFromYmd(2025, 4, 1), curvesTo: dayFromYmd(2025, 4, 30), curves: false, curvesRangeSet: true });
+    expect(o.curvesRangeSet).toBe(false);
     const d = defaultOptions();
     expect(d.curvesTo - d.curvesFrom + 1).toBe(90);
     expect(() => parseArgs(['--from', '2020', '--to', '2016'])).toThrow();

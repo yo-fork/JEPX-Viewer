@@ -7,6 +7,7 @@ import {
   crossing,
   CURVE_METRIC_INDEX,
   CURVE_METRIC_KEYS,
+  curveCsvKind,
   curveDayFile,
   curveMetrics,
   decodeCurveDay,
@@ -32,7 +33,9 @@ import {
   type CurveRow,
 } from '../src/lib/bidCurves';
 import { dayFromYmd } from '../src/lib/dates';
+import { generateDemoDays } from '../src/lib/demo';
 import { syntheticCurveDay } from '../src/lib/demoCurves';
+import { formatSpotCsv } from '../src/lib/jepxCsv';
 import { SLOTS } from '../src/lib/series';
 
 /** JEPX の入札カーブの CSV（先頭部分と、分断エリアのカーブの一部） */
@@ -70,7 +73,33 @@ const ROWS: CurveRow[] = [
 ];
 const m = (vals: number[], key: (typeof CURVE_METRIC_KEYS)[number]) => vals[CURVE_METRIC_INDEX[key]];
 
+/** システムプライスの行の分断エリア連番を -1 にした CSV（手元で保存した形） */
+const withMinusOne = (csv: string) =>
+  csv
+    .split('\n')
+    .map((line, i) => (i > 0 && /,\r?$/.test(line) ? line.replace(/,(\r?)$/, ',-1$1') : line))
+    .join('\n');
+
 describe('parseBidCurveCsv / parseSplittingAreasCsv', () => {
+  it('分断エリア連番が -1 の行も、空の行と同じくシステムプライスとして読む', () => {
+    expect(withMinusOne(BID_CSV)).toContain('20260925,1,0.00,0.0,49366.6,-1');
+    expect(withMinusOne(SPLIT_CSV)).toContain('20260925,1,システムプライス,-1');
+    expect(parseBidCurveCsv(withMinusOne(BID_CSV))).toEqual(parseBidCurveCsv(BID_CSV));
+    expect(parseSplittingAreasCsv(withMinusOne(SPLIT_CSV))).toEqual(parseSplittingAreasCsv(SPLIT_CSV));
+    // 全角の －１ も同じ。番号でない値の行は読み飛ばす
+    const sys = parseBidCurveCsv(BID_CSV).get(dayFromYmd(2026, 9, 25))!.slots[0].get(SYSTEM_GROUP)!;
+    const odd = parseBidCurveCsv(BID_CSV.replace('20260925,1,0.00,0.0,49366.6,', '20260925,1,0.00,0.0,49366.6,－１').replace('20260925,2,0.00,0.0,48000.0,', '20260925,2,0.00,0.0,48000.0,x'));
+    expect(odd.get(dayFromYmd(2026, 9, 25))!.slots[0].get(SYSTEM_GROUP)).toEqual(sys);
+    expect(odd.get(dayFromYmd(2026, 9, 25))!.slots[1].get(SYSTEM_GROUP)).toHaveLength(1);
+  });
+
+  it('入札カーブ・分断エリアの CSV を列名で見分ける（取引結果の CSV などは null）', () => {
+    expect(curveCsvKind(BID_CSV)).toBe('bidCurves');
+    expect(curveCsvKind(withMinusOne(SPLIT_CSV))).toBe('splittingAreas');
+    expect(curveCsvKind(formatSpotCsv(generateDemoDays(dayFromYmd(2024, 4, 1), dayFromYmd(2024, 4, 2), 1)))).toBeNull();
+    expect(curveCsvKind('a,b\n1,2\n')).toBeNull();
+  });
+
   it('コマ・分断エリア連番ごとに価格の昇順の点にする（連番が空はシステムプライス）', () => {
     const days = parseBidCurveCsv(BID_CSV);
     const day = dayFromYmd(2026, 9, 25);
