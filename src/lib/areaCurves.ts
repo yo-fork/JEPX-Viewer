@@ -37,7 +37,7 @@ import {
   type StepCurve,
   type StepResidual,
 } from './bidCurves';
-import { AREA_KEYS, SERIES_LABEL, type AreaKey } from './series';
+import { AREA_KEYS, SERIES_LABEL, SLOTS, type AreaKey } from './series';
 
 export { curveDifference, type CurveDifference, type StepCurve } from './bidCurves';
 
@@ -308,5 +308,86 @@ export function aloneSlots(day: CurveDay, area: AreaKey): number[] {
     const split = slotSplit(groups);
     if (split.kind === 'split' && split.singles.length === 1 && split.singles[0] === area) out.push(s);
   });
+  return out;
+}
+
+/** 市場分断が起きる地域間連系線（エリアのつながり） */
+export const INTERTIES: readonly (readonly [AreaKey, AreaKey])[] = [
+  ['hokkaido', 'tohoku'],
+  ['tohoku', 'tokyo'],
+  ['tokyo', 'chubu'],
+  ['chubu', 'hokuriku'],
+  ['chubu', 'kansai'],
+  ['hokuriku', 'kansai'],
+  ['kansai', 'chugoku'],
+  ['kansai', 'shikoku'],
+  ['chugoku', 'shikoku'],
+  ['chugoku', 'kyushu'],
+];
+
+/**
+ * 約定価格から分けた市場分断のまとまり（エリアの並び順）。連系線でつながったエリアのうち、価格が同じものを 1 つにまとめる。
+ * 分断エリアは連系線でつながったエリアのまとまりなので、離れたエリアの価格がたまたま同じでも（最低価格の 0.01 円など）別のまとまりにする。
+ * 価格の分からないエリアがあれば null
+ */
+export function priceSplit(price: (area: AreaKey) => number): AreaKey[][] | null {
+  const ps = AREA_KEYS.map(price);
+  if (ps.some((p) => !Number.isFinite(p))) return null;
+  const parent = AREA_KEYS.map((_, i) => i);
+  const root = (i: number): number => (parent[i] === i ? i : (parent[i] = root(parent[i])));
+  for (const [a, b] of INTERTIES) {
+    const i = AREA_KEYS.indexOf(a);
+    const j = AREA_KEYS.indexOf(b);
+    if (Math.abs(ps[i] - ps[j]) < PRICE_EPS) parent[root(i)] = root(j);
+  }
+  const groups = new Map<number, AreaKey[]>();
+  AREA_KEYS.forEach((a, i) => {
+    const r = root(i);
+    const g = groups.get(r);
+    if (g) g.push(a);
+    else groups.set(r, [a]);
+  });
+  return [...groups.values()];
+}
+
+/** 単エリアが 1 つだけのコマ */
+export interface AloneSlot {
+  day: number;
+  slot: number;
+  /** 1 エリアだけで分断したエリア */
+  area: AreaKey;
+}
+
+/**
+ * 約定価格から、単エリアが 1 つだけのコマ（そのエリアのカーブを推定し、約定価格で補正できるコマ）を探す（日・コマの順）。
+ * @param price 受渡日・コマ・エリアの約定価格（分からなければ NaN）
+ */
+export function findAloneSlots(days: readonly number[], price: (day: number, slot: number, area: AreaKey) => number): AloneSlot[] {
+  const out: AloneSlot[] = [];
+  for (const day of days) {
+    for (let slot = 0; slot < SLOTS; slot++) {
+      const groups = priceSplit((a) => price(day, slot, a));
+      if (!groups || groups.length < 2) continue;
+      const singles = groups.filter((g) => g.length === 1);
+      if (singles.length === 1) out.push({ day, slot, area: singles[0][0] });
+    }
+  }
+  return out;
+}
+
+/** 入札の段: その価格で増えた量（MW）と、増える前の累積（MW） */
+export interface CurveStep {
+  price: number;
+  mw: number;
+  before: number;
+}
+
+/**
+ * 階段状のカーブの段（売りは価格の昇順、買いは降順の点の並び）。最初の点は段ではなく起点なので除く
+ * （推定したカーブの最初の点には、足した量が入っている）
+ */
+export function curveSteps(steps: ArrayLike<number>): CurveStep[] {
+  const out: CurveStep[] = [];
+  for (let i = 2; i + 1 < steps.length; i += 2) out.push({ price: steps[i], mw: steps[i + 1] - steps[i - 1], before: steps[i - 1] });
   return out;
 }

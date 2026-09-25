@@ -97,11 +97,11 @@ describe('npm run check:curves', () => {
       const at = (k: keyof typeof SERIES_INDEX, s: number) => vals[SERIES_INDEX[k] * SLOTS + s];
       const targets = Array.from({ length: SLOTS }, (_, s) => ({ system: at('system', s), volume: at('volume', s) / 500, areas: Object.fromEntries(AREA_KEYS.map((a) => [a, at(a, s)])) }));
       const { raw, groups } = syntheticCurveDay(day, targets);
-      // 取引結果の入札量を、システムプライスのカーブの合計（全エリアの入札）にそろえ、ブロック入札は無しにする
+      // 取引結果の入札量を、システムプライスのカーブの合計（全エリアの入札。保存するカーブと同じ 1MW 単位）にそろえ、ブロック入札は無しにする
       for (let s = 0; s < SLOTS; s++) {
         const rows = raw.slots[s].get(SYSTEM_GROUP)!;
-        vals[SERIES_INDEX.sellBid * SLOTS + s] = Math.max(...rows.map((r) => r.sell)) * 500;
-        vals[SERIES_INDEX.buyBid * SLOTS + s] = Math.max(...rows.map((r) => r.buy)) * 500;
+        vals[SERIES_INDEX.sellBid * SLOTS + s] = Math.round(Math.max(...rows.map((r) => r.sell))) * 500;
+        vals[SERIES_INDEX.buyBid * SLOTS + s] = Math.round(Math.max(...rows.map((r) => r.buy))) * 500;
         for (const k of ['sellBlockBid', 'sellBlockVolume', 'buyBlockBid', 'buyBlockVolume'] as const) vals[SERIES_INDEX[k] * SLOTS + s] = 0;
       }
       const ymd = isoFromDay(day).replace(/-/g, '');

@@ -1,9 +1,26 @@
 import { describe, expect, it } from 'vitest';
-import { aloneSlots, areaCurve, blockGap, blockGapText, correctToPrice, curveDifference, liftDifference, residualDifference, slotSplit, type SpotBids } from '../src/lib/areaCurves';
+import {
+  aloneSlots,
+  areaCurve,
+  blockGap,
+  blockGapText,
+  correctToPrice,
+  curveDifference,
+  curveSteps,
+  findAloneSlots,
+  liftDifference,
+  priceSplit,
+  residualDifference,
+  slotSplit,
+  type SpotBids,
+} from '../src/lib/areaCurves';
 import { buyAtOrAbove, buyVolumeAt, crossing, decodeCurveDay, encodeCurveDay, rowsFromSteps, sellAtOrBelow, sellVolumeAt, SYSTEM_GROUP, type CurveGroup, type RawCurveDay } from '../src/lib/bidCurves';
+import { CurveStore } from '../src/lib/curveStore';
 import { dayFromYmd } from '../src/lib/dates';
+import { generateDemoDays } from '../src/lib/demo';
 import { syntheticCurveDay, type SlotTarget } from '../src/lib/demoCurves';
-import type { AreaKey } from '../src/lib/series';
+import { AREA_KEYS, SERIES_INDEX, SLOTS, type AreaKey } from '../src/lib/series';
+import { DataStore } from '../src/lib/store';
 
 const f = (a: ArrayLike<number>) => [...Float64Array.from(a)];
 
@@ -210,5 +227,64 @@ describe('areaCurve', () => {
     const day = decodeCurveDay(JSON.parse(JSON.stringify(encodeCurveDay(raw, groups))));
     expect(aloneSlots(day, 'hokkaido')).toEqual([0, 3]);
     expect(aloneSlots(day, 'kyushu')).toEqual([]);
+  });
+});
+
+describe('約定価格から単エリアのコマを探す', () => {
+  /** 指定しないエリアは 10 円 */
+  const prices = (over: Partial<Record<AreaKey, number>>) => (a: AreaKey) => over[a] ?? 10;
+  const singles = (over: Partial<Record<AreaKey, number>>) => priceSplit(prices(over))!.filter((g) => g.length === 1);
+
+  it('連系線でつながったエリアのうち価格が同じものをまとめ、離れたエリアは価格が同じでも別にする', () => {
+    expect(priceSplit(prices({}))).toEqual([AREA_KEYS]);
+    expect(priceSplit(prices({ hokkaido: 15 }))).toEqual([['hokkaido'], AREA_KEYS.filter((a) => a !== 'hokkaido')]);
+    // 北海道と九州がどちらも 0.01 円でも、つながっていないので別々の単エリア
+    expect(singles({ hokkaido: 0.01, kyushu: 0.01 })).toEqual([['hokkaido'], ['kyushu']]);
+    // 四国と九州は直接つながっていない（中国を通る）
+    expect(singles({ shikoku: 0.01, kyushu: 0.01 })).toEqual([['shikoku'], ['kyushu']]);
+    // 中国・四国・九州が同じ価格なら、中国を通して 1 つの分断エリア
+    expect(priceSplit(prices({ chugoku: 0.01, shikoku: 0.01, kyushu: 0.01 }))!.map((g) => g.length)).toEqual([6, 3]);
+    // 東北だけ安いと、北海道はほかとつながらないので、北海道も単エリア
+    expect(singles({ tohoku: 8 })).toEqual([['hokkaido'], ['tohoku']]);
+    // 価格の分からないエリアがあれば判定しない
+    expect(priceSplit(prices({ tokyo: Number.NaN }))).toBeNull();
+  });
+
+  it('単エリアが 1 つだけのコマを、日・コマの順に返す（単エリアが 2 つ以上のコマ、単エリアの無い分断は除く）', () => {
+    const cases: Record<string, Partial<Record<AreaKey, number>>> = {
+      '1:5': { hokkaido: 15 },
+      '1:6': { hokkaido: 15, kyushu: 5 },
+      '2:3': { kyushu: 0.01 },
+      '2:4': { hokkaido: 12, tohoku: 12 },
+    };
+    const found = findAloneSlots([1, 2], (d, s, a) => prices(cases[`${d}:${s}`] ?? {})(a));
+    expect(found).toEqual([
+      { day: 1, slot: 5, area: 'hokkaido' },
+      { day: 2, slot: 3, area: 'kyushu' },
+    ]);
+  });
+
+  it('デモの入札カーブの分断エリアから求めた単エリアと一致する', async () => {
+    const store = new DataStore();
+    store.addDays(generateDemoDays(dayFromYmd(2026, 6, 1), dayFromYmd(2026, 6, 30), 11), 'demo');
+    const ds = store.dataset()!;
+    const cs = CurveStore.demo(ds)!;
+    await cs.ensureDays(cs.days);
+    const found = findAloneSlots(cs.days, (d, s, a) => ds.values[SERIES_INDEX[a]][(d - ds.start) * SLOTS + s]);
+    const exact = cs.days
+      .flatMap((d) => AREA_KEYS.flatMap((area) => aloneSlots(cs.getDay(d)!, area).map((slot) => ({ day: d, slot, area }))))
+      .sort((x, y) => x.day - y.day || x.slot - y.slot);
+    expect(found.length).toBeGreaterThan(0);
+    expect(found).toEqual(exact);
+  });
+
+  it('入札の段は、点と点のあいだで増えた量（最初の点は起点なので段にしない）', () => {
+    expect(curveSteps([0, 100, 5, 300, 10, 350])).toEqual([
+      { price: 5, mw: 200, before: 100 },
+      { price: 10, mw: 50, before: 300 },
+    ]);
+    // 買いは価格の降順の点の並び
+    expect(curveSteps([999.99, 300, 10, 500])).toEqual([{ price: 10, mw: 200, before: 300 }]);
+    expect(curveSteps([0, 100])).toEqual([]);
   });
 });

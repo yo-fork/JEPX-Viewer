@@ -4,7 +4,20 @@
  * 売り入札は青、買い入札は橙（入札・約定量のタブと同じ色）。同じ側の線を何本も重ねるときは、その色相の濃淡で順序を表す。
  */
 import { GRANULARITY_LABEL } from '../lib/aggregate';
-import { aloneSlots, areaCurve, areaLabel, blockGapText, CURVE_TARGETS, type AreaCurve, type CurveTarget, type SpotBids, type StepCurve } from '../lib/areaCurves';
+import {
+  aloneSlots,
+  areaCurve,
+  areaLabel,
+  blockGapText,
+  CURVE_TARGETS,
+  curveSteps,
+  findAloneSlots,
+  type AloneSlot,
+  type AreaCurve,
+  type CurveTarget,
+  type SpotBids,
+  type StepCurve,
+} from '../lib/areaCurves';
 import {
   buyVolumeAt,
   buyVolumesAt,
@@ -22,9 +35,10 @@ import {
 } from '../lib/bidCurves';
 import { COMPARE_DAYS, type CurveStore } from '../lib/curveStore';
 import { DOW_LABEL, dowOfDay, formatDay, isoFromDay, parseDateString, slotRangeLabel, slotStartLabel, ymdFromDay } from '../lib/dates';
-import { fmtNum, fmtPrice } from '../lib/format';
-import { kwhToMw, SERIES_INDEX, SLOTS, type AreaKey, type SeriesKey } from '../lib/series';
+import { fmtNum, fmtPrice, fmtSigned } from '../lib/format';
+import { AREAS, kwhToMw, SERIES_INDEX, SLOTS, type AreaKey, type SeriesKey } from '../lib/series';
 import { reselect, type Selection } from '../lib/select';
+import type { Dataset } from '../lib/store';
 import { niceStep } from '../lib/stats';
 import { MAX_CURVE_PICKS, normalizePicks, type CurveCompare, type CurvePick, type CurveRange, type CurveSide } from '../state';
 import type { ChartCard, TableData } from '../ui/card';
@@ -33,8 +47,20 @@ import { h, uniqueId } from '../ui/dom';
 import { ordinalColors, seriesColor, TOKENS, type ThemeName } from '../ui/theme';
 import { ttHeader, ttNote, ttRow } from '../ui/tooltip';
 import { View } from './base';
-import { describeSelection, endLabels, grid, labelRoom, lineLegend, PRICE_UNIT, rangeTag, styledLine, valueAxis } from './common';
-import { buildGrid, colorRange, gridTable, heatmapHeight, heatmapOption } from './heatmap';
+import {
+  categoryBarOption,
+  describeSelection,
+  endLabels,
+  grid,
+  isNarrow,
+  labelRoom,
+  lineLegend,
+  PRICE_UNIT,
+  rangeTag,
+  styledLine,
+  valueAxis,
+} from './common';
+import { buildGrid, colorRange, gridTable, heatmapHeight, heatmapOption, type Grid } from './heatmap';
 import { autoGranularity, breakGaps, buildSeriesPoints, periodLabel, TIME_AXIS_LABEL } from './timeseries';
 
 const NO_CURVES =
@@ -54,6 +80,8 @@ const CROSS_LABEL_WIDTH_WRAPPED = 120;
 /** グラフ領域の上端（凡例 1 行と縦軸の名前の分）と、凡例が折り返したときの 1 行の高さ */
 const PLOT_TOP = 36;
 const LEGEND_ROW = 24;
+/** 入札の大きな段として並べる数 */
+const STEP_COUNT = 10;
 
 /** 価格帯ごとの入札量の推移で見る指標（入れ子になっている順。最後が合計） */
 const DEPTH: Record<CurveSide, { key: CurveMetricKey; name: string }[]> = {
@@ -118,11 +146,27 @@ export class CurvesView extends View {
   private metric!: SelectField<CurveMetricKey>;
   private curve!: ChartCard;
   private comparison!: ChartCard;
+  private sellSteps!: ChartCard;
+  private buySteps!: ChartCard;
+  private aloneLabel!: HTMLElement;
+  private alonePrev!: HTMLButtonElement;
+  private aloneNext!: HTMLButtonElement;
+  private aloneNote!: HTMLElement;
+  private aloneCompare!: HTMLButtonElement;
+  private aloneAreas!: ChartCard;
+  private aloneHours!: ChartCard;
+  private aloneMap!: ChartCard;
   private depth!: ChartCard;
   private sensitivity!: ChartCard;
   private heat!: ChartCard;
   /** 凡例で非表示にした系列（ツールチップに出さない）。描き直すと凡例は全部表示に戻る */
   private hidden = new Map<ChartCard, Record<string, boolean>>();
+  /** 単エリアが 1 つだけのコマ（1 コマのカーブがある日から、取引結果の約定価格で判定。日・コマの順） */
+  private alone: AloneSlot[] = [];
+  /** alone を求めたときの取引結果と入札カーブ（どちらかが変わったら求め直す） */
+  private aloneOf: { ds: Dataset; cs: CurveStore } | null = null;
+  /** 単エリアになったコマの図の横軸の日（押したマスの日を引く） */
+  private mapDays: number[] = [];
 
   protected build(): void {
     const s = this.ctx.state;
@@ -165,6 +209,11 @@ export class CurvesView extends View {
       s.curveRange,
       (v) => this.set({ curveRange: v }),
     );
+    // 対象のエリアだけが単エリアになった、前後のコマへ移る
+    this.aloneLabel = h('span', { class: 'field-label' }, '単エリアのコマへ');
+    this.alonePrev = h('button', { type: 'button', class: 'btn', onclick: () => this.stepAlone(-1) }, '◀ 前');
+    this.aloneNext = h('button', { type: 'button', class: 'btn', onclick: () => this.stepAlone(1) }, '次 ▶');
+    const aloneField = h('div', { class: 'field' }, this.aloneLabel, h('div', { class: 'date-nav' }, this.alonePrev, this.aloneNext));
     this.compare = segmented(
       '比べるもの',
       [
@@ -205,7 +254,7 @@ export class CurvesView extends View {
     );
     this.content.append(
       h('h2', { class: 'view-section-title' }, '1 コマの入札カーブ'),
-      toolbar(dateField, this.slot.el, this.target.el, this.range.el),
+      toolbar(dateField, this.slot.el, this.target.el, aloneField, this.range.el),
       h(
         'p',
         { class: 'view-note' },
@@ -238,6 +287,21 @@ export class CurvesView extends View {
       h('div', { class: 'field' }, h('label', { for: pickId }, '比べる日・時間帯を追加'), h('div', { class: 'date-nav' }, this.pickDate, this.pickSlot, this.pickAdd)),
       this.pickList,
     );
+    this.sellSteps = this.card(g1, { title: '売り入札の大きな段', height: 340 });
+    this.buySteps = this.card(g1, { title: '買い入札の大きな段', height: 340 });
+
+    this.aloneNote = h('p', { class: 'view-note' });
+    this.content.append(h('h2', { class: 'view-section-title' }, '単エリアが 1 つだけのコマ'), this.aloneNote);
+    const ga = h('div', { class: 'card-grid' });
+    this.content.append(ga);
+    this.aloneAreas = this.card(ga, { title: 'エリア別のコマ数', height: 300 });
+    this.aloneHours = this.card(ga, { title: '時間帯別のコマ数', height: 300 });
+    this.aloneMap = this.card(ga, { title: '単エリアになったコマ', height: 560, wide: true });
+    this.aloneCompare = h('button', { type: 'button', class: 'btn btn-sm', onclick: () => this.compareAlone() }, `直近の ${MAX_CURVE_PICKS} コマを比較の図に重ねる`);
+    this.aloneMap.addControls(this.aloneCompare);
+    this.aloneAreas.chart.on('click', (e: unknown) => this.onAloneArea((e as { dataIndex: number }).dataIndex));
+    this.aloneHours.chart.on('click', (e: unknown) => this.onAloneHour((e as { dataIndex: number }).dataIndex));
+    this.aloneMap.chart.on('click', (e: unknown) => this.onAloneCell((e as { value?: unknown }).value));
 
     this.periodNote = h('p', { class: 'view-note' });
     this.content.append(h('h2', { class: 'view-section-title' }, '期間で見る'), this.periodNote);
@@ -286,10 +350,92 @@ export class CurvesView extends View {
     this.side.set(state.curveSide);
     this.depthSide.set(state.curveDepth);
     this.metric.set(state.curveMetric);
+    // 単エリアが 1 つだけのコマ（カーブのある日の取引結果の約定価格から判定する）
+    const { ds } = this.ctx;
+    if (this.aloneOf?.ds !== ds || this.aloneOf.cs !== cs) {
+      this.alone = findAloneSlots(cs.days, (d, s, a) => this.price(d, s, a));
+      this.aloneOf = { ds, cs };
+    }
+    this.syncAloneNav(cs);
 
     this.renderCurve(cs, date);
+    this.renderSteps(cs, date);
     this.renderComparison(cs, date);
+    this.renderAlone(cs);
     this.renderPeriod(cs);
+  }
+
+  // ---- 単エリアが 1 つだけのコマ ----
+
+  /** 対象のエリアだけが単エリアになったコマのうち、表示中のコマより前（-1）・後ろ（1）でいちばん近いもの */
+  private aloneStep(cs: CurveStore, dir: -1 | 1): AloneSlot | null {
+    const { state } = this.ctx;
+    if (state.curveArea === 'system') return null;
+    const at = cs.resolve(state.curveDate) * SLOTS + state.curveSlot;
+    const own = this.alone.filter((x) => x.area === state.curveArea);
+    if (dir < 0) return own.findLast((x) => x.day * SLOTS + x.slot < at) ?? null;
+    return own.find((x) => x.day * SLOTS + x.slot > at) ?? null;
+  }
+
+  private syncAloneNav(cs: CurveStore): void {
+    const area = this.ctx.state.curveArea;
+    const n = area === 'system' ? 0 : this.alone.filter((x) => x.area === area).length;
+    this.aloneLabel.textContent = area === 'system' ? '単エリアのコマへ' : `${areaLabel(area)}だけが単エリアのコマへ（${fmtNum(n)}）`;
+    for (const [btn, dir] of [
+      [this.alonePrev, -1],
+      [this.aloneNext, 1],
+    ] as const) {
+      const x = this.aloneStep(cs, dir);
+      btn.disabled = x === null;
+      btn.title =
+        area === 'system'
+          ? '対象にエリアを選ぶと、そのエリアだけが単エリアになったコマへ移れます'
+          : x
+            ? `${formatDay(x.day, true)} ${slotRangeLabel(x.slot)}`
+            : `これより${dir < 0 ? '前' : '後'}にはありません`;
+    }
+  }
+
+  private stepAlone(dir: -1 | 1): void {
+    const cs = this.ctx.curves;
+    const x = cs ? this.aloneStep(cs, dir) : null;
+    if (x) this.set({ curveDate: x.day, curveSlot: x.slot });
+  }
+
+  /** そのコマのエリアの入札カーブを、上の 1 コマの図に表示する */
+  private openAlone(x: AloneSlot): void {
+    this.set({ curveArea: x.area, curveDate: x.day, curveSlot: x.slot });
+    this.curve.el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  private onAloneArea(index: number): void {
+    const area = AREAS[index]?.key;
+    if (area) this.set({ curveArea: area });
+  }
+
+  /** 時間帯の棒: その時間帯で、いちばん新しいコマを表示する */
+  private onAloneHour(slot: number): void {
+    const area = this.ctx.state.curveArea;
+    const last = this.alone.findLast((x) => x.slot === slot && (area === 'system' || x.area === area));
+    if (last) this.openAlone(last);
+  }
+
+  private onAloneCell(value: unknown): void {
+    const area = this.ctx.state.curveArea;
+    const v = value as [number, number, number] | undefined;
+    const day = v ? this.mapDays[v[0]] : undefined;
+    if (area === 'system' || day === undefined) return;
+    this.openAlone({ day, slot: v![1], area });
+  }
+
+  /** 対象のエリアだけが単エリアになった直近のコマを、比較の図（自由に選ぶ）に重ねる */
+  private compareAlone(): void {
+    const area = this.ctx.state.curveArea;
+    if (area === 'system') return;
+    const recent = this.alone.filter((x) => x.area === area).slice(-MAX_CURVE_PICKS);
+    if (recent.length === 0) return;
+    this.set({ curveCompare: 'picks', curvePicks: normalizePicks(recent.map((x) => ({ day: x.day, slot: x.slot }))) });
+    this.comparison.el.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
 
   private onDateInput(): void {
@@ -659,6 +805,156 @@ export class CurvesView extends View {
         series,
       },
       table,
+    );
+  }
+
+  /**
+   * 表示中のカーブで、入札量が大きく増える価格（その価格で増えた量の大きい段）。
+   * 単エリアのカーブでは、まとまった量の段が発電所の入札の手がかりになる
+   */
+  private renderSteps(cs: CurveStore, date: number): void {
+    const { state, theme } = this.ctx;
+    const t = TOKENS[theme];
+    const slot = state.curveSlot;
+    const target = state.curveArea;
+    const ac = cs.getDay(date) ? this.resolveCurve(cs, date, slot) : null;
+    if (!ac || ac.kind === 'unavailable') {
+      [this.sellSteps, this.buySteps].forEach((c) => c.setEmpty('表示している入札カーブがありません。'));
+      return;
+    }
+    const when = `${formatDay(date, true)} ${slotRangeLabel(slot)}`;
+    for (const side of ['sell', 'buy'] as const) {
+      const card = side === 'sell' ? this.sellSteps : this.buySteps;
+      const color = seriesColor(side === 'sell' ? 'sellBid' : 'buyBid', theme);
+      const all = curveSteps(side === 'sell' ? ac.sell : ac.buy)
+        .filter((st) => st.mw > 0)
+        .sort((a, b) => b.mw - a.mw);
+      if (all.length === 0) {
+        card.setEmpty(`${SIDE_LABEL[side]}の段がありません。`);
+        continue;
+      }
+      // 大きい段を、価格の順（売りは安い順、買いは高い順）に並べる
+      const top = all.slice(0, STEP_COUNT).sort((a, b) => (side === 'sell' ? a.price - b.price : b.price - a.price));
+      card.setSubtitle(
+        `${when}・${targetText(target, ac)}・その価格で増えた${SIDE_LABEL[side]}の量が大きい ${top.length} 段（${side === 'sell' ? '安い' : '高い'}順）${isEstimate(ac) ? '・推定のカーブ' : ''}`,
+      );
+      card.setOption(
+        categoryBarOption(
+          top.map((st) => ({ label: `${fmtPrice(st.price)} 円`, value: st.mw, color })),
+          {
+            horizontal: true,
+            theme,
+            unit: 'MW',
+            format: (v) => fmtMw(v),
+            tooltip: (i) =>
+              ttHeader(`${fmtPrice(top[i].price)} ${PRICE_UNIT}`) +
+              ttRow(color, fmtMw(top[i].mw), `この価格で増えた${SIDE_LABEL[side]}`, 'rect') +
+              ttNote(`累積 ${fmtMw(top[i].before)} → ${fmtMw(top[i].before + top[i].mw)}`),
+            valueAxisExtra: { splitLine: { show: true, lineStyle: { color: t.grid } } },
+          },
+        ),
+        {
+          columns: ['価格（円/kWh）', `この価格で増えた${SIDE_LABEL[side]}（MW）`, '増える前の累積（MW）', '増えた後の累積（MW）'],
+          rows: all.map((st) => [st.price, st.mw, st.before, st.before + st.mw]),
+          digits: [2, 0, 0, 0],
+          filename: `jepx_bidcurve_steps_${side}_${fileDate(date)}_${slotStartLabel(slot).replace(':', '')}${target === 'system' ? '' : `_${target}`}.csv`,
+        },
+      );
+    }
+  }
+
+  /** 単エリアが 1 つだけのコマが、どのエリア・時間帯・日にあるか */
+  private renderAlone(cs: CurveStore): void {
+    const { state, theme } = this.ctx;
+    const t = TOKENS[theme];
+    const area = state.curveArea;
+    const range = `${formatDay(cs.first)}〜${formatDay(cs.last)}`;
+    const tag = `${fileDate(cs.first)}-${fileDate(cs.last)}`;
+    this.aloneNote.textContent =
+      `1 コマの入札カーブがある ${range}（${fmtNum(cs.days.length)} 日）から、1 エリアだけで分断したエリアが 1 つだけのコマを、取引結果の約定価格で探します` +
+      '（連系線でつながったエリアのうち価格が同じものを 1 つの分断エリアとみなし、ほかと価格が違うエリアを単エリアとします）。' +
+      'このコマでは、そのエリアの入札カーブを推定し、約定価格で交わるように補正できます。棒やマスを押すと、上の図にそのコマの入札カーブを表示します。';
+
+    // エリア別
+    const counts = AREAS.map((a) => this.alone.filter((x) => x.area === a.key).length);
+    this.aloneAreas.setSubtitle(`${range}・そのエリアだけが単エリアになったコマの数（押すと対象をそのエリアにします）`);
+    this.aloneAreas.setOption(
+      categoryBarOption(
+        AREAS.map((a, i) => ({ label: a.label, value: counts[i], color: area === 'system' || area === a.key ? t.cat[0] : t.deemph })),
+        {
+          horizontal: isNarrow(this.aloneAreas.el),
+          theme,
+          unit: 'コマ',
+          format: (v) => fmtNum(v),
+          tooltip: (i) => ttHeader(AREAS[i].label) + ttRow(t.cat[0], `${fmtNum(counts[i])} コマ`, `${AREAS[i].label}だけが単エリア`, 'rect'),
+          valueAxisExtra: { minInterval: 1 },
+        },
+      ),
+      { columns: ['エリア', 'そのエリアだけが単エリアになったコマ数'], rows: AREAS.map((a, i) => [a.label, counts[i]]), digits: [null, 0], filename: `jepx_alone_areas_${tag}.csv` },
+    );
+
+    // 時間帯別
+    const own = area === 'system' ? this.alone : this.alone.filter((x) => x.area === area);
+    const who = area === 'system' ? 'どれか 1 エリアだけ' : `${areaLabel(area)}だけ`;
+    const bySlot = new Array<number>(SLOTS).fill(0);
+    for (const x of own) bySlot[x.slot]++;
+    this.aloneHours.setSubtitle(`${range}・${who}が単エリアになったコマの数（押すと、その時間帯のいちばん新しいコマを表示）`);
+    this.aloneHours.setOption(
+      {
+        grid: grid({ top: 28 }),
+        tooltip: {
+          trigger: 'item',
+          formatter: (p: { dataIndex: number }) =>
+            ttHeader(slotRangeLabel(p.dataIndex)) + ttRow(t.cat[0], `${fmtNum(bySlot[p.dataIndex])} コマ`, `${who}が単エリア`, 'rect'),
+        },
+        xAxis: {
+          type: 'category',
+          data: Array.from({ length: SLOTS }, (_, s) => slotStartLabel(s)),
+          axisLabel: { interval: (i: number) => i % 4 === 0, hideOverlap: true },
+        },
+        yAxis: valueAxis('コマ', { minInterval: 1 }),
+        series: [{ type: 'bar', barMaxWidth: 24, data: bySlot, itemStyle: { color: t.cat[0], borderRadius: [3, 3, 0, 0] } }],
+      },
+      {
+        columns: ['時刻', `${who}が単エリアになったコマ数`],
+        rows: bySlot.map((n, s) => [slotStartLabel(s), n]),
+        digits: [null, 0],
+        filename: `jepx_alone_slots_${area}_${tag}.csv`,
+      },
+    );
+
+    // 日付 × 時間帯（エリアを選んでいるとき）
+    this.aloneCompare.disabled = area === 'system' || own.length === 0;
+    this.mapDays = [];
+    if (area === 'system') {
+      this.aloneMap.setEmpty(
+        '上の「対象」か、「エリア別のコマ数」の棒でエリアを選ぶと、そのエリアだけが単エリアになったコマを、日付 × 時間帯に並べて表示します。',
+      );
+      return;
+    }
+    const name = areaLabel(area);
+    if (own.length === 0) {
+      this.aloneMap.setEmpty(`${range} に、${name}だけが単エリアになったコマはありません。`);
+      return;
+    }
+    this.mapDays = [...cs.days];
+    const column = new Map(this.mapDays.map((d, k) => [d, k]));
+    const g: Grid = {
+      xLabels: this.mapDays.map((d) => formatDay(d)),
+      xTitles: this.mapDays.map((d) => formatDay(d, true)),
+      yLabels: Array.from({ length: SLOTS }, (_, s) => slotStartLabel(s)),
+      yTitles: Array.from({ length: SLOTS }, (_, s) => slotRangeLabel(s)),
+      cells: own.map((x) => [column.get(x.day)!, x.slot, this.price(x.day, x.slot, area) - this.price(x.day, x.slot, 'system')]),
+      yIsSlot: true,
+    };
+    const [min, max] = colorRange(g, true);
+    this.aloneMap.setSubtitle(
+      `${range}・${name}だけが単エリアになったコマ（${fmtNum(own.length)} コマ。色は ${name} − システムプライス、赤: ${name}が高い、青: 安い）・押すとそのコマの入札カーブを表示`,
+    );
+    this.aloneMap.setHeight(heatmapHeight(g));
+    this.aloneMap.setOption(
+      heatmapOption(g, { theme, min, max, colors: t.div, precision: 1, fmt: (v) => `${fmtSigned(v)} 円`, valueLabel: `${name} − システムプライス` }),
+      gridTable(g, `jepx_alone_${area}_${tag}.csv`),
     );
   }
 

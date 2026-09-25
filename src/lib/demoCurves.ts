@@ -3,11 +3,12 @@
  *
  * 与えた価格（システムプライス・エリアプライス）と約定量の近くで売りと買いが交わるよう、JEPX に似た形の
  * カーブを擬似乱数で作る（昼は太陽光で 0.01 円以下の売りが増える、最も高い価格の買いが多い、など）。
- * 市場分断したコマは、価格の同じエリアのまとまりごとに、連系線でやりとりする量も含めてそのエリアの約定価格で交わるカーブを作り、
+ * 市場分断したコマは、連系線でつながった価格の同じエリアのまとまりごとに、連系線でやりとりする量も含めてそのエリアの約定価格で交わるカーブを作り、
  * それらを足してから、やりとりする量を売り・買いとも引いたものをシステムプライスのカーブ（全エリアの入札そのもの）にする。
  * JEPX と同じく、1 エリアだけのまとまり（単エリア）のカーブは出さない。
  * **実際の入札ではない**ため、画面上では常に「デモデータ」と明示する。
  */
+import { priceSplit } from './areaCurves';
 import { SYSTEM_GROUP, type AreaGroup, type CurveRow, type RawCurveDay } from './bidCurves';
 import { gaussian, mulberry32 } from './demo';
 import { AREA_KEYS, SERIES_LABEL, SLOTS, type AreaKey } from './series';
@@ -107,15 +108,9 @@ function areaPrices(t: SlotTarget): Record<AreaKey, number> | null {
   return null;
 }
 
-/** 価格の同じエリアのまとまり（エリアの並び順） */
+/** 連系線でつながった、価格の同じエリアのまとまり（エリアの並び順）。実際の分断エリアと同じく、離れたエリアは価格が同じでも別にする */
 function priceGroups(prices: Record<AreaKey, number>): { price: number; areas: AreaKey[] }[] {
-  const out: { price: number; areas: AreaKey[] }[] = [];
-  for (const a of AREA_KEYS) {
-    const g = out.find((x) => Math.abs(x.price - prices[a]) < 0.005);
-    if (g) g.areas.push(a);
-    else out.push({ price: prices[a], areas: [a] });
-  }
-  return out;
+  return (priceSplit((a) => prices[a]) ?? []).map((areas) => ({ price: prices[areas[0]], areas }));
 }
 
 /** 同じ価格の点を持つカーブを足す（syntheticCurve のカーブはどれも同じ価格の並び） */

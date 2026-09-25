@@ -209,12 +209,15 @@ export class App implements AppApi {
 
     // 概要タブは前年同期との比較に 1 年前のデータも使う
     const pending = this.ensureLoaded(this.state.tab === 'overview' ? range.from - 366 : range.from, range.to);
-    // 入札カーブのタブは、選んだ日（比較する日を含む）のカーブと期間の指標も読み込んでから描く
-    const curvesPending = this.state.tab === 'curves' ? this.prepareCurves(range) : null;
-    if (pending || curvesPending) {
+    // 入札カーブのタブは、選んだ日（比較する日を含む）のカーブと期間の指標も読み込んでから描く。
+    // カーブのある日の取引結果（エリアの約定価格。単エリアのコマを探すのに使う）も読み込む
+    const curvesTab = this.state.tab === 'curves' && this.curves !== null;
+    const curvesPending = curvesTab ? this.prepareCurves(range) : null;
+    const curveSpot = curvesTab ? this.ensureLoaded(this.curves!.first, this.curves!.last) : null;
+    if (pending || curvesPending || curveSpot) {
       this.viewHost.classList.add('is-loading');
       this.filterBar.setStatus('データを読み込み中…');
-      await Promise.all([pending, curvesPending]);
+      await Promise.all([pending, curvesPending, curveSpot]);
       if (seq !== this.renderSeq) return;
     }
     // 追い越された古い render が読み込み表示を残していても、ここで必ず解除する
