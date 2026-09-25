@@ -132,6 +132,22 @@ export class CurveStore {
     return this.shapes.get(day);
   }
 
+  /**
+   * 描画用のカーブを 1 日分読む（手元には置かない。多くの日のカーブを順に集計するときに使う）。
+   * 読み込み済みならそれを返す。カーブの無い日は null
+   */
+  async readDay(day: number): Promise<CurveDay | null> {
+    const cached = this.shapes.get(day);
+    if (cached) return cached;
+    if (!this.daySet.has(day)) return null;
+    const source = this.source;
+    if (source.kind === 'demo') {
+      const file = this.synth(source.ds, day);
+      return file ? decodeCurveDay(file) : null;
+    }
+    return decodeCurveDay(await source.read(curveDayFile(day)));
+  }
+
   /** 描画用のカーブを読み込む（すべて読み込み済みなら null） */
   ensureDays(days: number[]): Promise<void> | null {
     const need = days.filter((d) => this.daySet.has(d) && !this.shapes.has(d));

@@ -115,6 +115,8 @@ export interface AppState {
   curveSide: CurveSide;
   /** 価格帯ごとの入札量の推移で見る側 */
   curveDepth: CurveSide;
+  /** 何度も出てくる段で見る側 */
+  stepSide: CurveSide;
   /** 入札カーブのヒートマップの指標 */
   curveMetric: CurveMetricKey;
   yearMetric: YearMetric;
@@ -157,6 +159,7 @@ export const DEFAULT_STATE: AppState = {
   curvePicks: [],
   curveSide: 'sell',
   curveDepth: 'sell',
+  stepSide: 'sell',
   curveMetric: 'sell001',
   yearMetric: 'mean',
   tableUnit: 'month',
@@ -259,6 +262,7 @@ const SCHEMA: { [K in keyof AppState]: [string, Codec<AppState[K]>] } = {
   curvePicks: ['cp', picksCodec],
   curveSide: ['csd', oneOf<CurveSide>(['sell', 'buy'])],
   curveDepth: ['cdp', oneOf<CurveSide>(['sell', 'buy'])],
+  stepSide: ['ssd', oneOf<CurveSide>(['sell', 'buy'])],
   curveMetric: ['cm2', oneOf<CurveMetricKey>(CURVE_METRIC_KEYS)],
   yearMetric: ['ym', oneOf<YearMetric>(['mean', 'max', 'min', 'floor'])],
   tableUnit: ['tu', oneOf<TableUnit>(['day', 'week', 'month', 'fy', 'year', 'dow', 'slot', 'all'])],

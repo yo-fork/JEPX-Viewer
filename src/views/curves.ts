@@ -12,6 +12,7 @@ import {
   CURVE_TARGETS,
   curveSteps,
   findAloneSlots,
+  largestSteps,
   type AloneSlot,
   type AreaCurve,
   type CurveTarget,
@@ -35,9 +36,10 @@ import {
 } from '../lib/bidCurves';
 import { COMPARE_DAYS, type CurveStore } from '../lib/curveStore';
 import { DOW_LABEL, dowOfDay, formatDay, isoFromDay, parseDateString, slotRangeLabel, slotStartLabel, ymdFromDay } from '../lib/dates';
-import { fmtNum, fmtPrice, fmtSigned } from '../lib/format';
+import { fmtNum, fmtPrice, fmtSigned, stepDigits } from '../lib/format';
 import { AREAS, kwhToMw, SERIES_INDEX, SLOTS, type AreaKey, type SeriesKey } from '../lib/series';
 import { reselect, type Selection } from '../lib/select';
+import { stepGrid, type StepCell, type StepOccurrence } from '../lib/stepGrid';
 import type { Dataset } from '../lib/store';
 import { niceStep } from '../lib/stats';
 import { MAX_CURVE_PICKS, normalizePicks, type CurveCompare, type CurvePick, type CurveRange, type CurveSide } from '../state';
@@ -80,8 +82,21 @@ const CROSS_LABEL_WIDTH_WRAPPED = 120;
 /** グラフ領域の上端（凡例 1 行と縦軸の名前の分）と、凡例が折り返したときの 1 行の高さ */
 const PLOT_TOP = 36;
 const LEGEND_ROW = 24;
-/** 入札の大きな段として並べる数 */
+/** 入札の大きな段として並べる数（何度も出てくる段では、各コマのこの数の段を集める） */
 const STEP_COUNT = 10;
+
+/** 単エリアのコマの推定カーブから集めた段（エリアごと。集めたときの取引結果が変われば集め直す） */
+interface CollectedSteps {
+  ds: Dataset;
+  /** 段を集めたコマの数、推定できずに除いたコマの数、カーブを読み込めなかった日の数 */
+  slots: number;
+  skipped: number;
+  failed: number;
+  sell: StepOccurrence[];
+  buy: StepOccurrence[];
+}
+/** 集めた段は、タブを切り替えても入札カーブが同じあいだ使い回す */
+const collected = new WeakMap<CurveStore, Map<AreaKey, CollectedSteps>>();
 
 /** 価格帯ごとの入札量の推移で見る指標（入れ子になっている順。最後が合計） */
 const DEPTH: Record<CurveSide, { key: CurveMetricKey; name: string }[]> = {
@@ -156,6 +171,15 @@ export class CurvesView extends View {
   private aloneAreas!: ChartCard;
   private aloneHours!: ChartCard;
   private aloneMap!: ChartCard;
+  private stepSide!: Segmented<CurveSide>;
+  private collectBtn!: HTMLButtonElement;
+  private recurringMap!: ChartCard;
+  private recurringTop!: ChartCard;
+  /** 段を集めているエリア（集めていなければ null） */
+  private collecting: AreaKey | null = null;
+  /** 表示中の、何度も出てくる段（押したマス・棒からコマを引く） */
+  private recurring: { area: AreaKey; cells: Map<string, StepCell>; top: StepCell[] } | null = null;
+  private disposed = false;
   private depth!: ChartCard;
   private sensitivity!: ChartCard;
   private heat!: ChartCard;
@@ -302,6 +326,13 @@ export class CurvesView extends View {
     this.aloneAreas.chart.on('click', (e: unknown) => this.onAloneArea((e as { dataIndex: number }).dataIndex));
     this.aloneHours.chart.on('click', (e: unknown) => this.onAloneHour((e as { dataIndex: number }).dataIndex));
     this.aloneMap.chart.on('click', (e: unknown) => this.onAloneCell((e as { value?: unknown }).value));
+    this.recurringMap = this.card(ga, { title: '何度も出てくる段（価格 × 量）', height: 420 });
+    this.recurringTop = this.card(ga, { title: 'よく出てくる段（上位 10）', height: 420 });
+    this.stepSide = segmented('入札', sides, s.stepSide, (v) => this.set({ stepSide: v }));
+    this.collectBtn = h('button', { type: 'button', class: 'btn btn-sm', onclick: () => this.onCollect() }, '集める');
+    this.recurringMap.addControls(this.stepSide.el, this.collectBtn);
+    this.recurringMap.chart.on('click', (e: unknown) => this.onRecurringCell((e as { value?: unknown }).value));
+    this.recurringTop.chart.on('click', (e: unknown) => this.onRecurringBar((e as { dataIndex: number }).dataIndex));
 
     this.periodNote = h('p', { class: 'view-note' });
     this.content.append(h('h2', { class: 'view-section-title' }, '期間で見る'), this.periodNote);
@@ -362,7 +393,14 @@ export class CurvesView extends View {
     this.renderSteps(cs, date);
     this.renderComparison(cs, date);
     this.renderAlone(cs);
+    this.renderRecurring(cs);
     this.renderPeriod(cs);
+  }
+
+  override unmount(): void {
+    // 段を集めている途中なら、そこでやめる
+    this.disposed = true;
+    super.unmount();
   }
 
   // ---- 単エリアが 1 つだけのコマ ----
@@ -826,7 +864,8 @@ export class CurvesView extends View {
     for (const side of ['sell', 'buy'] as const) {
       const card = side === 'sell' ? this.sellSteps : this.buySteps;
       const color = seriesColor(side === 'sell' ? 'sellBid' : 'buyBid', theme);
-      const all = curveSteps(side === 'sell' ? ac.sell : ac.buy)
+      const steps = side === 'sell' ? ac.sell : ac.buy;
+      const all = curveSteps(steps)
         .filter((st) => st.mw > 0)
         .sort((a, b) => b.mw - a.mw);
       if (all.length === 0) {
@@ -834,7 +873,7 @@ export class CurvesView extends View {
         continue;
       }
       // 大きい段を、価格の順（売りは安い順、買いは高い順）に並べる
-      const top = all.slice(0, STEP_COUNT).sort((a, b) => (side === 'sell' ? a.price - b.price : b.price - a.price));
+      const top = largestSteps(steps, STEP_COUNT).sort((a, b) => (side === 'sell' ? a.price - b.price : b.price - a.price));
       card.setSubtitle(
         `${when}・${targetText(target, ac)}・その価格で増えた${SIDE_LABEL[side]}の量が大きい ${top.length} 段（${side === 'sell' ? '安い' : '高い'}順）${isEstimate(ac) ? '・推定のカーブ' : ''}`,
       );
@@ -956,6 +995,188 @@ export class CurvesView extends View {
       heatmapOption(g, { theme, min, max, colors: t.div, precision: 1, fmt: (v) => `${fmtSigned(v)} 円`, valueLabel: `${name} − システムプライス` }),
       gridTable(g, `jepx_alone_${area}_${tag}.csv`),
     );
+  }
+
+  private onCollect(): void {
+    const cs = this.ctx.curves;
+    const area = this.ctx.state.curveArea;
+    if (cs && area !== 'system') void this.collectSteps(cs, area);
+  }
+
+  /**
+   * 対象のエリアだけが単エリアになったコマの推定カーブを 1 日ずつ読み、各コマの大きい段を集める。
+   * 1 日分が数百 KB あるので、ボタンを押したときだけ読み、読んだカーブは手元に置かない
+   */
+  private async collectSteps(cs: CurveStore, area: AreaKey): Promise<void> {
+    if (this.collecting) return;
+    this.collecting = area;
+    const ds = this.ctx.ds;
+    const byDay = new Map<number, number[]>();
+    for (const x of this.alone) if (x.area === area) byDay.set(x.day, [...(byDay.get(x.day) ?? []), x.slot]);
+    const out: CollectedSteps = { ds, slots: 0, skipped: 0, failed: 0, sell: [], buy: [] };
+    const name = areaLabel(area);
+    this.collectBtn.hidden = true;
+    let stopped = false;
+    try {
+      let k = 0;
+      for (const [d, slots] of byDay) {
+        // タブを切り替えたり、対象を変えたりしたらやめる（途中までの段は使わない）
+        if (this.disposed || this.ctx.state.curveArea !== area) {
+          stopped = true;
+          break;
+        }
+        const msg = `${name}の入札カーブを読み込んでいます… ${fmtNum(++k)} / ${fmtNum(byDay.size)} 日`;
+        this.recurringMap.setEmpty(msg);
+        this.recurringTop.setEmpty(msg);
+        let day: CurveDay | null = null;
+        try {
+          day = await cs.readDay(d);
+        } catch {
+          // 読み込めなかった日は飛ばして、その数を出す
+          out.failed++;
+        }
+        // 進み具合を表示できるよう、1 日ごとに描画の機会を渡す
+        await new Promise((r) => setTimeout(r, 0));
+        if (!day) continue;
+        for (const s of slots) {
+          const ac = this.curveOf(day, s, area);
+          if (ac?.kind !== 'single') {
+            out.skipped++;
+            continue;
+          }
+          out.slots++;
+          for (const st of largestSteps(ac.sell, STEP_COUNT)) out.sell.push({ day: d, slot: s, price: st.price, mw: st.mw });
+          for (const st of largestSteps(ac.buy, STEP_COUNT)) out.buy.push({ day: d, slot: s, price: st.price, mw: st.mw });
+        }
+      }
+      if (!stopped) {
+        let map = collected.get(cs);
+        if (!map) collected.set(cs, (map = new Map()));
+        map.set(area, out);
+      }
+    } catch (err) {
+      const msg = `${name}の入札カーブを読み込めませんでした（${(err as Error).message}）`;
+      this.recurringMap.setEmpty(msg);
+      this.recurringTop.setEmpty(msg);
+      return;
+    } finally {
+      this.collecting = null;
+    }
+    // 途中でやめたときも、今の対象で描き直す（集めている間は、ほかのエリアの「集める」ボタンを隠している）
+    if (!this.disposed) this.renderRecurring(cs);
+  }
+
+  /** 対象のエリアだけが単エリアになったコマから集めた段を、価格と量の格子で数える */
+  private renderRecurring(cs: CurveStore): void {
+    const { state, ds, theme } = this.ctx;
+    const t = TOKENS[theme];
+    const area = state.curveArea;
+    const cards = [this.recurringMap, this.recurringTop];
+    this.stepSide.set(state.stepSide);
+    this.recurring = null;
+    this.collectBtn.hidden = true;
+    if (area === 'system') {
+      cards.forEach((c) => c.setEmpty('対象にエリアを選ぶと、そのエリアだけが単エリアになったコマの推定カーブから、何度も出てくる段を集めます。'));
+      return;
+    }
+    const name = areaLabel(area);
+    const own = this.alone.filter((x) => x.area === area);
+    if (own.length === 0) {
+      cards.forEach((c) => c.setEmpty(`${name}だけが単エリアになったコマはありません。`));
+      return;
+    }
+    // 集めている途中は、進み具合を出したままにする
+    if (this.collecting === area) return;
+    const got = collected.get(cs)?.get(area);
+    if (!got || got.ds !== ds) {
+      const days = new Set(own.map((x) => x.day)).size;
+      this.collectBtn.hidden = this.collecting !== null;
+      this.collectBtn.textContent = `${name}の ${fmtNum(own.length)} コマから集める（${fmtNum(days)} 日分のカーブを読み込みます）`;
+      cards.forEach((c) =>
+        c.setEmpty(
+          `上のボタンを押すと、${name}だけが単エリアになったコマの推定カーブを読み込み、各コマの大きい ${STEP_COUNT} 段を集めて、同じような価格と量の段が何コマに出てくるかを数えます。`,
+        ),
+      );
+      return;
+    }
+    const side = state.stepSide;
+    const g = stepGrid(got[side]);
+    if (!g) {
+      cards.forEach((c) => c.setEmpty(`${name}の推定カーブに${SIDE_LABEL[side]}の段がありません。`));
+      return;
+    }
+    const color = seriesColor(side === 'sell' ? 'sellBid' : 'buyBid', theme);
+    const digits = stepDigits(g.price.width);
+    const low = (k: number) => fmtNum(g.price.start + k * g.price.width, digits);
+    const lastP = g.price.n - 1;
+    const priceLabel = (k: number) => (k === 0 && g.price.below ? `〜${low(1)}` : k === lastP && g.price.above ? `${low(k)}〜` : low(k));
+    const priceRange = (k: number) =>
+      k === 0 && g.price.below ? `${low(1)} 円未満` : k === lastP && g.price.above ? `${low(k)} 円以上` : `${low(k)}〜${low(k + 1)} 円`;
+    const mwRange = (m: number) => `${fmtNum(m * g.mw.width)}〜${fmtNum((m + 1) * g.mw.width)} MW`;
+    const latestText = (c: StepCell) => `いちばん新しいコマ: ${formatDay(c.latest.day, true)} ${slotRangeLabel(c.latest.slot)}`;
+    const share = (c: StepCell) => `集めた ${fmtNum(got.slots)} コマの ${fmtNum((c.slots / got.slots) * 100, 1)}%`;
+    const top = g.cells.slice(0, STEP_COUNT);
+    // 縦軸は量（上ほど大きい。heatmapOption は上から並べるので、大きい量から並べる）
+    const nM = g.mw.n;
+    this.recurring = { area, cells: new Map(g.cells.map((c) => [`${c.p},${nM - 1 - c.m}`, c])), top };
+    const grid: Grid = {
+      xLabels: Array.from({ length: g.price.n }, (_, k) => priceLabel(k)),
+      xTitles: Array.from({ length: g.price.n }, (_, k) => priceRange(k)),
+      yLabels: Array.from({ length: nM }, (_, i) => fmtNum((nM - 1 - i) * g.mw.width)),
+      yTitles: Array.from({ length: nM }, (_, i) => mwRange(nM - 1 - i)),
+      cells: g.cells.map((c) => [c.p, nM - 1 - c.m, c.slots]),
+      yIsSlot: false,
+    };
+    const excluded = [
+      got.skipped > 0 ? `推定できない ${fmtNum(got.skipped)} コマ` : '',
+      got.failed > 0 ? `カーブを読み込めなかった ${fmtNum(got.failed)} 日` : '',
+    ].filter(Boolean);
+    const skipped = excluded.length > 0 ? `（${excluded.join('と')}を除く）` : '';
+    const what = `${name}だけが単エリアになった ${fmtNum(got.slots)} コマ${skipped}の推定カーブの、各コマの大きい ${STEP_COUNT} 段・${SIDE_LABEL[side]}`;
+    this.recurringMap.setSubtitle(`${what}・横軸は段の価格（円/kWh）、縦軸はその価格で増えた量（MW）、色は段のあったコマの数（押すと、いちばん新しいコマを表示）`);
+    this.recurringMap.setHeight(Math.round(Math.min(560, Math.max(320, nM * 14 + 120))));
+    const option = heatmapOption(grid, { theme, min: 1, max: Math.max(2, top[0].slots), colors: t.seq, precision: 0, fmt: (v) => `${fmtNum(v)} コマ`, valueLabel: '段のあったコマ' });
+    option.tooltip = {
+      trigger: 'item',
+      formatter: (p: { value: [number, number, number] }) => {
+        const c = this.recurring?.cells.get(`${p.value[0]},${p.value[1]}`);
+        if (!c) return '';
+        return ttHeader(`${priceRange(c.p)}・${mwRange(c.m)}`) + ttRow(color, `${fmtNum(c.slots)} コマ`, share(c), 'rect') + ttNote(latestText(c));
+      },
+    };
+    this.recurringMap.setOption(option, gridTable(grid, `jepx_recurring_steps_${area}_${side}_${fileDate(cs.first)}-${fileDate(cs.last)}.csv`));
+
+    this.recurringTop.setSubtitle(`${what}・同じような価格と量の段が出てきたコマの数（押すと、いちばん新しいコマを表示）`);
+    this.recurringTop.setOption(
+      categoryBarOption(
+        top.map((c) => ({ label: `${priceRange(c.p)}・${mwRange(c.m)}`, value: c.slots, color })),
+        {
+          horizontal: true,
+          theme,
+          unit: 'コマ',
+          format: (v) => fmtNum(v),
+          tooltip: (i) => ttHeader(`${priceRange(top[i].p)}・${mwRange(top[i].m)}`) + ttRow(color, `${fmtNum(top[i].slots)} コマ`, share(top[i]), 'rect') + ttNote(latestText(top[i])),
+          valueAxisExtra: { minInterval: 1, splitLine: { show: true, lineStyle: { color: t.grid } } },
+        },
+      ),
+      {
+        columns: ['段の価格（円/kWh）', 'その価格で増えた量（MW）', '段のあったコマ数', '集めたコマに対する割合（%）', 'いちばん新しいコマ'],
+        rows: g.cells.map((c) => [priceRange(c.p), mwRange(c.m), c.slots, (c.slots / got.slots) * 100, `${formatDay(c.latest.day)} ${slotStartLabel(c.latest.slot)}`]),
+        digits: [null, null, 0, 1, null],
+        filename: `jepx_recurring_steps_top_${area}_${side}_${fileDate(cs.first)}-${fileDate(cs.last)}.csv`,
+      },
+    );
+  }
+
+  private onRecurringCell(value: unknown): void {
+    const v = value as [number, number, number] | undefined;
+    const c = v ? this.recurring?.cells.get(`${v[0]},${v[1]}`) : undefined;
+    if (c && this.recurring) this.openAlone({ ...c.latest, area: this.recurring.area });
+  }
+
+  private onRecurringBar(index: number): void {
+    const c = this.recurring?.top[index];
+    if (c && this.recurring) this.openAlone({ ...c.latest, area: this.recurring.area });
   }
 
   // ---- 期間で見る ----

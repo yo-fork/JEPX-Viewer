@@ -391,3 +391,11 @@ export function curveSteps(steps: ArrayLike<number>): CurveStep[] {
   for (let i = 2; i + 1 < steps.length; i += 2) out.push({ price: steps[i], mw: steps[i + 1] - steps[i - 1], before: steps[i - 1] });
   return out;
 }
+
+/** 増えた量の大きい順に n 段 */
+export function largestSteps(steps: ArrayLike<number>, n: number): CurveStep[] {
+  return curveSteps(steps)
+    .filter((st) => st.mw > 0)
+    .sort((a, b) => b.mw - a.mw)
+    .slice(0, n);
+}
