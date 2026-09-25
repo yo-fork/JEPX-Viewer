@@ -5,16 +5,16 @@
 import { aggregate, buildPeriods, FISCAL_MONTH_LABELS, fiscalMonthIndex, src, type Source } from '../lib/aggregate';
 import { formatDay, slotRangeLabel, slotStartLabel } from '../lib/dates';
 import { fmtPrice, fmtSigned } from '../lib/format';
-import { PRICE_KEYS, SERIES_LABEL, SLOTS, type PriceKey } from '../lib/series';
+import { AREA_KEYS, PRICE_KEYS, SERIES_LABEL, SLOTS, type PriceKey } from '../lib/series';
 import type { Selection } from '../lib/select';
 import { accMean, quantileSorted } from '../lib/stats';
-import type { HeatKind } from '../state';
+import type { HeatKind, ScaleMode } from '../state';
 import type { ChartCard, TableData } from '../ui/card';
 import { segmented, selectField, toolbar, type Segmented, type SelectField } from '../ui/controls';
 import { TOKENS, type ThemeName } from '../ui/theme';
 import { ttHeader, ttRow } from '../ui/tooltip';
 import { NO_DATA, View } from './base';
-import { describeSelection, monthLabel, PRICE_UNIT, rangeTag } from './common';
+import { CommonRange, describeSelection, monthLabel, PRICE_UNIT, rangeTag, SCALE_OPTIONS } from './common';
 
 const DOW_COLUMNS = ['月', '火', '水', '木', '金', '土', '日', '祝日'];
 const MAX_DAILY_COLUMNS = 800;
@@ -36,7 +36,9 @@ export class HeatmapView extends View {
   private kind!: Segmented<HeatKind>;
   private focus!: SelectField<PriceKey>;
   private value!: Segmented<'price' | 'spread'>;
+  private scale!: Segmented<ScaleMode>;
   private chart!: ChartCard;
+  private readonly common = new CommonRange();
 
   protected build(): void {
     const s = this.ctx.state;
@@ -61,7 +63,8 @@ export class HeatmapView extends View {
       s.heatSpread ? 'spread' : 'price',
       (v) => this.set({ heatSpread: v === 'spread' }),
     );
-    this.root.append(toolbar(this.kind.el, this.focus.el, this.value.el));
+    this.scale = segmented('色の範囲', SCALE_OPTIONS, s.scale, (v) => this.set({ scale: v }));
+    this.root.append(toolbar(this.kind.el, this.focus.el, this.value.el, this.scale.el));
     const g = this.grid();
     this.chart = this.card(g, { title: 'ヒートマップ', height: 560, wide: true });
   }
@@ -75,21 +78,30 @@ export class HeatmapView extends View {
     this.value.setDisabled(!spreadAllowed);
     const spread = state.heatSpread && spreadAllowed;
     this.value.set(spread ? 'spread' : 'price');
+    this.scale.set(state.scale);
     if (sel.days.length === 0) {
       this.chart.setEmpty(NO_DATA);
       return;
     }
-    const source = spread ? src(ds, state.focus, 'system') : src(ds, state.focus);
-    const g = buildGrid(sel, source, state.heatKind);
+    const sourceOf = (k: PriceKey) => (spread ? src(ds, k, 'system') : src(ds, k));
+    const g = buildGrid(sel, sourceOf(state.focus), state.heatKind);
     if (g.cells.length === 0) {
       this.chart.setEmpty(NO_DATA);
       return;
     }
 
+    const common = state.scale === 'common';
     const valueLabel = spread ? `${SERIES_LABEL[state.focus]} − システムプライス` : SERIES_LABEL[state.focus];
-    this.chart.setSubtitle(`${describeSelection(sel, state)}・${valueLabel}（${PRICE_UNIT}）${g.note ? `・${g.note}` : ''}`);
+    this.chart.setSubtitle(
+      `${describeSelection(sel, state)}・${valueLabel}（${PRICE_UNIT}）${g.note ? `・${g.note}` : ''}${common ? '・色の範囲は全エリア共通' : ''}`,
+    );
 
-    const [min, max] = colorRange(g, spread);
+    // 全エリア共通: システムプライスと各エリア（差を見るときは各エリア）の色の範囲をすべて含む範囲
+    const [min, max] = common
+      ? this.common.get(sel, `${state.heatKind}|${spread}`, spread ? AREA_KEYS : PRICE_KEYS, (k) =>
+          colorRange(buildGrid(sel, sourceOf(k), state.heatKind), spread),
+        )
+      : colorRange(g, spread);
     this.chart.setHeight(heatmapHeight(g));
     const fmt = spread ? (v: number) => `${fmtSigned(v)} 円` : (v: number) => `${fmtPrice(v)} ${PRICE_UNIT}`;
 

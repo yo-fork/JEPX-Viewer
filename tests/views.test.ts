@@ -3,8 +3,12 @@ import { src } from '../src/lib/aggregate';
 import { dayFromYmd, MS_PER_SLOT } from '../src/lib/dates';
 import { generateDemoDays } from '../src/lib/demo';
 import { select } from '../src/lib/select';
+import { PRICE_KEYS } from '../src/lib/series';
 import { DataStore } from '../src/lib/store';
 import { stateFromHash, stateToHash } from '../src/state';
+import { dayRange } from '../src/views/calendar';
+import { CommonRange, fixedAxis, unionRange, whiskerRange } from '../src/views/common';
+import { buildGrid, colorRange } from '../src/views/heatmap';
 import { breakGaps, slotPoints } from '../src/views/timeseries';
 
 describe('30 分値の時系列', () => {
@@ -82,6 +86,83 @@ describe('入札カーブの URL', () => {
     expect(stateFromHash(`#cp=${many}`).curvePicks).toHaveLength(5);
     expect(stateFromHash('#ca=nowhere').curveArea).toBe('system');
     expect(stateToHash(stateFromHash('#tab=curves'))).toBe('#tab=curves');
+  });
+});
+
+describe('全エリア共通の色・縦軸の範囲', () => {
+  const start = dayFromYmd(2025, 4, 1);
+  const store = new DataStore();
+  store.addDays(generateDemoDays(start, start + 120), 'demo');
+  const ds = store.dataset()!;
+  const sel = select(ds, { from: start, to: start + 119, dayType: 'all', slotStart: 0, slotEnd: 48 });
+
+  it('URL に保存・復元でき、既定の「対象ごと」は URL に載せない', () => {
+    const s = stateFromHash('#tab=heatmap&sc=common');
+    expect(s.scale).toBe('common');
+    expect(stateToHash(s)).toBe('#tab=heatmap&sc=common');
+    expect(stateFromHash(stateToHash(s))).toEqual(s);
+    expect(stateFromHash('#sc=fixed').scale).toBe('auto');
+    expect(stateToHash(stateFromHash('#tab=heatmap'))).toBe('#tab=heatmap');
+  });
+
+  it('系列ごとの範囲をすべて含む範囲にする（値の無い系列は除く）', () => {
+    expect(unionRange([[4, 21], [0, 20], [Number.NaN, Number.NaN], [4, 22]])).toEqual([0, 22]);
+    expect(unionRange([[Number.NaN, Number.NaN]]).every(Number.isNaN)).toBe(true);
+  });
+
+  it('ヒートマップの色の範囲は、どの対象の「対象ごと」の範囲も含む', () => {
+    const rangeOf = (k: (typeof PRICE_KEYS)[number]) => colorRange(buildGrid(sel, src(ds, k), 'dateSlot'), false);
+    const own = PRICE_KEYS.map(rangeOf);
+    const [lo, hi] = new CommonRange().get(sel, 'dateSlot', PRICE_KEYS, rangeOf);
+    for (const [a, b] of own) {
+      expect(lo).toBeLessThanOrEqual(a);
+      expect(hi).toBeGreaterThanOrEqual(b);
+    }
+    expect(lo).toBe(Math.min(...own.map((r) => r[0])));
+    expect(hi).toBe(Math.max(...own.map((r) => r[1])));
+  });
+
+  it('期間・曜日区分・時間帯・格子の種類など（extra）とデータが同じあいだは計算し直さない', () => {
+    const own = new DataStore();
+    own.addDays(generateDemoDays(start, start + 30), 'demo');
+    const s = select(own.dataset()!, { from: start, to: start + 29, dayType: 'all', slotStart: 0, slotEnd: 48 });
+    const common = new CommonRange();
+    let calls = 0;
+    const rangeOf = (): [number, number] => {
+      calls++;
+      return [0, 1];
+    };
+    common.get(s, 'dateSlot', PRICE_KEYS, rangeOf);
+    common.get(select(s.ds, s.filters), 'dateSlot', PRICE_KEYS, rangeOf);
+    expect(calls).toBe(PRICE_KEYS.length);
+    common.get(s, 'monthSlot', PRICE_KEYS, rangeOf);
+    common.get(select(s.ds, { ...s.filters, dayType: 'weekday' }), 'monthSlot', PRICE_KEYS, rangeOf);
+    expect(calls).toBe(PRICE_KEYS.length * 3);
+    // データを読み込み直した（Dataset が作り直された）
+    own.addDays(generateDemoDays(start + 30, start + 31), 'demo');
+    common.get(select(own.dataset()!, { ...s.filters, dayType: 'weekday' }), 'monthSlot', PRICE_KEYS, rangeOf);
+    expect(calls).toBe(PRICE_KEYS.length * 4);
+  });
+
+  it('箱ひげ図の縦軸は、ひげ（10〜90%点）がすべて入る目盛りの幅の倍数まで広げる', () => {
+    expect(whiskerRange([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], [], [20]])).toEqual([2, 20]);
+    expect(fixedAxis([2, 20])).toEqual({ min: 0, max: 20, interval: 5 });
+    expect(fixedAxis([4.96, 18.96])).toEqual({ min: 0, max: 20, interval: 5 });
+    expect(fixedAxis([0.01, 33.2])).toEqual({ min: 0, max: 40, interval: 10 });
+    expect(fixedAxis([1, 12.1])).toEqual({ min: 0, max: 12.5, interval: 2.5 });
+    expect(fixedAxis([-3, 12])).toEqual({ min: -5, max: 15, interval: 5 });
+    // 値が無ければ固定しない
+    expect(fixedAxis([Number.NaN, Number.NaN])).toEqual({});
+  });
+
+  it('カレンダーの「対象ごと」の色の範囲（1〜99%点、差は対称、0.01 円のコマ数は 0〜最大）', () => {
+    const v = [0.01, 5.2, 7.9, 12.3, Number.NaN, 30.4];
+    expect(dayRange('mean', v)).toEqual([0, 30]);
+    expect(dayRange('floor', [0, 3, 12, Number.NaN])).toEqual([0, 12]);
+    const [lo, hi] = dayRange('spread', [-2, 1, 3]);
+    expect(hi).toBeCloseTo(2.96);
+    expect(lo).toBe(-hi);
+    expect(dayRange('mean', [Number.NaN]).every(Number.isNaN)).toBe(true);
   });
 });
 

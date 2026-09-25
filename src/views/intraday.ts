@@ -6,24 +6,28 @@ import { aggregate, seasonOfMonth, src } from '../lib/aggregate';
 import { slotRangeLabel, slotStartLabel } from '../lib/dates';
 import { PRICE_KEYS, SERIES_LABEL, SERIES_SHORT, SLOTS, type PriceKey } from '../lib/series';
 import { accMean, quantileSorted } from '../lib/stats';
-import type { IntradayMode } from '../state';
+import type { IntradayMode, ScaleMode } from '../state';
 import type { ChartCard } from '../ui/card';
 import { segmented, selectField, toolbar, type Segmented, type SelectField } from '../ui/controls';
 import { ordinalColors, seriesColor, seriesDashed, TOKENS } from '../ui/theme';
 import { ttHeader, ttRow } from '../ui/tooltip';
 import { NO_DATA, View } from './base';
 import {
+  CommonRange,
   describeSelection,
   endLabels,
+  fixedAxis,
   grid,
   labelRoom,
   lineLegend,
   PRICE_UNIT,
   priceText,
   rangeTag,
+  SCALE_OPTIONS,
   slotAxis,
   styledLine,
   valueAxis,
+  whiskerRange,
   withAlpha,
 } from './common';
 
@@ -50,8 +54,10 @@ export class IntradayView extends View {
   private mode!: Segmented<IntradayMode>;
   private stat!: Segmented<'mean' | 'median'>;
   private focus!: SelectField<PriceKey>;
+  private scale!: Segmented<ScaleMode>;
   private profile!: ChartCard;
   private box!: ChartCard;
+  private readonly common = new CommonRange();
 
   protected build(): void {
     const s = this.ctx.state;
@@ -76,7 +82,8 @@ export class IntradayView extends View {
       s.intradayStat,
       (v) => this.set({ intradayStat: v }),
     );
-    this.root.append(toolbar(this.mode.el, this.focus.el, this.stat.el));
+    this.scale = segmented('箱ひげ図の縦軸', SCALE_OPTIONS, s.scale, (v) => this.set({ scale: v }));
+    this.root.append(toolbar(this.mode.el, this.focus.el, this.stat.el, this.scale.el));
     const g = this.grid();
     this.profile = this.card(g, { title: '時間帯別の価格（日内カーブ）', height: 380, wide: true });
     this.box = this.card(g, { title: '時間帯別の価格のばらつき', height: 340, wide: true });
@@ -87,6 +94,7 @@ export class IntradayView extends View {
     this.mode.set(state.intradayMode);
     this.stat.set(state.intradayStat);
     this.focus.set(state.focus);
+    this.scale.set(state.scale);
     if (sel.days.length === 0) {
       this.profile.setEmpty(NO_DATA);
       this.box.setEmpty(NO_DATA);
@@ -197,7 +205,18 @@ export class IntradayView extends View {
   private renderBox(): void {
     const { sel, ds, state, theme } = this.ctx;
     const t = TOKENS[theme];
-    const g = aggregate(sel, src(ds, state.focus), (_i, s) => s, SLOTS, true);
+    const bySlot = (k: PriceKey) => aggregate(sel, src(ds, k), (_i, s) => s, SLOTS, true);
+    const g = bySlot(state.focus);
+    const common = state.scale === 'common';
+    // 全エリア共通: システムプライスと各エリアのひげがすべて入る範囲
+    const axis = common
+      ? fixedAxis(
+          this.common.get(sel, '', PRICE_KEYS, (k) => {
+            const values = bySlot(k).values!;
+            return whiskerRange(sel.slots.map((s) => values[s]));
+          }),
+        )
+      : {};
     const stats = sel.slots.map((s) => {
       const v = Float64Array.from(g.values![s]).sort();
       return {
@@ -211,7 +230,9 @@ export class IntradayView extends View {
         max: g.acc[s].max,
       };
     });
-    this.box.setSubtitle(`${describeSelection(sel, state)}・${SERIES_LABEL[state.focus]}・箱は 25〜75%点、ひげは 10〜90%点、中の線は中央値`);
+    this.box.setSubtitle(
+      `${describeSelection(sel, state)}・${SERIES_LABEL[state.focus]}・箱は 25〜75%点、ひげは 10〜90%点、中の線は中央値${common ? '・縦軸は全エリア共通' : ''}`,
+    );
     this.box.setOption(
       {
         grid: grid({ top: 28 }),
@@ -237,7 +258,7 @@ export class IntradayView extends View {
           },
         },
         xAxis: { type: 'category', data: sel.slots.map(slotStartLabel), axisLabel: { interval: (i: number) => sel.slots[i] % 4 === 0, hideOverlap: true } },
-        yAxis: valueAxis(),
+        yAxis: valueAxis(PRICE_UNIT, axis),
         series: [
           {
             type: 'boxplot',

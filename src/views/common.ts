@@ -3,10 +3,13 @@
  */
 import { formatDay, slotStartLabel, ymdFromDay } from '../lib/dates';
 import { fmtPrice } from '../lib/format';
-import { SERIES_SHORT, type SeriesKey } from '../lib/series';
+import { SERIES_SHORT, type PriceKey, type SeriesKey } from '../lib/series';
 import type { Selection } from '../lib/select';
 import { isAllDay } from '../lib/select';
-import { SLOT_PRESETS, type AppState } from '../state';
+import { niceStep, quantileSorted } from '../lib/stats';
+import type { Dataset } from '../lib/store';
+import { SLOT_PRESETS, type AppState, type ScaleMode } from '../state';
+import type { Option } from '../ui/controls';
 import { TOKENS, seriesColor, seriesDashed, type ThemeName } from '../ui/theme';
 import { ttHeader, ttRow } from '../ui/tooltip';
 
@@ -64,6 +67,70 @@ export function valueAxis(name = PRICE_UNIT, extra: Record<string, unknown> = {}
     scale: false,
     ...extra,
   };
+}
+
+/** ヒートマップ・カレンダーの色と、箱ひげ図の縦軸の範囲の決め方 */
+export const SCALE_OPTIONS: Option<ScaleMode>[] = [
+  { value: 'auto', label: '対象ごと' },
+  { value: 'common', label: '全エリア共通' },
+];
+
+/** 範囲をすべて含む範囲（値の無い系列の NaN は除く。どれにも値が無ければ NaN） */
+export function unionRange(ranges: readonly [number, number][]): [number, number] {
+  let lo = Number.POSITIVE_INFINITY;
+  let hi = Number.NEGATIVE_INFINITY;
+  for (const [a, b] of ranges) {
+    if (a < lo) lo = a;
+    if (b > hi) hi = b;
+  }
+  return lo <= hi ? [lo, hi] : [Number.NaN, Number.NaN];
+}
+
+/** 箱ひげ図のひげ（10〜90%点）がすべて入る範囲 */
+export function whiskerRange(valuesPerGroup: readonly number[][]): [number, number] {
+  return unionRange(
+    valuesPerGroup.map((vals) => {
+      const v = Float64Array.from(vals).sort();
+      return [quantileSorted(v, 0.1), quantileSorted(v, 0.9)];
+    }),
+  );
+}
+
+/**
+ * 縦軸を固定する設定。0 を含め、目盛りの幅（1・2・2.5・5 × 10^n）の倍数まで広げる。
+ * 範囲だけを渡すと ECharts が目盛りの幅を選び直して上端の目盛りが半端になるので、幅も渡す。値が無ければ固定しない
+ */
+export function fixedAxis([lo, hi]: [number, number]): Record<string, number> {
+  if (!(lo <= hi)) return {};
+  const a = Math.min(0, lo);
+  const b = Math.max(0, hi);
+  const interval = niceStep((b - a) / 5);
+  return { min: Math.floor(a / interval) * interval, max: Math.max(interval, Math.ceil(b / interval) * interval), interval };
+}
+
+/**
+ * 全エリア共通の範囲。系列ごとの範囲をすべて含む範囲を、データと条件が同じあいだ使い回す
+ * （全系列を集計し直すので、対象を切り替えるたびには計算しない）。
+ */
+export class CommonRange {
+  private ds: Dataset | null = null;
+  private key = '';
+  private range: [number, number] = [Number.NaN, Number.NaN];
+
+  /**
+   * @param extra 期間・曜日区分・時間帯のほかに範囲が変わる条件（格子の種類・指標など。keys を変える条件も入れる）
+   * @param rangeOf 系列の範囲（値が無ければ NaN）
+   */
+  get(sel: Selection, extra: string, keys: readonly PriceKey[], rangeOf: (key: PriceKey) => [number, number]): [number, number] {
+    const f = sel.filters;
+    const key = [sel.from, sel.to, f.dayType, f.slotStart, f.slotEnd, extra].join('|');
+    if (sel.ds !== this.ds || key !== this.key) {
+      this.range = unionRange(keys.map(rangeOf));
+      this.ds = sel.ds;
+      this.key = key;
+    }
+    return this.range;
+  }
 }
 
 /** コマ（0〜47）のカテゴリ軸。2 時間おきにラベル */

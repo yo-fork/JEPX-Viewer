@@ -6,7 +6,7 @@ import { fiscalYearOfDay } from '../lib/dates';
 import { fmtNum, fmtPct, fmtPrice } from '../lib/format';
 import { AREAS, PRICE_KEYS, SERIES_LABEL, SERIES_SHORT, type PriceKey, type SeriesKey } from '../lib/series';
 import { niceStep, quantileSorted, summarizeInPlace } from '../lib/stats';
-import type { DistGroup } from '../state';
+import type { DistGroup, ScaleMode } from '../state';
 import type { ChartCard } from '../ui/card';
 import { segmented, selectField, toolbar, type Segmented, type SelectField } from '../ui/controls';
 import { TOKENS } from '../ui/theme';
@@ -14,8 +14,10 @@ import { ttHeader, ttRow } from '../ui/tooltip';
 import { NO_DATA, View } from './base';
 import {
   axisTooltip,
+  CommonRange,
   describeSelection,
   endLabels,
+  fixedAxis,
   grid,
   labelRoom,
   seriesLegend,
@@ -24,7 +26,9 @@ import {
   PRICE_UNIT,
   priceText,
   rangeTag,
+  SCALE_OPTIONS,
   valueAxis,
+  whiskerRange,
   withAlpha,
 } from './common';
 
@@ -51,16 +55,19 @@ export class DistributionView extends View {
   private focus!: SelectField<PriceKey>;
   private bin!: SelectField<string>;
   private group!: Segmented<DistGroup>;
+  private scale!: Segmented<ScaleMode>;
   private hist!: ChartCard;
   private duration!: ChartCard;
   private box!: ChartCard;
+  private readonly common = new CommonRange();
 
   protected build(): void {
     const s = this.ctx.state;
     this.focus = selectField('対象', PRICE_KEYS.map((k) => ({ value: k, label: SERIES_LABEL[k] })), s.focus, (v) => this.set({ focus: v }));
     this.bin = selectField('階級の幅', BIN_OPTIONS, s.distBin, (v) => this.set({ distBin: v }));
     this.group = segmented('箱ひげ図のグループ', GROUP_OPTIONS, s.distGroup, (v) => this.set({ distGroup: v }));
-    this.root.append(toolbar(this.focus.el, this.bin.el, this.group.el));
+    this.scale = segmented('箱ひげ図の縦軸', SCALE_OPTIONS, s.scale, (v) => this.set({ scale: v }));
+    this.root.append(toolbar(this.focus.el, this.bin.el, this.group.el, this.scale.el));
     const g = this.grid();
     this.hist = this.card(g, { title: '価格帯別のコマ数（ヒストグラム）', height: 320 });
     this.duration = this.card(g, { title: '価格持続曲線', height: 320 });
@@ -72,6 +79,9 @@ export class DistributionView extends View {
     this.focus.set(state.focus);
     this.bin.set(state.distBin);
     this.group.set(state.distGroup);
+    this.scale.set(state.scale);
+    // エリア別は 1 つの図に全エリアを並べるので、対象を切り替えても縦軸は変わらない
+    this.scale.setDisabled(state.distGroup === 'area');
     if (sel.days.length === 0) {
       [this.hist, this.duration, this.box].forEach((c) => c.setEmpty(NO_DATA));
       return;
@@ -180,8 +190,10 @@ export class DistributionView extends View {
     const { sel, ds, state, theme } = this.ctx;
     const t = TOKENS[theme];
     const group = state.distGroup;
+    const common = state.scale === 'common' && group !== 'area';
     let labels: string[];
     let valuesPerGroup: number[][];
+    let axis: Record<string, number> = {};
 
     if (group === 'area') {
       const keys: SeriesKey[] = ['system', ...AREAS.map((a) => a.key)];
@@ -204,8 +216,10 @@ export class DistributionView extends View {
         n = 24;
         labels = Array.from({ length: 24 }, (_, h) => `${h}時`);
       }
-      const g = aggregate(sel, src(ds, state.focus), groupOf, n, true);
-      valuesPerGroup = g.values!;
+      const valuesOf = (k: PriceKey) => aggregate(sel, src(ds, k), groupOf, n, true).values!;
+      valuesPerGroup = valuesOf(state.focus);
+      // 全エリア共通: システムプライスと各エリアのひげがすべて入る範囲
+      if (common) axis = fixedAxis(this.common.get(sel, group, PRICE_KEYS, (k) => whiskerRange(valuesOf(k))));
     }
 
     const stats = valuesPerGroup.map((vals) => {
@@ -224,7 +238,9 @@ export class DistributionView extends View {
       };
     });
     const target = group === 'area' ? '全エリア' : SERIES_LABEL[state.focus];
-    this.box.setSubtitle(`${describeSelection(sel, state)}・${target}・箱は 25〜75%点、ひげは 10〜90%点、中の線は中央値`);
+    this.box.setSubtitle(
+      `${describeSelection(sel, state)}・${target}・箱は 25〜75%点、ひげは 10〜90%点、中の線は中央値${common ? '・縦軸は全エリア共通' : ''}`,
+    );
     this.box.setOption(
       {
         grid: grid({ top: 28 }),
@@ -249,7 +265,7 @@ export class DistributionView extends View {
           },
         },
         xAxis: { type: 'category', data: labels, axisLabel: { hideOverlap: true } },
-        yAxis: valueAxis(),
+        yAxis: valueAxis(PRICE_UNIT, axis),
         series: [
           {
             type: 'boxplot',

@@ -45,6 +45,8 @@ export type DistGroup = 'month' | 'fy' | 'dow' | 'hour' | 'area';
 export type YearMetric = 'mean' | 'max' | 'min' | 'floor';
 export type TableUnit = 'day' | 'week' | 'month' | 'fy' | 'year' | 'dow' | 'slot' | 'all';
 export type TableKind = 'areas' | 'stats';
+/** 色・縦軸の範囲: 対象ごとに決めるか、全エリアで共通にする（対象を切り替えても変えない）か */
+export type ScaleMode = 'auto' | 'common';
 /** 入札カーブの縦軸（価格）の上限 */
 export type CurveRange = 'auto' | '30' | '50' | '100' | 'all';
 /** 入札カーブの比較: 直近の日・6 時間おき・自由に選んだ日と時間帯 */
@@ -93,6 +95,8 @@ export interface AppState {
   calMetric: CalMetric;
   distBin: string;
   distGroup: DistGroup;
+  /** ヒートマップ・カレンダーの色と、箱ひげ図の縦軸の範囲 */
+  scale: ScaleMode;
   pairA: AreaKey;
   pairB: AreaKey;
   /** エリア比較タブの比較の基準（平均差・分断率・月別の差） */
@@ -141,6 +145,7 @@ export const DEFAULT_STATE: AppState = {
   calMetric: 'mean',
   distBin: 'auto',
   distGroup: 'month',
+  scale: 'auto',
   pairA: 'tokyo',
   pairB: 'kansai',
   areaBase: 'system',
@@ -242,6 +247,7 @@ const SCHEMA: { [K in keyof AppState]: [string, Codec<AppState[K]>] } = {
   calMetric: ['cm', oneOf<CalMetric>(['mean', 'max', 'min', 'range', 'floor', 'spread'])],
   distBin: ['bin', oneOf(['auto', '0.5', '1', '2', '5', '10'])],
   distGroup: ['dg', oneOf<DistGroup>(['month', 'fy', 'dow', 'hour', 'area'])],
+  scale: ['sc', oneOf<ScaleMode>(['auto', 'common'])],
   pairA: ['a', oneOf(AREA_KEYS)],
   pairB: ['b', oneOf(AREA_KEYS)],
   areaBase: ['base', oneOf(PRICE_KEYS)],
