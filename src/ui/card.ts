@@ -92,9 +92,11 @@ export class ChartCard {
     if (this.showTable) this.renderTable();
   }
 
-  /** このカードだけに効く表示設定を、見出しの下に並べる */
-  addControls(...items: HTMLElement[]): void {
-    this.el.insertBefore(h('div', { class: 'card-controls' }, items), this.chartEl);
+  /** このカードだけに効く表示設定を、見出しの下に 1 行ずつ並べる（その行の要素を返す） */
+  addControls(...items: HTMLElement[]): HTMLElement {
+    const row = h('div', { class: 'card-controls' }, items);
+    this.el.insertBefore(row, this.chartEl);
+    return row;
   }
 
   setTitle(text: string): void {

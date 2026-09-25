@@ -4,6 +4,7 @@
  * 売り入札は青、買い入札は橙（入札・約定量のタブと同じ色）。同じ側の線を何本も重ねるときは、その色相の濃淡で順序を表す。
  */
 import { GRANULARITY_LABEL } from '../lib/aggregate';
+import { aloneSlots, areaCurve, areaLabel, CURVE_TARGETS, type AreaCurve, type CurveTarget, type StepCurve } from '../lib/areaCurves';
 import {
   buyVolumeAt,
   buyVolumesAt,
@@ -15,18 +16,17 @@ import {
   SIMPLIFY_RATIO,
   stepPath,
   stepPrices,
-  SYSTEM_GROUP,
   SYSTEM_LABEL,
-  type CurveGroup,
+  type CurveDay,
   type CurveMetricKey,
 } from '../lib/bidCurves';
 import { COMPARE_DAYS, type CurveStore } from '../lib/curveStore';
 import { DOW_LABEL, dowOfDay, formatDay, isoFromDay, parseDateString, slotRangeLabel, slotStartLabel, ymdFromDay } from '../lib/dates';
 import { fmtNum, fmtPrice } from '../lib/format';
-import { SERIES_INDEX, SLOTS, type SeriesKey } from '../lib/series';
+import { SERIES_INDEX, SLOTS, type AreaKey, type SeriesKey } from '../lib/series';
 import { reselect, type Selection } from '../lib/select';
 import { niceStep } from '../lib/stats';
-import type { CurveCompare, CurveRange, CurveSide } from '../state';
+import { MAX_CURVE_PICKS, normalizePicks, type CurveCompare, type CurvePick, type CurveRange, type CurveSide } from '../state';
 import type { ChartCard, TableData } from '../ui/card';
 import { segmented, selectField, toolbar, type Segmented, type SelectField } from '../ui/controls';
 import { h, uniqueId } from '../ui/dom';
@@ -80,9 +80,14 @@ type AxisParam = { axisValue?: unknown; seriesIndex: number; value: unknown };
 
 interface CompareItem {
   name: string;
-  group: CurveGroup;
+  curve: AreaCurve;
   color: string;
 }
+
+const targetLabel = (t: CurveTarget): string => (t === 'system' ? SYSTEM_LABEL : areaLabel(t));
+/** 推定したカーブ（単エリア）。線を破線にする */
+const isEstimate = (c: AreaCurve): boolean => c.kind === 'single' || c.kind === 'combined';
+const pickName = (p: CurvePick): string => `${shortDay(p.day)} ${slotStartLabel(p.slot)}`;
 
 export class CurvesView extends View {
   private message!: HTMLElement;
@@ -90,15 +95,24 @@ export class CurvesView extends View {
   private demoNote!: HTMLElement;
   private shapesNote!: HTMLElement;
   private periodNote!: HTMLElement;
+  private methodNote!: HTMLElement;
+  private aloneRow!: HTMLElement;
   private dateInput!: HTMLInputElement;
   private prevBtn!: HTMLButtonElement;
   private nextBtn!: HTMLButtonElement;
   private latestBtn!: HTMLButtonElement;
   private slot!: SelectField<string>;
-  private group!: SelectField<string>;
+  private target!: SelectField<CurveTarget>;
   private range!: Segmented<CurveRange>;
   private compare!: Segmented<CurveCompare>;
   private side!: Segmented<CurveSide>;
+  private picksRow!: HTMLElement;
+  private pickDate!: HTMLInputElement;
+  private pickSlot!: HTMLSelectElement;
+  private pickAdd!: HTMLButtonElement;
+  private pickList!: HTMLElement;
+  /** 追加する日・時間帯の入力を、今の日・時間帯で初期化したか */
+  private pickerReady = false;
   private depthSide!: Segmented<CurveSide>;
   private metric!: SelectField<CurveMetricKey>;
   private curve!: ChartCard;
@@ -132,8 +146,11 @@ export class CurvesView extends View {
       String(s.curveSlot),
       (v) => this.set({ curveSlot: Number(v) }),
     );
-    this.group = selectField('対象', [{ value: String(SYSTEM_GROUP), label: SYSTEM_LABEL }], String(SYSTEM_GROUP), (v) =>
-      this.set({ curveGroup: Number(v) }),
+    this.target = selectField(
+      '対象',
+      CURVE_TARGETS.map((t) => ({ value: t, label: targetLabel(t) })),
+      s.curveArea,
+      (v) => this.set({ curveArea: v }),
     );
     this.range = segmented(
       '価格の範囲',
@@ -152,9 +169,10 @@ export class CurvesView extends View {
       [
         { value: 'days', label: `直近 ${COMPARE_DAYS} 日` },
         { value: 'slots', label: '6 時間おき' },
+        { value: 'picks', label: '自由に選ぶ' },
       ],
       s.curveCompare,
-      (v) => this.set({ curveCompare: v }),
+      (v) => this.onCompare(v),
     );
     const sides = [
       { value: 'sell' as const, label: '売り入札' },
@@ -168,6 +186,15 @@ export class CurvesView extends View {
       s.curveMetric,
       (v) => this.set({ curveMetric: v }),
     );
+    const pickId = uniqueId('cp');
+    this.pickDate = h('input', { id: pickId, type: 'date' });
+    this.pickSlot = h(
+      'select',
+      { 'aria-label': '追加する時間帯' },
+      Array.from({ length: SLOTS }, (_, i) => h('option', { value: String(i) }, slotRangeLabel(i))),
+    );
+    this.pickAdd = h('button', { type: 'button', class: 'btn', onclick: () => this.addPick() }, '追加');
+    this.pickList = h('div', { class: 'picks', role: 'group', 'aria-label': '比べる日・時間帯（押すと外す）' });
 
     this.shapesNote = h('p', { class: 'view-note', hidden: true });
     this.demoNote = h(
@@ -177,11 +204,13 @@ export class CurvesView extends View {
     );
     this.content.append(
       h('h2', { class: 'view-section-title' }, '1 コマの入札カーブ'),
-      toolbar(dateField, this.slot.el, this.range.el),
+      toolbar(dateField, this.slot.el, this.target.el, this.range.el),
       h(
         'p',
         { class: 'view-note' },
-        '売り入札は価格の安い順、買い入札は価格の高い順に入札量を積み上げたカーブです。2 本の交点が約定価格と約定量になります。',
+        '売り入札は価格の安い順、買い入札は価格の高い順に入札量を積み上げたカーブです。2 本の交点が約定価格と約定量になります。' +
+          '対象でエリアを選ぶと、日付や時間帯を変えても、そのエリアの価格を決めたカーブ（市場分断していれば分断エリアのカーブ）を表示します。' +
+          '1 エリアだけで分断した単エリアは JEPX がカーブを出していないため、推定して破線で表示します。',
       ),
       this.shapesNote,
       this.demoNote,
@@ -189,8 +218,11 @@ export class CurvesView extends View {
     const g1 = h('div', { class: 'card-grid' });
     this.content.append(g1);
     this.curve = this.card(g1, { title: '入札カーブ', height: 420 });
-    this.curve.addControls(this.group.el);
+    this.methodNote = h('p', { class: 'card-note', hidden: true });
+    this.aloneRow = h('div', { class: 'card-note alone', hidden: true });
     this.curve.footer.append(
+      this.methodNote,
+      this.aloneRow,
       h(
         'p',
         { class: 'card-note' },
@@ -199,6 +231,10 @@ export class CurvesView extends View {
     );
     this.comparison = this.card(g1, { title: '入札カーブの比較', height: 420 });
     this.comparison.addControls(this.compare.el, this.side.el);
+    this.picksRow = this.comparison.addControls(
+      h('div', { class: 'field' }, h('label', { for: pickId }, '比べる日・時間帯を追加'), h('div', { class: 'date-nav' }, this.pickDate, this.pickSlot, this.pickAdd)),
+      this.pickList,
+    );
 
     this.periodNote = h('p', { class: 'view-note' });
     this.content.append(h('h2', { class: 'view-section-title' }, '期間で見る'), this.periodNote);
@@ -241,21 +277,14 @@ export class CurvesView extends View {
     this.nextBtn.disabled = cs.step(date, 1) === null;
     this.latestBtn.disabled = date === cs.last;
     this.slot.set(String(state.curveSlot));
+    this.target.set(state.curveArea);
     this.range.set(state.curveRange);
     this.compare.set(state.curveCompare);
     this.side.set(state.curveSide);
     this.depthSide.set(state.curveDepth);
     this.metric.set(state.curveMetric);
 
-    // 対象の選択肢は、その日・時間帯に市場分断で分かれたエリアのグループ
-    const groups = cs.getDay(date)?.slots[state.curveSlot] ?? null;
-    const options = (groups ?? []).map((g) => ({ value: String(g.id), label: g.id === SYSTEM_GROUP ? SYSTEM_LABEL : g.label }));
-    if (options.length === 0) options.push({ value: String(SYSTEM_GROUP), label: SYSTEM_LABEL });
-    const current = options.find((o) => o.value === String(state.curveGroup)) ?? options[0];
-    this.group.setOptions(options, current.value);
-    this.group.setDisabled(options.length <= 1);
-
-    this.renderCurve(cs, date, groups, Number(current.value));
+    this.renderCurve(cs, date);
     this.renderComparison(cs, date);
     this.renderPeriod(cs);
   }
@@ -273,38 +302,82 @@ export class CurvesView extends View {
     if (day !== null) this.set({ curveDate: day });
   }
 
+  /** 「自由に選ぶ」に切り替えたとき、まだ何も選んでいなければ今の日・時間帯から始める */
+  private onCompare(v: CurveCompare): void {
+    const { state, curves: cs } = this.ctx;
+    if (v === 'picks' && state.curvePicks.length === 0 && cs) {
+      this.set({ curveCompare: v, curvePicks: [{ day: cs.resolve(state.curveDate), slot: state.curveSlot }] });
+    } else {
+      this.set({ curveCompare: v });
+    }
+  }
+
+  private addPick(): void {
+    const cs = this.ctx.curves;
+    const day = parseDateString(this.pickDate.value);
+    if (!cs || day === null) return;
+    this.set({ curvePicks: normalizePicks([...this.ctx.state.curvePicks, { day: cs.resolve(day), slot: Number(this.pickSlot.value) }]) });
+  }
+
+  private removePick(p: CurvePick): void {
+    this.set({ curvePicks: this.ctx.state.curvePicks.filter((q) => q.day !== p.day || q.slot !== p.slot) });
+  }
+
+  /** 受渡日・コマの約定価格（システムプライス・エリアプライス。無ければ NaN） */
+  private price(day: number, slot: number, key: SeriesKey): number {
+    const { ds } = this.ctx;
+    const i = day - ds.start;
+    return i < 0 || i >= ds.n ? Number.NaN : ds.values[SERIES_INDEX[key]][i * SLOTS + slot];
+  }
+
+  /** その日・時間帯に、対象の価格を決めたカーブ（カーブが無ければ null） */
+  private resolveCurve(cs: CurveStore, day: number, slot: number): AreaCurve | null {
+    const groups = cs.getDay(day)?.slots[slot];
+    return groups ? areaCurve(groups, this.ctx.state.curveArea, (a) => this.price(day, slot, a)) : null;
+  }
+
   // ---- 1 コマの入札カーブ ----
 
-  private renderCurve(cs: CurveStore, date: number, groups: CurveGroup[] | null, groupId: number): void {
+  private renderCurve(cs: CurveStore, date: number): void {
     const { state, theme } = this.ctx;
     const slot = state.curveSlot;
+    const target = state.curveArea;
     const when = `${formatDay(date, true)} ${slotRangeLabel(slot)}`;
-    if (!cs.getDay(date)) {
+    this.methodNote.hidden = true;
+    this.aloneRow.hidden = true;
+    const day = cs.getDay(date);
+    if (!day) {
       this.curve.setEmpty(`${formatDay(date, true)} の入札カーブを読み込めませんでした。`);
       return;
     }
-    const g = groups?.find((x) => x.id === groupId);
-    if (!g) {
+    const ac = this.resolveCurve(cs, date, slot);
+    if (!ac) {
       this.curve.setEmpty(`${when} の入札カーブがありません。`);
       return;
     }
     const sellColor = seriesColor('sellBid', theme);
     const buyColor = seriesColor('buyBid', theme);
-    const rows = rowsFromSteps(g.sell, g.buy);
-    const cross = crossing(rows);
-    const ymax = priceMax(state.curveRange, [g], cross ? [cross.price] : []);
-    const xmax = volumeMax([g], ymax, ['sell', 'buy']);
+    const estimate = isEstimate(ac);
+    const rows = rowsFromSteps(ac.sell, ac.buy);
+    // 単エリアが複数のときは交点に意味が無いので、代わりに各エリアの約定価格の線を引く
+    const lines = ac.kind === 'combined' ? priceLines(ac.areas, (a) => this.price(date, slot, a)) : [];
+    const cross =
+      ac.kind === 'combined' ? null : ac.correction ? { price: ac.correction.price, volume: sellVolumeAt(ac.sell, ac.correction.price) } : crossing(rows);
+    const ymax = priceMax(state.curveRange, [ac], cross ? [cross.price] : lines.map((l) => l.price));
+    const xmax = volumeMax([ac], ymax, ['sell', 'buy']);
     const plotWidth = this.curve.chart.getWidth() - 100;
 
-    const published = this.publishedPrice(date, slot, g);
-    this.curve.setSubtitle(
-      `${when}・${g.id === SYSTEM_GROUP ? SYSTEM_LABEL : `${g.label}（分断エリア）`}` +
-        (Number.isFinite(published) ? `・約定価格 ${fmtPrice(published)} ${PRICE_UNIT}` : ''),
-    );
+    const published = this.price(date, slot, target);
+    this.curve.setSubtitle(`${when}・${targetText(target, ac)}` + (Number.isFinite(published) ? `・約定価格 ${fmtPrice(published)} ${PRICE_UNIT}` : ''));
+    this.renderMethod(ac, day, slot);
 
     const series: Record<string, unknown>[] = [
-      styledLine(SIDE_LABEL.sell, sellColor, theme, toGw(g.sell), false, { symbol: 'none', z: 3 }),
-      styledLine(SIDE_LABEL.buy, buyColor, theme, toGw(g.buy), false, { symbol: 'none', z: 3 }),
+      styledLine(SIDE_LABEL.sell, sellColor, theme, toGw(ac.sell), estimate, {
+        symbol: 'none',
+        z: 3,
+        ...(lines.length > 0 ? { markLine: priceMarkLine(lines, theme) } : {}),
+      }),
+      styledLine(SIDE_LABEL.buy, buyColor, theme, toGw(ac.buy), estimate, { symbol: 'none', z: 3 }),
       priceProbe(ymax),
     ];
     if (cross) series.push(crossingSeries(cross, theme, ((cross.volume / 1000) / xmax) * plotWidth, plotWidth));
@@ -314,8 +387,8 @@ export class CurvesView extends View {
     series.push(
       lineLabels(
         [
-          { name: SIDE_LABEL.sell, x: sellVolumeAt(g.sell, low) / 1000, y: low, position: 'left', others: [buyVolumeAt(g.buy, low) / 1000] },
-          { name: SIDE_LABEL.buy, x: buyVolumeAt(g.buy, high) / 1000, y: high, position: 'left', others: [sellVolumeAt(g.sell, high) / 1000] },
+          { name: SIDE_LABEL.sell, x: sellVolumeAt(ac.sell, low) / 1000, y: low, position: 'left', others: [buyVolumeAt(ac.buy, low) / 1000] },
+          { name: SIDE_LABEL.buy, x: buyVolumeAt(ac.buy, high) / 1000, y: high, position: 'left', others: [sellVolumeAt(ac.sell, high) / 1000] },
         ],
         xmax,
         plotWidth,
@@ -327,20 +400,24 @@ export class CurvesView extends View {
     this.curve.setOption(
       {
         grid: grid({ top: PLOT_TOP, bottom: 28, right: 24 }),
-        legend: lineLegend([{ name: SIDE_LABEL.sell }, { name: SIDE_LABEL.buy }]),
+        legend: lineLegend([
+          { name: SIDE_LABEL.sell, dashed: estimate },
+          { name: SIDE_LABEL.buy, dashed: estimate },
+        ]),
         tooltip: {
           trigger: 'axis',
           axisPointer: { type: 'line', axis: 'y', snap: false },
           formatter: (params: AxisParam | AxisParam[]) => {
             const p = pointerPrice(params);
             if (p === null) return '';
-            const sv = sellVolumeAt(g.sell, p) / 1000;
-            const bv = buyVolumeAt(g.buy, p) / 1000;
+            const sv = sellVolumeAt(ac.sell, p) / 1000;
+            const bv = buyVolumeAt(ac.buy, p) / 1000;
             const showSell = this.isShown(this.curve, SIDE_LABEL.sell);
             const showBuy = this.isShown(this.curve, SIDE_LABEL.buy);
             let html = ttHeader(`${fmtPrice(p)} ${PRICE_UNIT}`);
-            if (showSell) html += ttRow(sellColor, `${fmtNum(sv, 2)} GW`, `${SIDE_LABEL.sell}（この価格以下）`);
-            if (showBuy) html += ttRow(buyColor, `${fmtNum(bv, 2)} GW`, `${SIDE_LABEL.buy}（この価格以上）`);
+            if (showSell) html += ttRow(sellColor, `${fmtNum(sv, 2)} GW`, `${SIDE_LABEL.sell}（この価格以下）`, estimate ? 'dash' : 'line');
+            if (showBuy) html += ttRow(buyColor, `${fmtNum(bv, 2)} GW`, `${SIDE_LABEL.buy}（この価格以上）`, estimate ? 'dash' : 'line');
+            if (estimate) html += ttNote('推定のカーブ');
             if (!showSell || !showBuy) return html;
             const diff = sv - bv;
             return html + ttNote(Math.abs(diff) < 0.005 ? '売りと買いがほぼ同じ量' : diff > 0 ? `売りが ${fmtNum(diff, 2)} GW 多い` : `買いが ${fmtNum(-diff, 2)} GW 多い`);
@@ -354,18 +431,60 @@ export class CurvesView extends View {
         columns: ['価格（円/kWh）', `${SIDE_LABEL.sell}の累積（MW、この価格以下）`, `${SIDE_LABEL.buy}の累積（MW、この価格以上）`],
         rows: rows.map((r) => [r.price, r.sell, r.buy]),
         digits: [2, 0, 0],
-        filename: `jepx_bidcurve_${fileDate(date)}_${slotStartLabel(slot).replace(':', '')}${g.id === SYSTEM_GROUP ? '' : `_group${g.id}`}.csv`,
+        filename: `jepx_bidcurve_${fileDate(date)}_${slotStartLabel(slot).replace(':', '')}${target === 'system' ? '' : `_${target}`}${estimate ? '_estimated' : ''}.csv`,
       },
     );
   }
 
-  /** 公表されている約定価格（システムプライス、分断エリアはそのグループのエリアプライス） */
-  private publishedPrice(date: number, slot: number, g: CurveGroup): number {
-    const { ds } = this.ctx;
-    const key: SeriesKey | undefined = g.id === SYSTEM_GROUP ? 'system' : g.areas[0];
-    const i = date - ds.start;
-    if (!key || i < 0 || i >= ds.n) return Number.NaN;
-    return ds.values[SERIES_INDEX[key]][i * SLOTS + slot];
+  /** 推定したカーブの作り方と、単エリアが複数のときに補正できる時間帯 */
+  private renderMethod(ac: AreaCurve, day: CurveDay, slot: number): void {
+    const target = this.ctx.state.curveArea;
+    if (!isEstimate(ac) || target === 'system') return;
+    let text = `推定: システムプライスのカーブから、公表されている分断エリア（${(ac.subtracted ?? []).join('、')}）のカーブを引いたものです。`;
+    if (ac.kind === 'single') {
+      text += ac.correction
+        ? `約定価格 ${fmtPrice(ac.correction.price)} ${PRICE_UNIT} で交わるように、${SIDE_LABEL[ac.correction.side]}に ${fmtNum(ac.correction.mw / 1000, 2)} GW を足して補正しています。`
+        : '約定価格が分からないため、補正していません。';
+    } else {
+      text += `単エリアが ${ac.areas.length} つ（${ac.label}）あり、エリアごとには分けられないため、${ac.areas.length} エリアを合わせたカーブです（補正なし）。破線の横線は各エリアの約定価格です。`;
+    }
+    this.methodNote.textContent = text;
+    this.methodNote.hidden = false;
+    if (ac.kind !== 'combined') return;
+    const name = areaLabel(target);
+    const near = aloneSlots(day, target)
+      .sort((a, b) => Math.abs(a - slot) - Math.abs(b - slot))
+      .slice(0, 12)
+      .sort((a, b) => a - b);
+    this.aloneRow.replaceChildren(
+      near.length > 0 ? `この日、${name}だけが単エリアになった時間帯（補正した推定を見られます）:` : `この日は、${name}だけが単エリアになった時間帯はありません。`,
+      ...near.map((s) => h('button', { type: 'button', class: 'btn btn-sm', onclick: () => this.set({ curveSlot: s }) }, slotStartLabel(s))),
+    );
+    this.aloneRow.hidden = false;
+  }
+
+  private syncPicks(cs: CurveStore, date: number): void {
+    const { state } = this.ctx;
+    this.pickDate.min = isoFromDay(cs.first);
+    this.pickDate.max = isoFromDay(cs.last);
+    if (!this.pickerReady) {
+      this.pickDate.value = isoFromDay(date);
+      this.pickSlot.value = String(state.curveSlot);
+      this.pickerReady = true;
+    }
+    const full = state.curvePicks.length >= MAX_CURVE_PICKS;
+    this.pickAdd.disabled = full;
+    this.pickAdd.title = full ? `${MAX_CURVE_PICKS} 件まで選べます（外すには、下の日・時間帯を押します）` : '';
+    this.pickList.replaceChildren(
+      ...state.curvePicks.map((p) =>
+        h(
+          'button',
+          { type: 'button', class: 'pick', title: `${pickName(p)} を外す`, 'aria-label': `${pickName(p)} を外す`, onclick: () => this.removePick(p) },
+          pickName(p),
+          h('span', { class: 'pick-x', 'aria-hidden': 'true' }, '×'),
+        ),
+      ),
+    );
   }
 
   private renderComparison(cs: CurveStore, date: number): void {
@@ -373,40 +492,51 @@ export class CurvesView extends View {
     const t = TOKENS[theme];
     const side = state.curveSide;
     const slot = state.curveSlot;
-    const system = (day: number, s: number) => cs.getDay(day)?.slots[s]?.find((g) => g.id === SYSTEM_GROUP);
+    const target = state.curveArea;
+    const mode = state.curveCompare;
+    this.picksRow.hidden = mode !== 'picks';
+    if (mode === 'picks') this.syncPicks(cs, date);
 
-    let raw: { name: string; group: CurveGroup | undefined }[];
+    let raw: { name: string; curve: AreaCurve | null }[];
     let subtitle: string;
-    if (state.curveCompare === 'days') {
+    if (mode === 'days') {
       const days = cs.recent(date, COMPARE_DAYS);
-      raw = days.map((d) => ({ name: shortDay(d), group: system(d, slot) }));
+      raw = days.map((d) => ({ name: shortDay(d), curve: this.resolveCurve(cs, d, slot) }));
       subtitle = `${slotRangeLabel(slot)}・${formatDay(days[0])}〜${formatDay(date)}`;
-    } else {
+    } else if (mode === 'slots') {
       const slots = Array.from({ length: SLOTS / SLOT_STEP }, (_, k) => (slot % SLOT_STEP) + k * SLOT_STEP);
-      raw = slots.map((s) => ({ name: slotStartLabel(s), group: system(date, s) }));
+      raw = slots.map((s) => ({ name: slotStartLabel(s), curve: this.resolveCurve(cs, date, s) }));
       subtitle = `${formatDay(date, true)}・6 時間おきの時間帯`;
+    } else {
+      raw = state.curvePicks.map((p) => ({ name: pickName(p), curve: this.resolveCurve(cs, p.day, p.slot) }));
+      subtitle = '選んだ日・時間帯';
     }
-    const present = raw.filter((r): r is { name: string; group: CurveGroup } => r.group !== undefined);
+    const present = raw.filter((r): r is { name: string; curve: AreaCurve } => r.curve !== null);
+    const missing = raw.length - present.length;
     if (present.length === 0) {
-      this.comparison.setEmpty('比べる入札カーブがありません。');
+      this.comparison.setEmpty(mode === 'picks' && raw.length === 0 ? '比べる日・時間帯を選んで「追加」を押してください。' : '比べる入札カーブがありません。');
       return;
     }
     const colored = Math.min(present.length, MAX_COLORED);
     const ramp = ordinalColors(colored, theme, side === 'buy');
     const grayed = present.length - colored;
     const items: CompareItem[] = present.map((r, k) => ({ ...r, color: k < grayed ? t.deemph : ramp[k - grayed] }));
-    const newestFirst = state.curveCompare === 'days';
+    const later = mode === 'days' ? '新しい日' : mode === 'slots' ? '遅い時刻' : '新しい日・時刻';
     this.comparison.setSubtitle(
-      `${SYSTEM_LABEL}の${SIDE_LABEL[side]}・${subtitle}・${theme === 'light' ? '色が濃い' : '色が明るい'}ほど${newestFirst ? '新しい日' : '遅い時刻'}` +
-        (grayed > 0 ? `（灰色は古い ${grayed} 日）` : ''),
+      `${targetLabel(target)}・${SIDE_LABEL[side]}・${subtitle}・${theme === 'light' ? '色が濃い' : '色が明るい'}ほど${later}` +
+        (grayed > 0 ? `（灰色は古い ${grayed} 日）` : '') +
+        (items.some((it) => isEstimate(it.curve)) ? '・破線は推定' : '') +
+        (missing > 0 ? `・カーブの無い ${missing} 件を除く` : ''),
     );
 
-    const crosses = items.map((it) => crossing(rowsFromSteps(it.group.sell, it.group.buy))?.price ?? Number.NaN);
-    const ymax = priceMax(state.curveRange, items.map((it) => it.group), crosses);
-    const xmax = volumeMax(items.map((it) => it.group), ymax, [side]);
-    const steps = (it: CompareItem) => (side === 'sell' ? it.group.sell : it.group.buy);
+    const crosses = items.map((it) => referencePrice(it.curve));
+    const ymax = priceMax(state.curveRange, items.map((it) => it.curve), crosses);
+    const xmax = volumeMax(items.map((it) => it.curve), ymax, [side]);
+    const steps = (it: CompareItem) => (side === 'sell' ? it.curve.sell : it.curve.buy);
     const volumeAt = side === 'sell' ? sellVolumeAt : buyVolumeAt;
-    const series: Record<string, unknown>[] = items.map((it, k) => styledLine(it.name, it.color, theme, toGw(steps(it)), false, { symbol: 'none', z: 2 + k }));
+    const series: Record<string, unknown>[] = items.map((it, k) =>
+      styledLine(it.name, it.color, theme, toGw(steps(it)), isEstimate(it.curve), { symbol: 'none', z: 2 + k }),
+    );
     series.push(priceProbe(ymax));
     if (items.length <= 4) {
       // 売りは価格の高いところ、買いは安いところで、ほかの線と重ならない側に名前を置く
@@ -421,19 +551,22 @@ export class CurvesView extends View {
         ),
       );
     }
+    // エリアを選んでいるときは、それぞれのカーブがどの分断エリアのものかをツールチップ・表に出す
+    const detail = (it: CompareItem) => (target === 'system' ? it.name : `${it.name}（${curveNote(it.curve)}）`);
 
     const prices = stepPrices(...items.map(steps));
-    const columns = items.map((it) => (side === 'sell' ? sellVolumesAt(it.group.sell, prices) : buyVolumesAt(it.group.buy, prices)));
+    const columns = items.map((it) => (side === 'sell' ? sellVolumesAt(it.curve.sell, prices) : buyVolumesAt(it.curve.buy, prices)));
     const table: TableData = {
-      columns: [`価格（円/kWh）`, ...items.map((it) => `${it.name}（MW、この価格${side === 'sell' ? '以下' : '以上'}）`)],
+      columns: [`価格（円/kWh）`, ...items.map((it) => `${detail(it)}（MW、この価格${side === 'sell' ? '以下' : '以上'}）`)],
       rows: prices.map((p, r) => [p, ...columns.map((c) => c[r])]),
       digits: [2, ...items.map(() => 0)],
-      filename: `jepx_bidcurve_compare_${state.curveCompare}_${side}_${fileDate(date)}_${slotStartLabel(slot).replace(':', '')}.csv`,
+      filename: `jepx_bidcurve_compare_${mode}_${side}${target === 'system' ? '' : `_${target}`}_${fileDate(date)}_${slotStartLabel(slot).replace(':', '')}.csv`,
     };
 
     const legend = wrappedLegend(
       items.map((it) => it.name),
       this.comparison.chart.getWidth(),
+      items.map((it) => isEstimate(it.curve)),
     );
     this.hidden.delete(this.comparison);
     this.comparison.setOption(
@@ -447,9 +580,10 @@ export class CurvesView extends View {
             const p = pointerPrice(params);
             if (p === null) return '';
             let html = ttHeader(`${fmtPrice(p)} ${PRICE_UNIT}${side === 'sell' ? '以下の売り入札' : '以上の買い入札'}`);
-            const order = newestFirst ? [...items].reverse() : items;
+            const order = mode === 'slots' ? items : [...items].reverse();
             for (const it of order) {
-              if (this.isShown(this.comparison, it.name)) html += ttRow(it.color, `${fmtNum(volumeAt(steps(it), p) / 1000, 2)} GW`, it.name);
+              if (!this.isShown(this.comparison, it.name)) continue;
+              html += ttRow(it.color, `${fmtNum(volumeAt(steps(it), p) / 1000, 2)} GW`, detail(it), isEstimate(it.curve) ? 'dash' : 'line');
             }
             return html;
           },
@@ -595,8 +729,70 @@ function toGw(steps: Float64Array): [number, number][] {
   return stepPath(steps).map(([v, p]) => [v / 1000, p]);
 }
 
+/** 副題に出す、対象と表示しているカーブの説明 */
+function targetText(target: CurveTarget, ac: AreaCurve): string {
+  if (target === 'system') return SYSTEM_LABEL;
+  const name = areaLabel(target);
+  switch (ac.kind) {
+    case 'system':
+      return ac.unnamed ? `${name}（分断エリアの名前が分からないため、システムプライスのカーブ）` : `${name}（市場分断なし: システムプライスのカーブ）`;
+    case 'group':
+      return `${name}（分断エリア: ${ac.label}）`;
+    case 'single':
+      return `${name}（単エリア・推定）`;
+    case 'combined':
+      return `${name}（単エリア ${ac.areas.length} つを合わせた推定: ${ac.label}）`;
+  }
+}
+
+/** 比較の図で、それぞれのカーブがどのカーブかの短い説明 */
+function curveNote(ac: AreaCurve): string {
+  switch (ac.kind) {
+    case 'system':
+      return ac.unnamed ? 'システムプライス' : '分断なし';
+    case 'group':
+      return ac.label;
+    case 'single':
+      return '単エリア・推定';
+    case 'combined':
+      return `${ac.label}の合算・推定`;
+  }
+}
+
+/** 縦軸の範囲を決めるのに使う価格（交点。補正した単エリアは約定価格、単エリアの合算は無し） */
+function referencePrice(ac: AreaCurve): number {
+  if (ac.kind === 'combined') return Number.NaN;
+  if (ac.correction) return ac.correction.price;
+  return crossing(rowsFromSteps(ac.sell, ac.buy))?.price ?? Number.NaN;
+}
+
+/** エリアの約定価格の横線（同じ価格のエリアは 1 本にまとめる） */
+function priceLines(areas: readonly AreaKey[], priceOf: (a: AreaKey) => number): { price: number; label: string }[] {
+  const out: { price: number; names: string[] }[] = [];
+  for (const a of areas) {
+    const p = priceOf(a);
+    if (!Number.isFinite(p)) continue;
+    const same = out.find((x) => Math.abs(x.price - p) < 0.005);
+    if (same) same.names.push(areaLabel(a));
+    else out.push({ price: p, names: [areaLabel(a)] });
+  }
+  return out.map((x) => ({ price: x.price, label: x.names.join('・') }));
+}
+
+function priceMarkLine(lines: { price: number; label: string }[], theme: ThemeName): Record<string, unknown> {
+  const t = TOKENS[theme];
+  return {
+    symbol: 'none',
+    silent: true,
+    animation: false,
+    lineStyle: { color: t.ink2, width: 1, type: [4, 4] },
+    label: { position: 'insideEndTop', color: t.ink2, fontSize: 11, backgroundColor: t.surface, padding: [1, 3], borderRadius: 3 },
+    data: lines.map((l) => ({ yAxis: l.price, label: { formatter: `${l.label} ${fmtPrice(l.price)}円` } })),
+  };
+}
+
 /** 縦軸（価格）の上限。「自動」は交点の価格の 1.5 倍が入る段（30 円以上） */
-function priceMax(range: CurveRange, groups: CurveGroup[], crossPrices: number[]): number {
+function priceMax(range: CurveRange, groups: StepCurve[], crossPrices: number[]): number {
   if (range === 'all') {
     let top = 0;
     for (const g of groups) {
@@ -611,7 +807,7 @@ function priceMax(range: CurveRange, groups: CurveGroup[], crossPrices: number[]
 }
 
 /** 横軸（GW）の上限: 表示する価格の範囲の中のカーブが収まる量 */
-function volumeMax(groups: CurveGroup[], priceTop: number, sides: CurveSide[]): number {
+function volumeMax(groups: StepCurve[], priceTop: number, sides: CurveSide[]): number {
   let mw = 0;
   for (const g of groups) {
     if (sides.includes('sell')) mw = Math.max(mw, sellVolumeAt(g.sell, priceTop));
@@ -798,7 +994,7 @@ function legendTextWidth(text: string): number {
  * 項目が多いときは折り返す凡例（スクロールで隠れる項目を作らない）と、その行数に合わせたグラフ領域の上端。
  * @param width グラフの幅（px）
  */
-function wrappedLegend(names: string[], width: number): { legend: Record<string, unknown>; top: number } {
+function wrappedLegend(names: string[], width: number, dashed: boolean[] = []): { legend: Record<string, unknown>; top: number } {
   // 凡例の内側の余白（左右 5px）を除いた幅に並べる
   const room = width - 10;
   let rows = 1;
@@ -812,7 +1008,7 @@ function wrappedLegend(names: string[], width: number): { legend: Record<string,
     }
     x += w + 16;
   }
-  return { legend: lineLegend(names.map((name) => ({ name })), { type: 'plain' }), top: PLOT_TOP + (rows - 1) * LEGEND_ROW };
+  return { legend: lineLegend(names.map((name, i) => ({ name, dashed: dashed[i] })), { type: 'plain' }), top: PLOT_TOP + (rows - 1) * LEGEND_ROW };
 }
 
 function granText(gran: ReturnType<typeof autoGranularity>): string {

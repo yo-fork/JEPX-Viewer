@@ -287,7 +287,7 @@ describe('ファイル形式', () => {
 });
 
 describe('合成の入札カーブ（デモ用）', () => {
-  it('与えた価格の近くで交わり、売りは増え、買いは減っていく', () => {
+  it('与えた価格の近くで交わり、売りは増え、買いは減っていく（分断したコマは分断エリアのカーブを足したもの）', () => {
     const day = dayFromYmd(2025, 5, 3);
     const targets = Array.from({ length: SLOTS }, (_, s) => ({ system: s === 24 ? 0.01 : 8 + (s % 10), volume: 30000, east: 12, west: s % 2 ? 9 : 12 }));
     const { raw, groups } = syntheticCurveDay(day, targets);
@@ -297,12 +297,37 @@ describe('合成の入札カーブ（デモ用）', () => {
         expect(rows[i].sell).toBeGreaterThanOrEqual(rows[i - 1].sell);
         expect(rows[i].buy).toBeLessThanOrEqual(rows[i - 1].buy);
       }
-      const c = crossing(rows)!;
-      expect(Math.abs(c.price - targets[s].system)).toBeLessThanOrEqual(0.5);
-      expect(groups[s].length).toBe(s % 2 ? 2 : 0);
+      if (s % 2 === 0) {
+        expect(groups[s]).toEqual([]);
+        expect(Math.abs(crossing(rows)!.price - targets[s].system)).toBeLessThanOrEqual(0.5);
+        continue;
+      }
+      // 東西に分断: 北海道・東北・東京（12 円）と、それ以外（9 円）
+      expect(groups[s].map((g) => [g.id, g.label])).toEqual([
+        [0, '北海道・東北・東京'],
+        [1, '中部・北陸・関西・中国・四国・九州'],
+      ]);
+      const [east, west] = [raw.slots[s].get(0)!, raw.slots[s].get(1)!];
+      expect(Math.abs(crossing(east)!.price - 12)).toBeLessThanOrEqual(0.5);
+      expect(Math.abs(crossing(west)!.price - 9)).toBeLessThanOrEqual(0.5);
+      // システムプライスのカーブは 2 つを足したもの（買いには、ずれの分として約定量の 1.5% を足してある）
+      rows.forEach((r, i) => {
+        expect(r.sell).toBeCloseTo(east[i].sell + west[i].sell, 0);
+        expect(r.buy).toBeCloseTo(east[i].buy + west[i].buy + 30000 * 0.015, 0);
+      });
     }
     expect(crossing(raw.slots[24].get(SYSTEM_GROUP)!)!.price).toBeLessThanOrEqual(0.01);
     // 同じ日なら同じカーブ
     expect(syntheticCurveDay(day, targets).raw.slots[3].get(SYSTEM_GROUP)).toEqual(raw.slots[3].get(SYSTEM_GROUP));
+  });
+
+  it('1 エリアだけで分断したエリア（単エリア）のカーブと名前は出さず、分断エリアの番号は飛ぶ', () => {
+    const areas = { hokkaido: 15, tohoku: 12, tokyo: 12, chubu: 9, hokuriku: 9, kansai: 9, chugoku: 9, shikoku: 9, kyushu: 5 };
+    const { raw, groups } = syntheticCurveDay(dayFromYmd(2025, 5, 3), [{ system: 10, volume: 30000, areas }]);
+    expect(groups[0].map((g) => [g.id, g.label, g.areas.length])).toEqual([
+      [1, '東北・東京', 2],
+      [2, '中部・北陸・関西・中国・四国', 5],
+    ]);
+    expect([...raw.slots[0].keys()].sort()).toEqual([SYSTEM_GROUP, 1, 2].sort());
   });
 });

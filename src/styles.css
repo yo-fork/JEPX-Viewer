@@ -579,6 +579,48 @@ input[type='number'] {
   font-size: 12px;
 }
 
+/* 入札カーブの比較で自由に選んだ日・時間帯（押すと外す） */
+.picks {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.pick {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 28px;
+  padding: 2px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--raised);
+  color: var(--ink);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.pick:hover {
+  background: var(--wash);
+}
+
+.pick-x {
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1;
+}
+
+/* 単エリアの推定を補正できる時間帯へのボタン */
+.card-note.alone {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+}
+
 .zoom-note {
   display: flex;
   flex-wrap: wrap;

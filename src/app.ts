@@ -384,7 +384,8 @@ export class App implements AppApi {
     const cs = this.curves;
     if (!cs) return null;
     const date = cs.resolve(this.state.curveDate);
-    const days = this.state.curveCompare === 'days' ? cs.recent(date, COMPARE_DAYS) : [date];
+    const { curveCompare: compare, curvePicks: picks } = this.state;
+    const days = compare === 'days' ? cs.recent(date, COMPARE_DAYS) : compare === 'picks' ? [date, ...picks.map((p) => p.day)] : [date];
     const from = Math.max(range.from, cs.metricsFirst);
     const to = Math.min(range.to, cs.metricsLast);
     const jobs = [cs.ensureDays(days), from <= to ? cs.ensureMetrics(from, to) : null].filter((p): p is Promise<void> => p !== null);

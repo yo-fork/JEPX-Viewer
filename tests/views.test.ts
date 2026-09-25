@@ -66,3 +66,22 @@ describe('新しい表示設定の URL', () => {
     expect(stateToHash(d)).toBe('#tab=trend');
   });
 });
+
+describe('入札カーブの URL', () => {
+  it('対象のエリアと、自由に選んだ日・時間帯を保存・復元できる（古い順・重複なし・5 件まで）', () => {
+    const s = stateFromHash('#tab=curves&ca=hokkaido&cc=picks&cp=20260922.36,20260920.24,20260922.36,bad,20260921.99');
+    expect(s.curveArea).toBe('hokkaido');
+    expect(s.curveCompare).toBe('picks');
+    expect(s.curvePicks).toEqual([
+      { day: dayFromYmd(2026, 9, 20), slot: 24 },
+      { day: dayFromYmd(2026, 9, 22), slot: 36 },
+    ]);
+    expect(stateToHash(s)).toContain('cp=20260920.24%2C20260922.36');
+    expect(stateFromHash(stateToHash(s))).toEqual(s);
+    const many = Array.from({ length: 8 }, (_, i) => `2026091${i}.10`).join(',');
+    expect(stateFromHash(`#cp=${many}`).curvePicks).toHaveLength(5);
+    expect(stateFromHash('#ca=nowhere').curveArea).toBe('system');
+    expect(stateToHash(stateFromHash('#tab=curves'))).toBe('#tab=curves');
+  });
+});
+

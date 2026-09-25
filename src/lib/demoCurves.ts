@@ -1,13 +1,15 @@
 /**
  * デモ・テスト用の合成の入札カーブ。
  *
- * 与えた価格（システムプライス・東西のエリアプライス）と約定量の近くで売りと買いが交わるよう、JEPX に似た形の
+ * 与えた価格（システムプライス・エリアプライス）と約定量の近くで売りと買いが交わるよう、JEPX に似た形の
  * カーブを擬似乱数で作る（昼は太陽光で 0.01 円以下の売りが増える、最も高い価格の買いが多い、など）。
+ * 市場分断したコマは、価格の同じエリアのまとまりごとにカーブを作り、それらを足したものをシステムプライスのカーブにする。
+ * JEPX と同じく、1 エリアだけのまとまり（単エリア）のカーブは出さない。
  * **実際の入札ではない**ため、画面上では常に「デモデータ」と明示する。
  */
 import { SYSTEM_GROUP, type AreaGroup, type CurveRow, type RawCurveDay } from './bidCurves';
 import { gaussian, mulberry32 } from './demo';
-import { SLOTS } from './series';
+import { AREA_KEYS, SERIES_LABEL, SLOTS, type AreaKey } from './series';
 
 /** 入札のある価格（円/kWh） */
 const LEVELS: number[] = (() => {
@@ -58,13 +60,70 @@ export interface SlotTarget {
   system: number;
   /** 約定量（MW） */
   volume: number;
-  /** 東西で分断したときの東・西の価格 */
+  /** エリアプライス。価格の同じエリアを 1 つの分断エリアにまとめる（無いエリアはシステムプライス） */
+  areas?: Partial<Record<AreaKey, number>>;
+  /** areas が無いとき: 東（北海道・東北・東京）・西（それ以外）の価格 */
   east?: number;
   west?: number;
 }
 
-const EAST: AreaGroup = { id: 0, label: '北海道・東北・東京', areas: ['hokkaido', 'tohoku', 'tokyo'] };
-const WEST: AreaGroup = { id: 1, label: '中部・北陸・関西・中国・四国・九州', areas: ['chubu', 'hokuriku', 'kansai', 'chugoku', 'shikoku', 'kyushu'] };
+/** エリアの需要の割合の目安（分断エリアのカーブの量を分けるのに使う。合計 1） */
+const AREA_SHARE: Record<AreaKey, number> = {
+  hokkaido: 0.04,
+  tohoku: 0.09,
+  tokyo: 0.31,
+  chubu: 0.14,
+  hokuriku: 0.03,
+  kansai: 0.16,
+  chugoku: 0.07,
+  shikoku: 0.04,
+  kyushu: 0.12,
+};
+/** エリアの太陽光の多さの目安（西ほど多い） */
+const AREA_SOLAR: Record<AreaKey, number> = {
+  hokkaido: 0.5,
+  tohoku: 0.7,
+  tokyo: 0.6,
+  chubu: 0.9,
+  hokuriku: 0.6,
+  kansai: 0.9,
+  chugoku: 1.2,
+  shikoku: 1.2,
+  kyushu: 1.5,
+};
+const EAST_AREAS: readonly AreaKey[] = ['hokkaido', 'tohoku', 'tokyo'];
+/**
+ * 実データでは、システムプライスのカーブから分断エリアのカーブを引いた量が、単エリアの約定価格とずれることがある。
+ * デモでも単エリアの補正を試せるよう、分断したコマのシステムプライスのカーブに、この割合の価格を問わない買いを足しておく
+ */
+const DEMO_MISMATCH = 0.015;
+
+function areaPrices(t: SlotTarget): Record<AreaKey, number> | null {
+  const ok = (v: number | undefined): v is number => v !== undefined && Number.isFinite(v);
+  if (t.areas) return Object.fromEntries(AREA_KEYS.map((a) => [a, ok(t.areas![a]) ? t.areas![a] : t.system])) as Record<AreaKey, number>;
+  if (ok(t.east) && ok(t.west)) return Object.fromEntries(AREA_KEYS.map((a) => [a, EAST_AREAS.includes(a) ? t.east : t.west])) as Record<AreaKey, number>;
+  return null;
+}
+
+/** 価格の同じエリアのまとまり（エリアの並び順） */
+function priceGroups(prices: Record<AreaKey, number>): { price: number; areas: AreaKey[] }[] {
+  const out: { price: number; areas: AreaKey[] }[] = [];
+  for (const a of AREA_KEYS) {
+    const g = out.find((x) => Math.abs(x.price - prices[a]) < 0.005);
+    if (g) g.areas.push(a);
+    else out.push({ price: prices[a], areas: [a] });
+  }
+  return out;
+}
+
+/** 同じ価格の点を持つカーブを足す（syntheticCurve のカーブはどれも同じ価格の並び） */
+function sumCurves(curves: CurveRow[][]): CurveRow[] {
+  return curves[0].map((r, i) => ({
+    price: r.price,
+    sell: round1(curves.reduce((v, c) => v + c[i].sell, 0)),
+    buy: round1(curves.reduce((v, c) => v + c[i].buy, 0)),
+  }));
+}
 
 /** 1 日分（同じ日なら毎回同じカーブになる） */
 export function syntheticCurveDay(day: number, targets: (SlotTarget | null)[]): { raw: RawCurveDay; groups: AreaGroup[][] } {
@@ -74,12 +133,28 @@ export function syntheticCurveDay(day: number, targets: (SlotTarget | null)[]): 
   targets.forEach((t, s) => {
     if (!t || !Number.isFinite(t.system) || !Number.isFinite(t.volume) || t.volume <= 0) return;
     const solar = Math.exp(-((s / 2 + 0.25 - 12.3) ** 2) / (2 * 2.2 ** 2));
-    raw.slots[s].set(SYSTEM_GROUP, syntheticCurve(t.system, t.volume, solar, rand));
-    if (t.east !== undefined && t.west !== undefined && Number.isFinite(t.east) && Number.isFinite(t.west) && Math.abs(t.east - t.west) > 0.005) {
-      raw.slots[s].set(EAST.id, syntheticCurve(t.east, t.volume * 0.42, solar * 0.6, rand));
-      raw.slots[s].set(WEST.id, syntheticCurve(t.west, t.volume * 0.58, Math.min(1, solar * 1.3), rand));
-      groups[s] = [EAST, WEST];
+    const prices = areaPrices(t);
+    const parts = prices ? priceGroups(prices) : [];
+    if (parts.length <= 1) {
+      raw.slots[s].set(SYSTEM_GROUP, syntheticCurve(t.system, t.volume, solar, rand));
+      return;
     }
+    const curves = parts.map((g) => {
+      const share = g.areas.reduce((v, a) => v + AREA_SHARE[a], 0);
+      const sun = g.areas.reduce((v, a) => v + AREA_SOLAR[a] * AREA_SHARE[a], 0) / share;
+      return syntheticCurve(g.price, t.volume * share, Math.min(1, solar * sun), rand);
+    });
+    const extra = t.volume * DEMO_MISMATCH;
+    raw.slots[s].set(
+      SYSTEM_GROUP,
+      sumCurves(curves).map((r) => ({ ...r, buy: round1(r.buy + extra) })),
+    );
+    // 分断エリアの番号は単エリアにも振り、カーブと名前は 2 エリア以上のまとまりだけ出す（JEPX と同じく番号が飛ぶ）
+    parts.forEach((g, id) => {
+      if (g.areas.length < 2) return;
+      raw.slots[s].set(id, curves[id]);
+      groups[s].push({ id, label: g.areas.map((a) => SERIES_LABEL[a]).join('・'), areas: g.areas });
+    });
   });
   return { raw, groups };
 }

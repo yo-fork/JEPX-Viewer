@@ -5,7 +5,8 @@
 import { fiscalYearEnd, fiscalYearOfDay, fiscalYearStart, isoFromDay, parseDateString } from './lib/dates';
 import type { Granularity } from './lib/aggregate';
 import type { DayType } from './lib/select';
-import { CURVE_METRIC_KEYS, SYSTEM_GROUP, type CurveMetricKey } from './lib/bidCurves';
+import { CURVE_TARGETS, type CurveTarget } from './lib/areaCurves';
+import { CURVE_METRIC_KEYS, type CurveMetricKey } from './lib/bidCurves';
 import { AREA_KEYS, PRICE_KEYS, type AreaKey, type PriceKey } from './lib/series';
 
 export const TABS = [
@@ -46,8 +47,25 @@ export type TableUnit = 'day' | 'week' | 'month' | 'fy' | 'year' | 'dow' | 'slot
 export type TableKind = 'areas' | 'stats';
 /** 入札カーブの縦軸（価格）の上限 */
 export type CurveRange = 'auto' | '30' | '50' | '100' | 'all';
-export type CurveCompare = 'days' | 'slots';
+/** 入札カーブの比較: 直近の日・6 時間おき・自由に選んだ日と時間帯 */
+export type CurveCompare = 'days' | 'slots' | 'picks';
 export type CurveSide = 'sell' | 'buy';
+/** 比較の図で自由に選んだ受渡日・時間帯（コマ 0〜47） */
+export interface CurvePick {
+  day: number;
+  slot: number;
+}
+/** 自由に選べる数（重ねた線を濃淡で見分けられる本数） */
+export const MAX_CURVE_PICKS = 5;
+
+/** 古い順に並べ、同じものを除き、MAX_CURVE_PICKS 件までにする */
+export function normalizePicks(picks: readonly CurvePick[]): CurvePick[] {
+  const out: CurvePick[] = [];
+  for (const p of [...picks].sort((a, b) => a.day - b.day || a.slot - b.slot)) {
+    if (!out.some((q) => q.day === p.day && q.slot === p.slot)) out.push(p);
+  }
+  return out.slice(0, MAX_CURVE_PICKS);
+}
 
 export interface AppState {
   tab: TabId;
@@ -83,10 +101,12 @@ export interface AppState {
   curveDate: number;
   /** 入札カーブを見るコマ（0〜47） */
   curveSlot: number;
-  /** 入札カーブの対象（-1 はシステムプライス、0 以上は分断エリアのグループ） */
-  curveGroup: number;
+  /** 入札カーブの対象（システムプライスかエリア。受渡日・時間帯を変えても保つ） */
+  curveArea: CurveTarget;
   curveRange: CurveRange;
   curveCompare: CurveCompare;
+  /** 比較の図で自由に選んだ受渡日・時間帯（古い順） */
+  curvePicks: CurvePick[];
   /** 比較の図で重ねる側 */
   curveSide: CurveSide;
   /** 価格帯ごとの入札量の推移で見る側 */
@@ -126,9 +146,10 @@ export const DEFAULT_STATE: AppState = {
   areaBase: 'system',
   curveDate: Number.NaN,
   curveSlot: 36,
-  curveGroup: SYSTEM_GROUP,
+  curveArea: 'system',
   curveRange: 'auto',
   curveCompare: 'days',
+  curvePicks: [],
   curveSide: 'sell',
   curveDepth: 'sell',
   curveMetric: 'sell001',
@@ -180,6 +201,20 @@ const day: Codec<number> = {
   enc: (v) => (Number.isFinite(v) ? isoFromDay(v) : ''),
   dec: (s) => parseDateString(s) ?? undefined,
 };
+/** 20260925.36,20260926.12 */
+const picksCodec: Codec<CurvePick[]> = {
+  enc: (v) => v.map((p) => `${isoFromDay(p.day).replace(/-/g, '')}.${p.slot}`).join(','),
+  dec: (s) => {
+    const picks: CurvePick[] = [];
+    for (const item of s.split(',')) {
+      const m = /^(\d{8})\.(\d{1,2})$/.exec(item);
+      const day = m ? parseDateString(m[1]) : null;
+      const slot = m ? Number(m[2]) : Number.NaN;
+      if (day !== null && slot >= 0 && slot <= 47) picks.push({ day, slot });
+    }
+    return picks.length > 0 ? normalizePicks(picks) : undefined;
+  },
+};
 const presetCodec: Codec<string> = {
   enc: (v) => v,
   dec: (s) => (/^(last(7|30|90|365)|fy\d{4}|all|custom)$/.test(s) ? s : undefined),
@@ -212,9 +247,10 @@ const SCHEMA: { [K in keyof AppState]: [string, Codec<AppState[K]>] } = {
   areaBase: ['base', oneOf(PRICE_KEYS)],
   curveDate: ['cd', day],
   curveSlot: ['cs', intIn(0, 47)],
-  curveGroup: ['cg', intIn(-1, 99)],
+  curveArea: ['ca', oneOf(CURVE_TARGETS)],
   curveRange: ['cr', oneOf<CurveRange>(['auto', '30', '50', '100', 'all'])],
-  curveCompare: ['cc', oneOf<CurveCompare>(['days', 'slots'])],
+  curveCompare: ['cc', oneOf<CurveCompare>(['days', 'slots', 'picks'])],
+  curvePicks: ['cp', picksCodec],
   curveSide: ['csd', oneOf<CurveSide>(['sell', 'buy'])],
   curveDepth: ['cdp', oneOf<CurveSide>(['sell', 'buy'])],
   curveMetric: ['cm2', oneOf<CurveMetricKey>(CURVE_METRIC_KEYS)],
