@@ -3,7 +3,8 @@
  *
  * 与えた価格（システムプライス・エリアプライス）と約定量の近くで売りと買いが交わるよう、JEPX に似た形の
  * カーブを擬似乱数で作る（昼は太陽光で 0.01 円以下の売りが増える、最も高い価格の買いが多い、など）。
- * 市場分断したコマは、価格の同じエリアのまとまりごとにカーブを作り、それらを足したものをシステムプライスのカーブにする。
+ * 市場分断したコマは、価格の同じエリアのまとまりごとに、連系線でやりとりする量も含めてそのエリアの約定価格で交わるカーブを作り、
+ * それらを足してから、やりとりする量を売り・買いとも引いたものをシステムプライスのカーブ（全エリアの入札そのもの）にする。
  * JEPX と同じく、1 エリアだけのまとまり（単エリア）のカーブは出さない。
  * **実際の入札ではない**ため、画面上では常に「デモデータ」と明示する。
  */
@@ -93,10 +94,11 @@ const AREA_SOLAR: Record<AreaKey, number> = {
 };
 const EAST_AREAS: readonly AreaKey[] = ['hokkaido', 'tohoku', 'tokyo'];
 /**
- * 実データでは、システムプライスのカーブから分断エリアのカーブを引いた量が、単エリアの約定価格とずれることがある。
- * デモでも単エリアの補正を試せるよう、分断したコマのシステムプライスのカーブに、この割合の価格を問わない買いを足しておく
+ * 分断したコマで、連系線で分断エリアの間をやりとりする量（約定量に対する割合）。
+ * JEPX の分断エリアのカーブには、この量が送る側では買い、受ける側では売りとして価格によらない量で入っているとみられる
+ * （公表されている分断エリアの入札量の合計が、システムプライスより多くなることがある）
  */
-const DEMO_MISMATCH = 0.015;
+const DEMO_FLOW = 0.08;
 
 function areaPrices(t: SlotTarget): Record<AreaKey, number> | null {
   const ok = (v: number | undefined): v is number => v !== undefined && Number.isFinite(v);
@@ -144,10 +146,11 @@ export function syntheticCurveDay(day: number, targets: (SlotTarget | null)[]): 
       const sun = g.areas.reduce((v, a) => v + AREA_SOLAR[a] * AREA_SHARE[a], 0) / share;
       return syntheticCurve(g.price, t.volume * share, Math.min(1, solar * sun), rand);
     });
-    const extra = t.volume * DEMO_MISMATCH;
+    // 売りは最も安い価格（0 円）の段から、買いは最も高い価格の段まで、やりとりする量を引く（先頭の売り 0 の点はそのまま）
+    const flow = t.volume * DEMO_FLOW;
     raw.slots[s].set(
       SYSTEM_GROUP,
-      sumCurves(curves).map((r) => ({ ...r, buy: round1(r.buy + extra) })),
+      sumCurves(curves).map((r, i) => ({ price: r.price, sell: i === 0 ? r.sell : round1(Math.max(0, r.sell - flow)), buy: round1(Math.max(0, r.buy - flow)) })),
     );
     // 分断エリアの番号は単エリアにも振り、カーブと名前は 2 エリア以上のまとまりだけ出す（JEPX と同じく番号が飛ぶ）
     parts.forEach((g, id) => {

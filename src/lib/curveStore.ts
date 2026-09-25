@@ -17,7 +17,7 @@ import {
 import type { CurveIndex } from './dataFile';
 import { fiscalYearEnd, fiscalYearStart, parseDateString } from './dates';
 import { syntheticCurveDay } from './demoCurves';
-import { AREA_KEYS, SERIES_INDEX, SLOTS, type SeriesKey } from './series';
+import { AREA_KEYS, kwhToMw, SERIES_INDEX, SLOTS, type SeriesKey } from './series';
 import type { Dataset } from './store';
 
 export type ReadFile = (file: string) => Promise<unknown>;
@@ -222,8 +222,7 @@ export class CurveStore {
     const at = (k: SeriesKey, s: number) => ds.values[SERIES_INDEX[k]][i * SLOTS + s];
     const targets = Array.from({ length: SLOTS }, (_, s) => ({
       system: at('system', s),
-      // 約定総量（kWh/コマ）を MW に
-      volume: at('volume', s) / 500,
+      volume: kwhToMw(at('volume', s)),
       areas: Object.fromEntries(AREA_KEYS.map((a) => [a, at(a, s)])),
     }));
     const { raw, groups } = syntheticCurveDay(day, targets);

@@ -4,7 +4,7 @@
  * 売り入札は青、買い入札は橙（入札・約定量のタブと同じ色）。同じ側の線を何本も重ねるときは、その色相の濃淡で順序を表す。
  */
 import { GRANULARITY_LABEL } from '../lib/aggregate';
-import { aloneSlots, areaCurve, areaLabel, CURVE_TARGETS, type AreaCurve, type CurveTarget, type StepCurve } from '../lib/areaCurves';
+import { aloneSlots, areaCurve, areaLabel, CURVE_TARGETS, sameTotal, type AreaCurve, type CurveTarget, type StepCurve } from '../lib/areaCurves';
 import {
   buyVolumeAt,
   buyVolumesAt,
@@ -23,7 +23,7 @@ import {
 import { COMPARE_DAYS, type CurveStore } from '../lib/curveStore';
 import { DOW_LABEL, dowOfDay, formatDay, isoFromDay, parseDateString, slotRangeLabel, slotStartLabel, ymdFromDay } from '../lib/dates';
 import { fmtNum, fmtPrice } from '../lib/format';
-import { SERIES_INDEX, SLOTS, type AreaKey, type SeriesKey } from '../lib/series';
+import { kwhToMw, SERIES_INDEX, SLOTS, type AreaKey, type SeriesKey } from '../lib/series';
 import { reselect, type Selection } from '../lib/select';
 import { niceStep } from '../lib/stats';
 import { MAX_CURVE_PICKS, normalizePicks, type CurveCompare, type CurvePick, type CurveRange, type CurveSide } from '../state';
@@ -96,6 +96,7 @@ export class CurvesView extends View {
   private shapesNote!: HTMLElement;
   private periodNote!: HTMLElement;
   private methodNote!: HTMLElement;
+  private checkNote!: HTMLElement;
   private aloneRow!: HTMLElement;
   private dateInput!: HTMLInputElement;
   private prevBtn!: HTMLButtonElement;
@@ -219,9 +220,11 @@ export class CurvesView extends View {
     this.content.append(g1);
     this.curve = this.card(g1, { title: '入札カーブ', height: 420 });
     this.methodNote = h('p', { class: 'card-note', hidden: true });
+    this.checkNote = h('p', { class: 'card-note', hidden: true });
     this.aloneRow = h('div', { class: 'card-note alone', hidden: true });
     this.curve.footer.append(
       this.methodNote,
+      this.checkNote,
       this.aloneRow,
       h(
         'p',
@@ -323,11 +326,19 @@ export class CurvesView extends View {
     this.set({ curvePicks: this.ctx.state.curvePicks.filter((q) => q.day !== p.day || q.slot !== p.slot) });
   }
 
-  /** 受渡日・コマの約定価格（システムプライス・エリアプライス。無ければ NaN） */
+  /** 受渡日・コマの取引結果の値（約定価格、入札量は kWh。無ければ NaN） */
   private price(day: number, slot: number, key: SeriesKey): number {
     const { ds } = this.ctx;
     const i = day - ds.start;
     return i < 0 || i >= ds.n ? Number.NaN : ds.values[SERIES_INDEX[key]][i * SLOTS + slot];
+  }
+
+  /** 取引結果の売り・買い入札量（MW。デモのカーブは取引結果と別に合成しているので比べない） */
+  private spotBids(day: number, slot: number): SpotBids | null {
+    if (this.ctx.curves?.isDemo) return null;
+    const sell = kwhToMw(this.price(day, slot, 'sellBid'));
+    const buy = kwhToMw(this.price(day, slot, 'buyBid'));
+    return Number.isFinite(sell) && Number.isFinite(buy) ? { sell, buy } : null;
   }
 
   /** その日・時間帯に、対象の価格を決めたカーブ（カーブが無ければ null） */
@@ -344,6 +355,7 @@ export class CurvesView extends View {
     const target = state.curveArea;
     const when = `${formatDay(date, true)} ${slotRangeLabel(slot)}`;
     this.methodNote.hidden = true;
+    this.checkNote.hidden = true;
     this.aloneRow.hidden = true;
     const day = cs.getDay(date);
     if (!day) {
@@ -359,7 +371,7 @@ export class CurvesView extends View {
     const priceText = Number.isFinite(published) ? `・約定価格 ${fmtPrice(published)} ${PRICE_UNIT}` : '';
     this.curve.setSubtitle(`${when}・${targetText(target, ac)}${priceText}`);
     if (ac.kind === 'unavailable') {
-      this.curve.setEmpty(unavailableText(target, ac));
+      this.curve.setEmpty(unavailableText(target, ac, this.spotBids(date, slot)));
       return;
     }
     const sellColor = seriesColor('sellBid', theme);
@@ -441,18 +453,31 @@ export class CurvesView extends View {
     );
   }
 
-  /** 推定したカーブの作り方と、単エリアが複数のときに補正できる時間帯 */
+  /** 推定したカーブの作り方・確かめた結果と、単エリアが複数のときに補正できる時間帯 */
   private renderMethod(ac: AreaCurve, day: CurveDay, slot: number): void {
     const target = this.ctx.state.curveArea;
     if (!isEstimate(ac) || target === 'system') return;
     let text = `推定: システムプライスのカーブから、公表されている分断エリア（${(ac.subtracted ?? []).join('、')}）のカーブを引いたものです。`;
+    const lift = ac.lift ?? 0;
+    if (lift > 0) {
+      text +=
+        `分断エリアのカーブには連系線で送る量が買い、受ける量が売りとして入っているとみられ、引くと売り・買いとも同じだけ引き過ぎになるため、売り・買いに同じ ${fmtMw(lift)} を足しています` +
+        '（足す量そのものは分からないので、最も安い売りと最も高い買いの少ない方を 0 にしています。横軸の位置は目安で、カーブの形と交点の価格はこの量によりません）。';
+    }
     if (ac.kind === 'single') {
-      text += ac.correction
-        ? `約定価格 ${fmtPrice(ac.correction.price)} ${PRICE_UNIT} で交わるように、${SIDE_LABEL[ac.correction.side]}に ${fmtNum(ac.correction.mw / 1000, 2)} GW を足して補正しています。`
-        : '約定価格が分からないため、補正していません。';
+      const made = lift > 0 ? '引いて足した' : '引いた';
+      const crosses = Number.isFinite(ac.rawCrossing);
+      const raw = crosses ? `${made}カーブの交点は ${fmtPrice(ac.rawCrossing!)} ${PRICE_UNIT} で` : `${made}カーブは交わらず`;
+      const c = ac.correction;
+      if (!c) text += `${raw}、約定価格が分からないため補正していません。`;
+      else if (c.mw === 0) text += `${made}カーブは約定価格 ${fmtPrice(c.price)} ${PRICE_UNIT} で交わっていて、補正は要りませんでした。`;
+      else text += `${raw}、約定価格 ${fmtPrice(c.price)} ${PRICE_UNIT} で交わるように${SIDE_LABEL[c.side]}に ${fmtMw(c.mw)} を足して補正しています。`;
     } else {
       text += `単エリアが ${ac.areas.length} つ（${ac.label}）あり、エリアごとには分けられないため、${ac.areas.length} エリアを合わせたカーブです（補正なし）。破線の横線は各エリアの約定価格です。`;
     }
+    const check = totalsText(ac, this.spotBids(day.day, slot));
+    this.checkNote.textContent = check;
+    this.checkNote.hidden = check === '';
     this.methodNote.textContent = text;
     this.methodNote.hidden = false;
     if (ac.kind !== 'combined') return;
@@ -762,15 +787,52 @@ function targetText(target: CurveTarget, ac: AreaCurve): string {
   }
 }
 
-/** 単エリアを推定できないときの説明（引く前後の入札量の合計を添えて、なぜ推定できないかが分かるようにする） */
-function unavailableText(target: CurveTarget, ac: AreaCurve): string {
-  const t = ac.totals!;
-  const gw = (mw: number) => `${fmtNum(mw / 1000, 1)} GW`;
+/** 取引結果の売り・買い入札量（MW） */
+interface SpotBids {
+  sell: number;
+  buy: number;
+}
+
+/** 小さい量は MW、大きい量は GW で */
+function fmtMw(mw: number): string {
+  return Math.abs(mw) < 1000 ? `${fmtNum(mw, 0)} MW` : `${fmtNum(mw / 1000, 2)} GW`;
+}
+
+const fmtGw = (mw: number) => `${fmtNum(mw / 1000, 2)} GW`;
+const signedGw = (mw: number) => `${mw > 0 ? '+' : mw < 0 ? '−' : '±'}${fmtNum(Math.abs(mw) / 1000, 2)} GW`;
+
+/**
+ * 推定に使った入札量の合計と、取引結果の入札量との比較。システムプライスのカーブの合計が取引結果（全国の入札量）と同じなら、
+ * システムプライスのカーブには単エリアを含む全エリアの入札が入っている
+ */
+function totalsText(ac: AreaCurve, spot: SpotBids | null): string {
+  const t = ac.totals;
+  if (!t) return '';
+  let text = `入札量の合計: システムプライスのカーブは売り ${fmtGw(t.systemSell)}・買い ${fmtGw(t.systemBuy)}、公表されている分断エリアのカーブの合計は売り ${fmtGw(t.publishedSell)}・買い ${fmtGw(t.publishedBuy)}。`;
+  if (!spot) return text;
+  if (sameTotal(t.systemSell, spot.sell) && sameTotal(t.systemBuy, spot.buy)) {
+    return text + `システムプライスのカーブの合計は取引結果の売り・買い入札量と同じで、${ac.label}の入札も入っています。`;
+  }
   return (
-    `${targetLabel(target)}のカーブは推定できませんでした。システムプライスのカーブから、公表されている分断エリア（${(ac.subtracted ?? []).join('、')}）のカーブを引くと、` +
-    `売り・買いの入札量がほとんど残りません（入札量の合計: システムプライスは売り ${gw(t.systemSell)}・買い ${gw(t.systemBuy)}、` +
-    `公表されている分断エリアは売り ${gw(t.publishedSell)}・買い ${gw(t.publishedBuy)}）。` +
-    `この時間帯は、公表されている分断エリアのカーブに${ac.label}の入札も含まれているとみられます。`
+    text +
+    `取引結果の売り・買い入札量は ${fmtGw(spot.sell)}・${fmtGw(spot.buy)} で、システムプライスのカーブの合計との差は売り ${signedGw(t.systemSell - spot.sell)}・買い ${signedGw(t.systemBuy - spot.buy)} です。`
+  );
+}
+
+/** 単エリアを推定できないときの説明（引く前後の入札量の合計を添えて、なぜ推定できないかが分かるようにする） */
+function unavailableText(target: CurveTarget, ac: AreaCurve, spot: SpotBids | null): string {
+  const t = ac.totals!;
+  let text =
+    `${targetLabel(target)}のカーブは推定できませんでした。システムプライスのカーブから、公表されている分断エリア（${(ac.subtracted ?? []).join('、')}）のカーブを引いた差が、` +
+    `価格によらずほぼ一定（売り ${signedGw(t.systemSell - t.publishedSell)}・買い ${signedGw(t.systemBuy - t.publishedBuy)}）で、${ac.label}の入札の形が残りません` +
+    `（入札量の合計: システムプライスのカーブは売り ${fmtGw(t.systemSell)}・買い ${fmtGw(t.systemBuy)}、公表されている分断エリアのカーブの合計は売り ${fmtGw(t.publishedSell)}・買い ${fmtGw(t.publishedBuy)}）。`;
+  if (!spot) return text;
+  if (sameTotal(t.systemSell, spot.sell) && sameTotal(t.systemBuy, spot.buy)) {
+    return text + `システムプライスのカーブの合計は取引結果の売り・買い入札量と同じなので、公表されている分断エリアのカーブに${ac.label}の入札も含まれているとみられます。`;
+  }
+  return (
+    text +
+    `システムプライスのカーブの合計が取引結果の売り・買い入札量（${fmtGw(spot.sell)}・${fmtGw(spot.buy)}）と違い、システムプライスのカーブに${ac.label}の入札が入っていないのかもしれません。`
   );
 }
 

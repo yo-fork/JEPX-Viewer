@@ -307,7 +307,7 @@ describe('ファイル形式', () => {
 });
 
 describe('合成の入札カーブ（デモ用）', () => {
-  it('与えた価格の近くで交わり、売りは増え、買いは減っていく（分断したコマは分断エリアのカーブを足したもの）', () => {
+  it('与えた価格の近くで交わり、売りは増え、買いは減っていく（分断したコマは分断エリアのカーブから作る）', () => {
     const day = dayFromYmd(2025, 5, 3);
     const targets = Array.from({ length: SLOTS }, (_, s) => ({ system: s === 24 ? 0.01 : 8 + (s % 10), volume: 30000, east: 12, west: s % 2 ? 9 : 12 }));
     const { raw, groups } = syntheticCurveDay(day, targets);
@@ -330,10 +330,12 @@ describe('合成の入札カーブ（デモ用）', () => {
       const [east, west] = [raw.slots[s].get(0)!, raw.slots[s].get(1)!];
       expect(Math.abs(crossing(east)!.price - 12)).toBeLessThanOrEqual(0.5);
       expect(Math.abs(crossing(west)!.price - 9)).toBeLessThanOrEqual(0.5);
-      // システムプライスのカーブは 2 つを足したもの（買いには、ずれの分として約定量の 1.5% を足してある）
+      // システムプライスのカーブは、2 つを足したものから、連系線でやりとりする量（約定量の 8%）を売り・買いとも引いたもの
+      // （分断エリアのカーブには、その量が送る側では買い、受ける側では売りとして入っている）
+      const flow = 30000 * 0.08;
       rows.forEach((r, i) => {
-        expect(r.sell).toBeCloseTo(east[i].sell + west[i].sell, 0);
-        expect(r.buy).toBeCloseTo(east[i].buy + west[i].buy + 30000 * 0.015, 0);
+        expect(r.sell).toBeCloseTo(i === 0 ? 0 : east[i].sell + west[i].sell - flow, 0);
+        expect(r.buy).toBeCloseTo(east[i].buy + west[i].buy - flow, 0);
       });
     }
     expect(crossing(raw.slots[24].get(SYSTEM_GROUP)!)!.price).toBeLessThanOrEqual(0.01);

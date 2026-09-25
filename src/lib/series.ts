@@ -29,6 +29,9 @@ export const SERIES_COUNT = SERIES_KEYS.length;
 /** 1 日あたりのコマ数（30 分 × 48） */
 export const SLOTS = 48;
 
+/** 1 コマ（30 分）の電力量（kWh）を、その間の平均の電力（MW）にする（1MW × 0.5 時間 = 500kWh） */
+export const kwhToMw = (kwh: number): number => kwh / 500;
+
 export const SERIES_INDEX = Object.fromEntries(SERIES_KEYS.map((k, i) => [k, i])) as Record<SeriesKey, number>;
 
 export const SERIES_LABEL: Record<SeriesKey, string> = {

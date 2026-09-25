@@ -15,6 +15,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "fetch": "tsx scripts/fetch-jepx.ts",
+    "check:curves": "tsx scripts/check-curves.ts",
     "sample": "tsx scripts/make-sample-csv.ts"
   },
   "dependencies": {
