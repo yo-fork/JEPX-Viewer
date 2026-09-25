@@ -218,13 +218,22 @@ async function writeFyFile(out: string, fy: number, days: DayMap): Promise<FyFil
 }
 
 /** 入札カーブの 1 日分を保存し、ファイルの大きさ（バイト）を返す */
+/** システムプライスの入札カーブが 1 コマも無い CSV の案内（分断エリア連番の読み違いなど） */
+const NO_SYSTEM_CURVE = 'システムプライスの入札カーブが 1 コマも無いため保存しません（分断エリア連番が空か -1 の行をシステムプライスとして読みます）';
+
+/**
+ * 入札カーブの 1 日分を保存し、ファイルの大きさ（バイト）と保存したコマ数を返す。
+ * システムプライスのカーブが 1 コマも無ければ、中身の無いファイルは作らない（slots 0 を返す）
+ */
 async function writeCurveDayFile(out: string, raw: RawCurveDay, groups: AreaGroup[][] | undefined): Promise<{ bytes: number; slots: number }> {
   const file = encodeCurveDay(raw, groups);
+  const slots = file.slots.filter(Boolean).length;
+  if (slots === 0) return { bytes: 0, slots };
   const p = path.join(out, curveDayFile(raw.day));
   await mkdir(path.dirname(p), { recursive: true });
   const text = JSON.stringify(file);
   await writeFile(p, text);
-  return { bytes: Buffer.byteLength(text), slots: file.slots.filter(Boolean).length };
+  return { bytes: Buffer.byteLength(text), slots };
 }
 
 /**
@@ -391,6 +400,10 @@ async function convertDir(o: FetchOptions): Promise<Set<number>> {
       }
       const g = groups.get(day);
       const { bytes, slots } = await writeCurveDayFile(o.out, raw, g);
+      if (slots === 0) {
+        fail(f.label, new Error(`${isoFromDay(day)}: ${NO_SYSTEM_CURVE}`));
+        continue;
+      }
       touched.add(fiscalYearOfDay(day));
       written.add(day);
       o.log(`${f.label}: ${isoFromDay(day)} の入札カーブ ${slots} コマ（${Math.round(bytes / 1024)} KB）${g ? '' : '・分断エリアの名前なし'}`);
@@ -517,6 +530,11 @@ async function fetchCurves(o: FetchOptions, dispatcher: EnvHttpProxyAgent, pace:
       o.log(`${label}: 分断エリアの名前を取得できませんでした（${(err as Error).message}）`);
     }
     const { bytes, slots } = await writeCurveDayFile(o.out, raw, groups);
+    if (slots === 0) {
+      missing++;
+      o.log(`${label}: ${NO_SYSTEM_CURVE}`);
+      continue;
+    }
     touched.add(fiscalYearOfDay(day));
     saved++;
     o.log(`${label}: ${slots} コマを保存（${Math.round(bytes / 1024)} KB）`);

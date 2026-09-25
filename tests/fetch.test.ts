@@ -218,6 +218,36 @@ describe('データ取得スクリプト', () => {
     expect(day.slots[s]!.slice(1).map((g) => g.label)).toEqual(f2.groups[s].map((g) => g.label));
   });
 
+  it('--from-dir: 分断エリア連番が -1.0・0.0 の UTF-8 の CSV も変換し、システムプライスのカーブが無い日は保存しない', async () => {
+    const dir = path.join(workdir, 'decimals');
+    await mkdir(dir, { recursive: true });
+    const d2 = dayFromYmd(2024, 4, 2);
+    const f2 = curveFixture(d2)!;
+    // 最後の列（分断エリア連番）を -1.0・0.0 のような小数にする（表計算ソフトで保存し直した形）
+    const decimals = (csv: string) => csv.replace(/,(\d*)\r\n/g, (_, id: string) => `,${id === '' ? '-1' : id}.0\r\n`);
+    const bid = decimals(formatBidCurveCsv(f2.raw));
+    expect(bid).toMatch(/,-1\.0\r\n/);
+    await writeFile(path.join(dir, 'spot_bid_curves_20240402.csv'), bid);
+    await writeFile(path.join(dir, 'spot_splitting_areas_20240402.csv'), decimals(formatSplittingAreasCsv(d2, f2.groups)));
+    // システムプライスの行が無い CSV（分断エリアの行だけ）
+    const onlyGroups = bid
+      .split('\r\n')
+      .filter((l, i) => i === 0 || (l !== '' && !l.endsWith(',-1.0')))
+      .join('\r\n')
+      .replace(/^20240402,/gm, '20240403,');
+    await writeFile(path.join(dir, 'spot_bid_curves_20240403.csv'), onlyGroups);
+
+    const out = path.join(workdir, 'decimals-out');
+    const logs: string[] = [];
+    const manifest = await run({ ...defaultOptions(), out, fromDirs: [dir], log: (m) => logs.push(m) });
+    const expected = encodeCurveDay(parseBidCurveCsv(formatBidCurveCsv(f2.raw)).get(d2)!, parseSplittingAreasCsv(formatSplittingAreasCsv(d2, f2.groups)).get(d2));
+    expect(JSON.parse(await readFile(path.join(out, curveDayFile(d2)), 'utf8'))).toEqual(JSON.parse(JSON.stringify(expected)));
+    expect(expected.slots.filter(Boolean)).toHaveLength(SLOTS);
+    expect(manifest.curves?.dates).toEqual(['20240402']);
+    expect(existsSync(path.join(out, curveDayFile(dayFromYmd(2024, 4, 3))))).toBe(false);
+    expect(logs.some((l) => l.includes('2024-04-03') && l.includes('システムプライスの入札カーブが 1 コマも無い'))).toBe(true);
+  });
+
   it('--from-dir を複数指定して、別々のフォルダの入札カーブと分断エリアを突き合わせる（別々に変換しても名前を付け直す）', async () => {
     const bidDir = path.join(workdir, 'sep', 'bid_curves');
     const splitDir = path.join(workdir, 'elsewhere', 'splitting_areas');

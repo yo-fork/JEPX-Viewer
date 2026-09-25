@@ -52,7 +52,8 @@ function findColumn(headers: string[], tests: Matcher[]): number {
 /** 時刻コード（1〜48）または "HH:MM" 形式をコマ番号（0〜47）に変換 */
 export function parseSlot(value: string): number | null {
   const s = value.normalize('NFKC').trim();
-  if (/^\d{1,2}$/.test(s)) {
+  // 1〜48 のコード（表計算ソフトで保存し直した 1.0 のような形も）
+  if (/^\d{1,2}(\.0+)?$/.test(s)) {
     const code = Number(s);
     return code >= 1 && code <= SLOTS ? code - 1 : null;
   }

@@ -94,6 +94,26 @@ describe('parseBidCurveCsv / parseSplittingAreasCsv', () => {
     expect(odd.get(dayFromYmd(2026, 9, 25))!.slots[1].get(SYSTEM_GROUP)).toHaveLength(1);
   });
 
+  it('表計算ソフトで保存し直した CSV（分断エリア連番・商品コードが -1.0・0.0・1.0 のような小数）も読む', () => {
+    const decimals = (csv: string) =>
+      csv
+        .split('\n')
+        .map((line, i) => {
+          if (i === 0 || line.trim() === '') return line;
+          const cells = line.replace(/\r$/, '').split(',');
+          const last = cells.length - 1;
+          cells[last] = cells[last] === '' || cells[last] === '-1' ? '-1.0' : `${cells[last]}.0`;
+          cells[1] = `${cells[1]}.0`;
+          return cells.join(',');
+        })
+        .join('\n');
+    expect(decimals(BID_CSV)).toContain('20260925,1.0,0.00,0.0,49366.6,-1.0');
+    expect(decimals(BID_CSV)).toContain('20260925,1.0,0.00,0.0,32884.0,1.0');
+    expect(parseBidCurveCsv(decimals(BID_CSV))).toEqual(parseBidCurveCsv(BID_CSV));
+    expect(decimals(SPLIT_CSV)).toContain('20260925,5.0,北海道・東北・東京・中部,0.0');
+    expect(parseSplittingAreasCsv(decimals(SPLIT_CSV))).toEqual(parseSplittingAreasCsv(SPLIT_CSV));
+  });
+
   it('入札カーブ・分断エリアの CSV を列名で見分ける（取引結果の CSV などは null）', () => {
     expect(curveCsvKind(BID_CSV)).toBe('bidCurves');
     expect(curveCsvKind(withMinusOne(SPLIT_CSV))).toBe('splittingAreas');

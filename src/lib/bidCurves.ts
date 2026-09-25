@@ -70,11 +70,15 @@ export function curveCsvKind(text: string): CurveCsvKind | null {
   return null;
 }
 
-/** 分断エリア連番の値からグループ番号を読む。空（JEPX の形式）と -1 はシステムプライス。番号でなければ null */
+/**
+ * 分断エリア連番の値からグループ番号を読む。空（JEPX の形式）と -1 はシステムプライス。番号でなければ null。
+ * 表計算ソフトなどで保存し直した CSV の -1.0・0.0 のような小数の形も読む
+ */
 function parseGroupId(cell: string | undefined): number | null {
   const s = (cell ?? '').normalize('NFKC').trim();
-  if (s === '' || s === '-1') return SYSTEM_GROUP;
+  if (s === '') return SYSTEM_GROUP;
   const id = Number(s);
+  if (id === SYSTEM_GROUP) return SYSTEM_GROUP;
   return Number.isInteger(id) && id >= 0 ? id : null;
 }
 
