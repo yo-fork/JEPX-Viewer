@@ -5,14 +5,29 @@ import { aggregate, FISCAL_MONTH_LABELS, fiscalMonthIndex, src } from '../lib/ag
 import { fmtNum, fmtPrice } from '../lib/format';
 import { PRICE_KEYS, SERIES_LABEL, SERIES_SHORT, type PriceKey } from '../lib/series';
 import { accMean, accStd } from '../lib/stats';
-import { fiscalYearsIn, type YearMetric } from '../state';
+import { fiscalYearsIn, type ScaleMode, type YearMetric } from '../state';
 import type { ChartCard } from '../ui/card';
 import { segmented, selectField, toolbar, type Segmented, type SelectField } from '../ui/controls';
 import { h } from '../ui/dom';
 import { ordinalColors, TOKENS } from '../ui/theme';
 import { ttHeader, ttRow } from '../ui/tooltip';
 import { NO_DATA, View } from './base';
-import { describeSelection, endLabels, grid, labelOnSeq, labelRoom, lineLegend, PRICE_UNIT, rangeTag, styledLine, valueAxis } from './common';
+import {
+  CommonRange,
+  describeSelection,
+  endLabels,
+  fixedAxis,
+  grid,
+  labelOnSeq,
+  labelRoom,
+  lineLegend,
+  PRICE_UNIT,
+  rangeTag,
+  SCALE_OPTIONS,
+  styledLine,
+  valueAxis,
+  valueRange,
+} from './common';
 
 const METRICS: { value: YearMetric; label: string }[] = [
   { value: 'mean', label: '月平均' },
@@ -25,16 +40,20 @@ const FY_COLORED = 5;
 export class YearlyView extends View {
   private focus!: SelectField<PriceKey>;
   private metric!: Segmented<YearMetric>;
+  private scale!: Segmented<ScaleMode>;
   private months!: ChartCard;
   private fyBars!: ChartCard;
   private fyAreas!: ChartCard;
   private hint!: HTMLElement;
+  private readonly monthsRange = new CommonRange();
+  private readonly fyRange = new CommonRange();
 
   protected build(): void {
     const s = this.ctx.state;
     this.focus = selectField('対象', PRICE_KEYS.map((k) => ({ value: k, label: SERIES_LABEL[k] })), s.focus, (v) => this.set({ focus: v }));
     this.metric = segmented('指標', METRICS, s.yearMetric, (v) => this.set({ yearMetric: v }));
-    this.root.append(toolbar(this.focus.el, this.metric.el));
+    this.scale = segmented('軸の範囲', SCALE_OPTIONS, s.scale, (v) => this.set({ scale: v }));
+    this.root.append(toolbar(this.focus.el, this.metric.el, this.scale.el));
     this.hint = h(
       'p',
       { class: 'view-note', hidden: true },
@@ -52,6 +71,7 @@ export class YearlyView extends View {
     const { sel, state } = this.ctx;
     this.focus.set(state.focus);
     this.metric.set(state.yearMetric);
+    this.scale.set(state.scale);
     if (sel.days.length === 0) {
       [this.months, this.fyBars, this.fyAreas].forEach((c) => c.setEmpty(NO_DATA));
       return;
@@ -64,17 +84,28 @@ export class YearlyView extends View {
     this.renderFyAreas(fys);
   }
 
-  private renderMonths(fys: number[]): void {
-    const { sel, ds, state, theme } = this.ctx;
-    const t = TOKENS[theme];
+  /** key の、年度（fys の順）ごとの 12 か月（4 月〜3 月）の指標の値 */
+  private monthValues(key: PriceKey, fys: number[]): number[][] {
+    const { sel, ds, state } = this.ctx;
     const row = new Map(fys.map((fy, k) => [fy, k]));
-    const g = aggregate(sel, src(ds, state.focus), (i) => row.get(ds.fy[i])! * 12 + fiscalMonthIndex(ds.m[i]), fys.length * 12);
+    const g = aggregate(sel, src(ds, key), (i) => row.get(ds.fy[i])! * 12 + fiscalMonthIndex(ds.m[i]), fys.length * 12);
     const metric = state.yearMetric;
     const value = (k: number) => {
       const acc = g.acc[k];
       if (acc.n === 0) return Number.NaN;
       return metric === 'mean' ? accMean(acc) : metric === 'max' ? acc.max : metric === 'min' ? acc.min : g.floor[k];
     };
+    return fys.map((_, r) => Array.from({ length: 12 }, (_, m) => value(r * 12 + m)));
+  }
+
+  private renderMonths(fys: number[]): void {
+    const { sel, state, theme } = this.ctx;
+    const t = TOKENS[theme];
+    const metric = state.yearMetric;
+    const values = this.monthValues(state.focus, fys);
+    const common = state.scale === 'common';
+    // 全エリア共通: システムプライスと各エリアの値がすべて入る範囲
+    const axis = common ? fixedAxis(this.monthsRange.get(sel, metric, PRICE_KEYS, (k) => valueRange(this.monthValues(k, fys)))) : {};
     const colored = fys.slice(-FY_COLORED);
     const ramp = ordinalColors(colored.length, theme);
     const lines = fys.map((fy, r) => {
@@ -83,15 +114,15 @@ export class YearlyView extends View {
         name: `${fy}年度`,
         color: c >= 0 ? ramp[c] : t.deemph,
         muted: c < 0,
-        values: Array.from({ length: 12 }, (_, m) => value(r * 12 + m)),
+        values: values[r],
       };
     });
     const unit = metric === 'floor' ? 'コマ' : PRICE_UNIT;
     const fmt = (v: number) => (metric === 'floor' ? `${fmtNum(v)} コマ` : `${fmtPrice(v)} ${PRICE_UNIT}`);
     const mutedN = lines.filter((l) => l.muted).length;
-    const ends = endLabels(lines.map((l) => l.name), lines.map((l) => l.values), theme, 260);
+    const ends = endLabels(lines.map((l) => l.name), lines.map((l) => l.values), theme, 260, axis);
     this.months.setSubtitle(
-      `${describeSelection(sel, state)}・${SERIES_LABEL[state.focus]}の${METRICS.find((m) => m.value === metric)!.label}・${theme === 'light' ? '色が濃い' : '色が明るい'}ほど新しい年度${mutedN ? `（灰色は古い ${mutedN} 年度）` : ''}`,
+      `${describeSelection(sel, state)}・${SERIES_LABEL[state.focus]}の${METRICS.find((m) => m.value === metric)!.label}・${theme === 'light' ? '色が濃い' : '色が明るい'}ほど新しい年度${mutedN ? `（灰色は古い ${mutedN} 年度）` : ''}${common ? '・縦軸は全エリア共通' : ''}`,
     );
     this.months.setOption(
       {
@@ -110,7 +141,7 @@ export class YearlyView extends View {
           },
         },
         xAxis: { type: 'category', data: FISCAL_MONTH_LABELS, boundaryGap: false },
-        yAxis: valueAxis(unit),
+        yAxis: valueAxis(unit, axis),
         series: lines.map((l, i) =>
           styledLine(l.name, l.color, theme, l.values, false, {
             z: l.muted ? 1 : 2 + i,
@@ -132,10 +163,14 @@ export class YearlyView extends View {
     const { sel, ds, state, theme } = this.ctx;
     const t = TOKENS[theme];
     const row = new Map(fys.map((fy, k) => [fy, k]));
-    const g = aggregate(sel, src(ds, state.focus), (i) => row.get(ds.fy[i])!, fys.length);
+    const byFy = (k: PriceKey) => aggregate(sel, src(ds, k), (i) => row.get(ds.fy[i])!, fys.length);
+    const g = byFy(state.focus);
     const means = fys.map((_, k) => accMean(g.acc[k]));
     const days = fys.map((fy) => [...sel.days].filter((i) => ds.fy[i] === fy).length);
-    this.fyBars.setSubtitle(`${describeSelection(sel, state)}・${SERIES_LABEL[state.focus]}（期間内の日のみで集計）`);
+    const common = state.scale === 'common';
+    // 全エリア共通: システムプライスと各エリアの年度別の平均がすべて入る範囲
+    const axis = common ? fixedAxis(this.fyRange.get(sel, '', PRICE_KEYS, (k) => valueRange([byFy(k).acc.map(accMean)]))) : {};
+    this.fyBars.setSubtitle(`${describeSelection(sel, state)}・${SERIES_LABEL[state.focus]}（期間内の日のみで集計）${common ? '・縦軸は全エリア共通' : ''}`);
     this.fyBars.setOption(
       {
         grid: grid({ top: 28 }),
@@ -154,7 +189,7 @@ export class YearlyView extends View {
           },
         },
         xAxis: { type: 'category', data: fys.map((fy) => `${fy}`), axisLabel: { hideOverlap: true, formatter: '{value}年度' } },
-        yAxis: valueAxis(),
+        yAxis: valueAxis(PRICE_UNIT, axis),
         series: [
           {
             type: 'bar',

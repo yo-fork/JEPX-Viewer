@@ -69,7 +69,7 @@ export function valueAxis(name = PRICE_UNIT, extra: Record<string, unknown> = {}
   };
 }
 
-/** ヒートマップ・カレンダーの色と、箱ひげ図の縦軸の範囲の決め方 */
+/** ヒートマップ・カレンダーの色と、時間帯・分布・年度比較のグラフの軸の範囲の決め方 */
 export const SCALE_OPTIONS: Option<ScaleMode>[] = [
   { value: 'auto', label: '対象ごと' },
   { value: 'common', label: '全エリア共通' },
@@ -86,6 +86,20 @@ export function unionRange(ranges: readonly [number, number][]): [number, number
   return lo <= hi ? [lo, hi] : [Number.NaN, Number.NaN];
 }
 
+/** 値（NaN を除く）がすべて入る範囲（折れ線・棒の縦軸用。どれにも値が無ければ NaN） */
+export function valueRange(lines: readonly ArrayLike<number>[]): [number, number] {
+  let lo = Number.POSITIVE_INFINITY;
+  let hi = Number.NEGATIVE_INFINITY;
+  for (const line of lines) {
+    for (let i = 0; i < line.length; i++) {
+      const v = line[i];
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+    }
+  }
+  return lo <= hi ? [lo, hi] : [Number.NaN, Number.NaN];
+}
+
 /** 箱ひげ図のひげ（10〜90%点）がすべて入る範囲 */
 export function whiskerRange(valuesPerGroup: readonly number[][]): [number, number] {
   return unionRange(
@@ -96,11 +110,14 @@ export function whiskerRange(valuesPerGroup: readonly number[][]): [number, numb
   );
 }
 
+/** 固定した軸の範囲と目盛りの幅（固定しないときは空） */
+export type FixedAxis = { min?: number; max?: number; interval?: number };
+
 /**
  * 縦軸を固定する設定。0 を含め、目盛りの幅（1・2・2.5・5 × 10^n）の倍数まで広げる。
  * 範囲だけを渡すと ECharts が目盛りの幅を選び直して上端の目盛りが半端になるので、幅も渡す。値が無ければ固定しない
  */
-export function fixedAxis([lo, hi]: [number, number]): Record<string, number> {
+export function fixedAxis([lo, hi]: [number, number]): FixedAxis {
   if (!(lo <= hi)) return {};
   const a = Math.min(0, lo);
   const b = Math.max(0, hi);
@@ -207,8 +224,15 @@ function endLabel(name: string, theme: ThemeName): Record<string, unknown> {
  * 折れ線の右端に系列名を直接表示する設定を系列ごとに返す（4 系列以下のとき）。
  * 右端の値が近く、ラベルが重なるものは積み上げずに表示しない（凡例・ツールチップ・表で識別できる）。
  * @param values 各系列の y 値（右端のラベル位置と縦軸の範囲の見積もりに使う）
+ * @param axis 縦軸を固定したときの範囲（その範囲で位置を見積もる）
  */
-export function endLabels(names: string[], values: ArrayLike<number>[], theme: ThemeName, plotHeight: number): Record<string, unknown>[] {
+export function endLabels(
+  names: string[],
+  values: ArrayLike<number>[],
+  theme: ThemeName,
+  plotHeight: number,
+  axis: FixedAxis = {},
+): Record<string, unknown>[] {
   const none = names.map(() => ({}));
   if (names.length > DIRECT_LABEL_MAX) return none;
   let lo = 0;
@@ -224,6 +248,10 @@ export function endLabels(names: string[], values: ArrayLike<number>[], theme: T
     }
     return v;
   });
+  if (axis.min !== undefined && axis.max !== undefined) {
+    lo = axis.min;
+    hi = axis.max;
+  }
   if (!Number.isFinite(hi) || hi <= lo) return none;
   const px = last.map((v) => ((v - lo) / (hi - lo)) * plotHeight);
   const kept: number[] = [];

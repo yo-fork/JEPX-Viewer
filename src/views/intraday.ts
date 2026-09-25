@@ -27,6 +27,7 @@ import {
   slotAxis,
   styledLine,
   valueAxis,
+  valueRange,
   whiskerRange,
   withAlpha,
 } from './common';
@@ -57,7 +58,8 @@ export class IntradayView extends View {
   private scale!: Segmented<ScaleMode>;
   private profile!: ChartCard;
   private box!: ChartCard;
-  private readonly common = new CommonRange();
+  private readonly profileRange = new CommonRange();
+  private readonly boxRange = new CommonRange();
 
   protected build(): void {
     const s = this.ctx.state;
@@ -82,7 +84,7 @@ export class IntradayView extends View {
       s.intradayStat,
       (v) => this.set({ intradayStat: v }),
     );
-    this.scale = segmented('箱ひげ図の縦軸', SCALE_OPTIONS, s.scale, (v) => this.set({ scale: v }));
+    this.scale = segmented('軸の範囲', SCALE_OPTIONS, s.scale, (v) => this.set({ scale: v }));
     this.root.append(toolbar(this.mode.el, this.focus.el, this.stat.el, this.scale.el));
     const g = this.grid();
     this.profile = this.card(g, { title: '時間帯別の価格（日内カーブ）', height: 380, wide: true });
@@ -104,11 +106,20 @@ export class IntradayView extends View {
     this.renderBox();
   }
 
-  private groups(): Group[] {
-    const { sel, ds, state, theme } = this.ctx;
-    const t = TOKENS[theme];
+  /** 期間に含まれる年度（古い順） */
+  private fiscalYears(): number[] {
+    const { sel, ds } = this.ctx;
+    return [...new Set([...sel.days].map((i) => ds.fy[i]))].sort((a, b) => a - b);
+  }
+
+  /**
+   * key の日内カーブを、今の切り口の線ごとに返す（値はコマの順）。
+   * 系列は 1 本、季節は季節の番号順の 4 本、平日・土曜・日祝は 3 本、年度は古い順
+   */
+  private lineValues(key: PriceKey): number[][] {
+    const { sel, ds, state } = this.ctx;
     const median = state.intradayStat === 'median';
-    const valuesOf = (key: PriceKey, groupOf: (i: number) => number, n: number): number[][] => {
+    const valuesOf = (groupOf: (i: number) => number, n: number): number[][] => {
       const g = aggregate(sel, src(ds, key), (i, s) => (groupOf(i) < 0 ? -1 : groupOf(i) * SLOTS + s), n * SLOTS, median);
       return Array.from({ length: n }, (_, k) =>
         sel.slots.map((s) => {
@@ -118,28 +129,43 @@ export class IntradayView extends View {
         }),
       );
     };
+    switch (state.intradayMode) {
+      case 'series':
+        return valuesOf(() => 0, 1);
+      case 'season':
+        return valuesOf((i) => seasonOfMonth(ds.m[i]), 4);
+      case 'daytype':
+        // 0: 平日, 1: 土曜（祝日を除く）, 2: 日曜・祝日
+        return valuesOf((i) => (ds.holiday[i] || ds.dow[i] === 0 ? 2 : ds.dow[i] === 6 ? 1 : 0), 3);
+      case 'fy': {
+        const index = new Map(this.fiscalYears().map((fy, k) => [fy, k]));
+        return valuesOf((i) => index.get(ds.fy[i]) ?? -1, index.size);
+      }
+    }
+  }
 
+  private groups(): Group[] {
+    const { state, theme } = this.ctx;
+    const t = TOKENS[theme];
     switch (state.intradayMode) {
       case 'series':
         return state.series.map((k) => ({
           name: SERIES_SHORT[k],
           color: seriesColor(k, theme),
           dashed: seriesDashed(k),
-          values: valuesOf(k, () => 0, 1)[0],
+          values: this.lineValues(k)[0],
         }));
       case 'season': {
-        const v = valuesOf(state.focus, (i) => seasonOfMonth(ds.m[i]), 4);
+        const v = this.lineValues(state.focus);
         return SEASON_ORDER.map((o, i) => ({ name: o.label, color: t.cat[i], values: v[o.season] }));
       }
       case 'daytype': {
-        // 0: 平日, 1: 土曜（祝日を除く）, 2: 日曜・祝日
-        const v = valuesOf(state.focus, (i) => (ds.holiday[i] || ds.dow[i] === 0 ? 2 : ds.dow[i] === 6 ? 1 : 0), 3);
+        const v = this.lineValues(state.focus);
         return ['平日', '土曜', '日曜・祝日'].map((name, i) => ({ name, color: t.cat[i], values: v[i] }));
       }
       case 'fy': {
-        const fys = [...new Set([...sel.days].map((i) => ds.fy[i]))].sort((a, b) => a - b);
-        const index = new Map(fys.map((fy, k) => [fy, k]));
-        const v = valuesOf(state.focus, (i) => index.get(ds.fy[i]) ?? -1, fys.length);
+        const fys = this.fiscalYears();
+        const v = this.lineValues(state.focus);
         const colored = fys.slice(-FY_COLORED);
         const ramp = ordinalColors(colored.length, theme);
         return fys.map((fy, k) => {
@@ -155,17 +181,25 @@ export class IntradayView extends View {
   private renderProfile(): void {
     const { sel, state, theme } = this.ctx;
     const groups = this.groups();
+    const common = state.scale === 'common';
+    // 全エリア共通: システムプライスと各エリアの線がすべて入る範囲（系列で比べるときは、表示していない系列も含める）
+    const axis = common
+      ? fixedAxis(
+          this.profileRange.get(sel, `${state.intradayMode}|${state.intradayStat}`, PRICE_KEYS, (k) => valueRange(this.lineValues(k))),
+        )
+      : {};
     const statLabel = state.intradayStat === 'median' ? '中央値' : '平均';
     const target = state.intradayMode === 'series' ? '' : `・${SERIES_LABEL[state.focus]}`;
     const mutedCount = groups.filter((g) => g.muted).length;
     this.profile.setSubtitle(
-      `${describeSelection(sel, state)}${target}・コマごとの${statLabel}${state.intradayMode === 'fy' ? `・${theme === 'light' ? '色が濃い' : '色が明るい'}ほど新しい年度` : ''}${mutedCount ? `（灰色は古い ${mutedCount} 年度）` : ''}`,
+      `${describeSelection(sel, state)}${target}・コマごとの${statLabel}${state.intradayMode === 'fy' ? `・${theme === 'light' ? '色が濃い' : '色が明るい'}ほど新しい年度` : ''}${mutedCount ? `（灰色は古い ${mutedCount} 年度）` : ''}${common ? '・縦軸は全エリア共通' : ''}`,
     );
     const ends = endLabels(
       groups.map((g) => g.name.replace(/（.*）/, '')),
       groups.map((g) => g.values),
       theme,
       300,
+      axis,
     );
     this.profile.setOption(
       {
@@ -184,7 +218,7 @@ export class IntradayView extends View {
           },
         },
         xAxis: slotAxis(sel.slots),
-        yAxis: valueAxis(),
+        yAxis: valueAxis(PRICE_UNIT, axis),
         series: groups.map((g, i) =>
           styledLine(g.name, g.color, theme, g.values, g.dashed, {
             z: g.muted ? 1 : 2 + i,
@@ -211,7 +245,7 @@ export class IntradayView extends View {
     // 全エリア共通: システムプライスと各エリアのひげがすべて入る範囲
     const axis = common
       ? fixedAxis(
-          this.common.get(sel, '', PRICE_KEYS, (k) => {
+          this.boxRange.get(sel, '', PRICE_KEYS, (k) => {
             const values = bySlot(k).values!;
             return whiskerRange(sel.slots.map((s) => values[s]));
           }),

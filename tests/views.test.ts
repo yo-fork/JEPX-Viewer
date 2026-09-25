@@ -7,7 +7,8 @@ import { PRICE_KEYS } from '../src/lib/series';
 import { DataStore } from '../src/lib/store';
 import { stateFromHash, stateToHash } from '../src/state';
 import { dayRange } from '../src/views/calendar';
-import { CommonRange, fixedAxis, unionRange, whiskerRange } from '../src/views/common';
+import { CommonRange, endLabels, fixedAxis, unionRange, valueRange, whiskerRange } from '../src/views/common';
+import { histogramBins, histogramCounts } from '../src/views/distribution';
 import { buildGrid, colorRange } from '../src/views/heatmap';
 import { breakGaps, slotPoints } from '../src/views/timeseries';
 
@@ -153,6 +154,36 @@ describe('全エリア共通の色・縦軸の範囲', () => {
     expect(fixedAxis([-3, 12])).toEqual({ min: -5, max: 15, interval: 5 });
     // 値が無ければ固定しない
     expect(fixedAxis([Number.NaN, Number.NaN])).toEqual({});
+  });
+
+  it('折れ線・棒の縦軸は、値（NaN を除く）がすべて入る範囲', () => {
+    expect(valueRange([[3, Number.NaN, 7], Float64Array.from([5, 12]), []])).toEqual([3, 12]);
+    expect(valueRange([[Number.NaN]]).every(Number.isNaN)).toBe(true);
+  });
+
+  it('縦軸を固定したときは、右端のラベルの重なりをその範囲で見積もる', () => {
+    // データの範囲（0〜11）では 27px 離れるが、0〜100 に固定すると 3px しか離れず重なる
+    const names = ['A', 'B'];
+    const values = [[10], [11]];
+    expect(endLabels(names, values, 'light', 300).filter((e) => 'endLabel' in e)).toHaveLength(2);
+    expect(endLabels(names, values, 'light', 300, fixedAxis([0, 100])).filter((e) => 'endLabel' in e)).toHaveLength(1);
+  });
+
+  it('ヒストグラムを全エリア共通の階級で数えると、どのエリアも同じ階級に分かれ、上端以上は最後の階級に入る', () => {
+    const tokyo = [4.2, 7.9, 8.1, 12.5, 30];
+    const kyushu = [0.01, 0.01, 6.3, 9.9];
+    const b = histogramBins(0.01, 12.5, '2');
+    expect(b).toEqual({ start: 0, width: 2, nBins: 7 });
+    const t = histogramCounts(tokyo, b);
+    const k = histogramCounts(kyushu, b);
+    expect(t).toHaveLength(b.nBins + 1);
+    expect(k).toHaveLength(b.nBins + 1);
+    expect(t).toEqual([0, 0, 1, 1, 1, 0, 1, 1]);
+    expect(k).toEqual([2, 0, 0, 1, 1, 0, 0, 0]);
+    // 階級の下端より少し小さい値（浮動小数点の誤差）も最初の階級に入れる
+    expect(histogramCounts([-1e-12], b)[0]).toBe(1);
+    // 「自動」は約 40 個に分ける幅
+    expect(histogramBins(0, 40, 'auto')).toEqual({ start: 0, width: 1, nBins: 40 });
   });
 
   it('カレンダーの「対象ごと」の色の範囲（1〜99%点、差は対称、0.01 円のコマ数は 0〜最大）', () => {

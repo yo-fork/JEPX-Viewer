@@ -45,7 +45,7 @@ export type DistGroup = 'month' | 'fy' | 'dow' | 'hour' | 'area';
 export type YearMetric = 'mean' | 'max' | 'min' | 'floor';
 export type TableUnit = 'day' | 'week' | 'month' | 'fy' | 'year' | 'dow' | 'slot' | 'all';
 export type TableKind = 'areas' | 'stats';
-/** 色・縦軸の範囲: 対象ごとに決めるか、全エリアで共通にする（対象を切り替えても変えない）か */
+/** 色・軸の範囲: 対象ごとに決めるか、全エリアで共通にする（対象を切り替えても変えない）か */
 export type ScaleMode = 'auto' | 'common';
 /** 入札カーブの縦軸（価格）の上限 */
 export type CurveRange = 'auto' | '30' | '50' | '100' | 'all';
@@ -95,7 +95,7 @@ export interface AppState {
   calMetric: CalMetric;
   distBin: string;
   distGroup: DistGroup;
-  /** ヒートマップ・カレンダーの色と、箱ひげ図の縦軸の範囲 */
+  /** ヒートマップ・カレンダーの色と、時間帯・分布・年度比較のグラフの軸の範囲 */
   scale: ScaleMode;
   pairA: AreaKey;
   pairB: AreaKey;
