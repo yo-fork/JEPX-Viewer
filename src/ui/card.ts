@@ -85,7 +85,9 @@ export class ChartCard {
     this.setEmpty(null);
     // 時間軸は「JST の壁時計時刻を UTC として表したミリ秒」で渡すので UTC で表示する（カレンダーは除く）
     const opt = option as Record<string, unknown>;
-    this.chart.setOption({ useUTC: true, ...opt } as EChartsOption, { notMerge: true, lazyUpdate: true });
+    // その場で描き直す（lazyUpdate にしない）。lazyUpdate では新しい設定のモデルがすぐに作られる一方、描き直しは次のフレームになる。
+    // そのあいだにマウスが動くと、古い図形が新しいモデルのまだデータの無い系列を参照して、ECharts の中で例外になる
+    this.chart.setOption({ useUTC: true, ...opt } as EChartsOption, { notMerge: true });
     this.table = table;
     this.csvBtn.disabled = !table;
     this.toggleBtn.disabled = !table;
