@@ -148,7 +148,7 @@ describe('データ取得スクリプト', () => {
     await writeFile(path.join(csvDir, 'spot_bid_curves_20230402.csv'), iconv.encode(formatBidCurveCsv(f.raw), 'Shift_JIS'));
     await writeFile(path.join(csvDir, 'spot_splitting_areas_20230402.csv'), iconv.encode(formatSplittingAreasCsv(f.raw.day, f.groups), 'Shift_JIS'));
     const out = path.join(workdir, 'converted');
-    const manifest = await run({ ...defaultOptions(), from: 2005, to: 2030, out, fromDir: csvDir, log: () => {} });
+    const manifest = await run({ ...defaultOptions(), from: 2005, to: 2030, out, fromDirs: [csvDir], log: () => {} });
     expect(manifest.files.map((x) => x.fy)).toEqual([2023]);
     expect(manifest.source).toBe(`local:${csvDir}`);
     expect(manifest.curves?.dates).toEqual(['20230402']);
@@ -174,7 +174,7 @@ describe('データ取得スクリプト', () => {
 
     const out = path.join(workdir, 'saved-out');
     const logs: string[] = [];
-    const manifest = await run({ ...defaultOptions(), out, fromDir: saved, log: (m) => logs.push(m) });
+    const manifest = await run({ ...defaultOptions(), out, fromDirs: [saved], log: (m) => logs.push(m) });
     expect(manifest.files.map((x) => x.fy)).toEqual([2023]);
     expect(manifest.curves?.dates).toEqual(['20230402', '20230403']);
     // JEPX の形式（連番が空）の CSV から作ったものと同じになる
@@ -187,9 +187,9 @@ describe('データ取得スクリプト', () => {
     expect(logs).toContain('読み込めなかった CSV: 1 件（memo.csv）');
 
     // --curves-from / --curves-to を指定したときだけ受渡日で絞る
-    const only = await run({ ...defaultOptions(), out: path.join(workdir, 'saved-out2'), fromDir: saved, curvesFrom: d3, curvesTo: d3, curvesRangeSet: true, log: () => {} });
+    const only = await run({ ...defaultOptions(), out: path.join(workdir, 'saved-out2'), fromDirs: [saved], curvesFrom: d3, curvesTo: d3, curvesRangeSet: true, log: () => {} });
     expect(only.curves?.dates).toEqual(['20230403']);
-    await expect(run({ ...defaultOptions(), out: path.join(workdir, 'none'), fromDir: path.join(saved, '2023'), curves: false, log: () => {} })).rejects.toThrow(/変換できる CSV がありません/);
+    await expect(run({ ...defaultOptions(), out: path.join(workdir, 'none'), fromDirs: [path.join(saved, '2023')], curves: false, log: () => {} })).rejects.toThrow(/変換できる CSV がありません/);
   });
 
   it('--from-dir: UTF-8 で保存した大きな分断エリアの CSV も、先頭で種類を見分けて読む', async () => {
@@ -211,11 +211,49 @@ describe('データ取得スクリプト', () => {
     expect(bytes[8192] >= 0x80 && bytes[8192] <= 0xbf).toBe(true);
     await writeFile(path.join(dir, 'areas.csv'), bytes);
     const logs: string[] = [];
-    await run({ ...defaultOptions(), out: path.join(workdir, 'utf8-out'), fromDir: dir, log: (m) => logs.push(m) });
+    await run({ ...defaultOptions(), out: path.join(workdir, 'utf8-out'), fromDirs: [dir], log: (m) => logs.push(m) });
     expect(logs.some((l) => l.includes('読み込めなかった'))).toBe(false);
     const day = decodeCurveDay(JSON.parse(await readFile(path.join(workdir, 'utf8-out', curveDayFile(d2)), 'utf8')));
     const s = f2.groups.findIndex((g) => g.length > 0);
     expect(day.slots[s]!.slice(1).map((g) => g.label)).toEqual(f2.groups[s].map((g) => g.label));
+  });
+
+  it('--from-dir を複数指定して、別々のフォルダの入札カーブと分断エリアを突き合わせる（別々に変換しても名前を付け直す）', async () => {
+    const bidDir = path.join(workdir, 'sep', 'bid_curves');
+    const splitDir = path.join(workdir, 'elsewhere', 'splitting_areas');
+    await mkdir(bidDir, { recursive: true });
+    await mkdir(splitDir, { recursive: true });
+    const d2 = dayFromYmd(2024, 4, 2);
+    const f2 = curveFixture(d2)!;
+    const s = f2.groups.findIndex((g) => g.length > 0);
+    expect(s).toBeGreaterThanOrEqual(0);
+    const minusOne = (csv: string) => csv.replace(/,\r\n/g, ',-1\r\n');
+    await writeFile(path.join(bidDir, 'spot_bid_curves_20240402.csv'), iconv.encode(minusOne(formatBidCurveCsv(f2.raw)), 'Shift_JIS'));
+    await writeFile(path.join(splitDir, 'spot_splitting_areas_20240402.csv'), iconv.encode(minusOne(formatSplittingAreasCsv(d2, f2.groups)), 'Shift_JIS'));
+    // 分断エリアだけがある日（入札カーブは無い）
+    await writeFile(path.join(splitDir, 'spot_splitting_areas_20240403.csv'), formatSplittingAreasCsv(dayFromYmd(2024, 4, 3), f2.groups));
+    const expected = JSON.parse(
+      JSON.stringify(encodeCurveDay(parseBidCurveCsv(formatBidCurveCsv(f2.raw)).get(d2)!, parseSplittingAreasCsv(formatSplittingAreasCsv(d2, f2.groups)).get(d2))),
+    );
+    const dayFile = (out: string) => readFile(path.join(out, curveDayFile(d2)), 'utf8').then((t) => JSON.parse(t) as unknown);
+
+    // 1 回で 2 つのフォルダを読む
+    const both = path.join(workdir, 'sep-out-both');
+    const logs: string[] = [];
+    await run({ ...defaultOptions(), out: both, fromDirs: [bidDir, splitDir], log: (m) => logs.push(m) });
+    expect(await dayFile(both)).toEqual(expected);
+    expect(logs.some((l) => l.includes('分断エリアの名前なし'))).toBe(false);
+    expect(logs).toContain('分断エリアの CSV だけがあり、入札カーブが無い日: 1 日（その日の入札カーブを変換すると名前が付きます）');
+
+    // 別々に変換しても、あとから読んだ分断エリアの名前を付け直す
+    const apart = path.join(workdir, 'sep-out-apart');
+    await run({ ...defaultOptions(), out: apart, fromDirs: [bidDir], log: () => {} });
+    expect(decodeCurveDay(await dayFile(apart)).slots[s]![1].label).toMatch(/^分断エリア \d+$/);
+    const later: string[] = [];
+    const manifest = await run({ ...defaultOptions(), out: apart, fromDirs: [splitDir], log: (m) => later.push(m) });
+    expect(later).toContain('分断エリアの名前を、変換済みの入札カーブ 1 日に付けました');
+    expect(await dayFile(apart)).toEqual(expected);
+    expect(manifest.curves?.dates).toEqual(['20240402']);
   });
 
   it('コマンドライン引数を解釈する', () => {
@@ -224,6 +262,8 @@ describe('データ取得スクリプト', () => {
     const c = parseArgs(['--curves-from', '2025-04-01', '--curves-to', '2025/04/30', '--no-curves']);
     expect(c).toMatchObject({ curvesFrom: dayFromYmd(2025, 4, 1), curvesTo: dayFromYmd(2025, 4, 30), curves: false, curvesRangeSet: true });
     expect(o.curvesRangeSet).toBe(false);
+    expect(o.fromDirs).toEqual([]);
+    expect(parseArgs(['--from-dir', 'a', '--from-dir', 'b']).fromDirs).toEqual(['a', 'b']);
     const d = defaultOptions();
     expect(d.curvesTo - d.curvesFrom + 1).toBe(90);
     expect(() => parseArgs(['--from', '2020', '--to', '2016'])).toThrow();

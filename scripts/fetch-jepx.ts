@@ -7,7 +7,7 @@
  *   npm run fetch -- --no-curves              入札カーブを取得しない
  *   npm run fetch -- --force                  取得済みの年度・日も取り直す
  *   npm run fetch -- --keep-csv               元の CSV も public/data/raw/ に保存する
- *   npm run fetch -- --from-dir ./csv         手元の CSV（ダウンロード・保存しておいたもの）を変換する（通信なし）
+ *   npm run fetch -- --from-dir ./csv         手元の CSV（ダウンロード・保存しておいたもの）を変換する（通信なし。複数指定できる）
  *
  * 社内プロキシ環境では HTTPS_PROXY / HTTP_PROXY / NO_PROXY 環境変数がそのまま使われる。
  * JEPX のサイトに負荷をかけないよう、取得は 1 件ずつ間隔（--delay）を空けて行う。
@@ -18,6 +18,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { EnvHttpProxyAgent, fetch } from 'undici';
 import {
+  applyGroupNames,
   curveCsvKind,
   curveDayFile,
   curveMetricsFile,
@@ -62,7 +63,8 @@ export interface FetchOptions {
   out: string;
   force: boolean;
   keepCsv: boolean;
-  fromDir?: string;
+  /** 手元の CSV のフォルダ（--from-dir。複数指定できる。指定すると通信しない） */
+  fromDirs: string[];
   urlTemplate: string;
   delayMs: number;
   log: (msg: string) => void;
@@ -93,6 +95,7 @@ export function defaultOptions(): FetchOptions {
     curvesTo: tomorrow,
     curvesRangeSet: false,
     curvesUrlTemplate: DEFAULT_CURVES_URL_TEMPLATE,
+    fromDirs: [],
   };
 }
 
@@ -127,7 +130,7 @@ export function parseArgs(argv: string[], base = defaultOptions()): FetchOptions
         o.keepCsv = true;
         break;
       case '--from-dir':
-        o.fromDir = next();
+        o.fromDirs = [...o.fromDirs, next()];
         break;
       case '--url-template':
         o.urlTemplate = next();
@@ -172,7 +175,7 @@ const HELP = `使い方: npm run fetch -- [オプション]
   --out <ディレクトリ>   出力先（既定: public/data）
   --force                取得済みの年度・日も取り直す
   --keep-csv             元の CSV を <出力先>/raw/ に保存する
-  --from-dir <ディレクトリ>  手元の CSV を変換する（通信しない。サブフォルダも含め、ファイル名は問わず中身で判定）
+  --from-dir <ディレクトリ>  手元の CSV を変換する（通信しない。サブフォルダも含め、ファイル名は問わず中身で判定。複数指定できる）
   --url-template <URL>   取引結果の取得元 URL（{fy} が年度に置き換わる）
   --curves-url-template <URL>  入札カーブの取得元 URL（{dir}・{file} が置き換わる）
   --delay <ミリ秒>       連続取得の間隔（既定: 1500）`;
@@ -308,44 +311,58 @@ async function readHead(file: string, size = 8192): Promise<string> {
 }
 
 /**
- * 手元の CSV（サブフォルダも含む）を変換する。入札カーブを保存した年度を返す。
- * 取引結果・入札カーブ・分断エリアのどれかは、ファイル名ではなく列名で見分ける（保存したときの名前は問わない）。
- * 入札カーブは受渡日の列で日を決めるので、1 つの CSV に何日分入っていてもよい（同じ日が複数あれば、名前順で後のファイル）。
- * 入札カーブは --curves-from / --curves-to を指定したときだけ受渡日で絞る（既定はすべて）。
- * 読めない CSV は飛ばして最後にまとめて知らせ、1 件も変換できなければエラーにする。
+ * 手元の CSV（--from-dir のフォルダ。サブフォルダも含む）を変換する。入札カーブを保存した年度を返す。
+ * - 取引結果・入札カーブ・分断エリアのどれかは、ファイル名ではなく列名で見分ける（保存したときの名前やフォルダは問わない）
+ * - 入札カーブと分断エリアは受渡日の列で突き合わせる。1 つの CSV に何日分入っていてもよい
+ *   （同じ日が複数あれば後に読んだもの。フォルダは指定の順、フォルダの中は名前の順に読む）
+ * - 分断エリアだけがある日は、変換済みの入札カーブがあれば名前を付け直す（別々に変換したとき）
+ * - 入札カーブは --curves-from / --curves-to を指定したときだけ受渡日で絞る（既定はすべて）
+ * - 読めない CSV は飛ばして最後にまとめて知らせ、1 件も変換できなければエラーにする
  */
 async function convertDir(o: FetchOptions): Promise<Set<number>> {
-  const dir = o.fromDir!;
-  const names = (await readdir(dir, { recursive: true })).filter((f) => /\.csv$/i.test(f)).sort();
-  if (names.length === 0) throw new Error(`${dir} に CSV ファイルがありません`);
-  const read = async (name: string) => decodeCsvBytes(await readFile(path.join(dir, name))).text;
+  const files: { path: string; label: string }[] = [];
+  for (const dir of o.fromDirs) {
+    let names: string[];
+    try {
+      names = await readdir(dir, { recursive: true });
+    } catch (err) {
+      throw new Error(`${dir} を開けません（${(err as Error).message}）`);
+    }
+    for (const name of names.filter((f) => /\.csv$/i.test(f)).sort()) {
+      files.push({ path: path.join(dir, name), label: o.fromDirs.length > 1 ? path.join(dir, name) : name });
+    }
+  }
+  const where = o.fromDirs.join('、');
+  if (files.length === 0) throw new Error(`${where} に CSV ファイルがありません`);
+  const read = async (file: string) => decodeCsvBytes(await readFile(file)).text;
   const failed: string[] = [];
-  const fail = (name: string, err: unknown) => {
-    failed.push(name);
-    o.log(`${name}: 読み込めませんでした（${(err as Error).message}）`);
+  const fail = (label: string, err: unknown) => {
+    failed.push(label);
+    o.log(`${label}: 読み込めませんでした（${(err as Error).message}）`);
   };
+  const inRange = (day: number) => !o.curvesRangeSet || (day >= o.curvesFrom && day <= o.curvesTo);
 
   // 1 周目: 取引結果と分断エリアの名前を読み、入札カーブの CSV（大きいので 2 周目に 1 つずつ読む）を見つける
   const days: DayMap = new Map();
   const groups = new Map<number, AreaGroup[][]>();
-  const curveFiles: string[] = [];
-  for (const name of names) {
+  const curveFiles: typeof files = [];
+  for (const f of files) {
     try {
-      const kind = curveCsvKind(await readHead(path.join(dir, name)));
+      const kind = curveCsvKind(await readHead(f.path));
       if (kind === 'bidCurves') {
-        curveFiles.push(name);
+        curveFiles.push(f);
         continue;
       }
-      const text = await read(name);
+      const text = await read(f.path);
       if (kind === 'splittingAreas') {
         for (const [day, g] of parseSplittingAreasCsv(text)) groups.set(day, g);
       } else {
         const res = parseSpotCsv(text);
         for (const [day, vals] of res.days) days.set(day, vals);
-        o.log(`${name}: ${isoFromDay(res.firstDay)}〜${isoFromDay(res.lastDay)}（${res.rowCount} コマ）${res.warnings.length ? ` ※${res.warnings.join(' / ')}` : ''}`);
+        o.log(`${f.label}: ${isoFromDay(res.firstDay)}〜${isoFromDay(res.lastDay)}（${res.rowCount} コマ）${res.warnings.length ? ` ※${res.warnings.join(' / ')}` : ''}`);
       }
     } catch (err) {
-      fail(name, err);
+      fail(f.label, err);
     }
   }
   for (const [fy, fyDays] of splitByFiscalYear(days)) {
@@ -356,30 +373,51 @@ async function convertDir(o: FetchOptions): Promise<Set<number>> {
 
   // 2 周目: 入札カーブ
   const touched = new Set<number>();
+  const written = new Set<number>();
   let outside = 0;
   if (!o.curves && curveFiles.length > 0) o.log(`入札カーブの CSV ${curveFiles.length} 件は、--no-curves のため変換しません`);
-  for (const name of o.curves ? curveFiles : []) {
+  for (const f of o.curves ? curveFiles : []) {
     let parsed: Map<number, RawCurveDay>;
     try {
-      parsed = parseBidCurveCsv(await read(name));
+      parsed = parseBidCurveCsv(await read(f.path));
     } catch (err) {
-      fail(name, err);
+      fail(f.label, err);
       continue;
     }
     for (const [day, raw] of parsed) {
-      if (o.curvesRangeSet && (day < o.curvesFrom || day > o.curvesTo)) {
+      if (!inRange(day)) {
         outside++;
         continue;
       }
       const g = groups.get(day);
       const { bytes, slots } = await writeCurveDayFile(o.out, raw, g);
       touched.add(fiscalYearOfDay(day));
-      o.log(`${name}: ${isoFromDay(day)} の入札カーブ ${slots} コマ（${Math.round(bytes / 1024)} KB）${g ? '' : '・分断エリアの名前なし'}`);
+      written.add(day);
+      o.log(`${f.label}: ${isoFromDay(day)} の入札カーブ ${slots} コマ（${Math.round(bytes / 1024)} KB）${g ? '' : '・分断エリアの名前なし'}`);
     }
   }
+
+  // 分断エリアの名前だけがある日: 変換済みの入札カーブ（前に別に変換したもの）があれば、名前を付け直す
+  let renamed = 0;
+  let orphan = 0;
+  for (const [day, g] of o.curves ? groups : new Map<number, AreaGroup[][]>()) {
+    if (written.has(day) || !inRange(day)) continue;
+    const file = path.join(o.out, curveDayFile(day));
+    if (!existsSync(file)) {
+      orphan++;
+      continue;
+    }
+    const json = JSON.parse(await readFile(file, 'utf8')) as CurveDayFile;
+    if (applyGroupNames(json, g)) {
+      await writeFile(file, JSON.stringify(json));
+      renamed++;
+    }
+  }
+  if (renamed > 0) o.log(`分断エリアの名前を、変換済みの入札カーブ ${renamed} 日に付けました`);
+  if (orphan > 0) o.log(`分断エリアの CSV だけがあり、入札カーブが無い日: ${orphan} 日（その日の入札カーブを変換すると名前が付きます）`);
   if (outside > 0) o.log(`入札カーブ: --curves-from / --curves-to の範囲外の ${outside} 日は変換しませんでした`);
   if (failed.length > 0) o.log(`読み込めなかった CSV: ${failed.length} 件（${failed.join(', ')}）`);
-  if (days.size === 0 && touched.size === 0) throw new Error(`${dir} に変換できる CSV がありません`);
+  if (days.size === 0 && touched.size === 0 && renamed === 0) throw new Error(`${where} に変換できる CSV がありません`);
   return touched;
 }
 
@@ -489,7 +527,8 @@ async function fetchCurves(o: FetchOptions, dispatcher: EnvHttpProxyAgent, pace:
 
 export async function run(o: FetchOptions): Promise<Manifest> {
   let touched = new Set<number>();
-  if (o.fromDir) {
+  const local = o.fromDirs.length > 0;
+  if (local) {
     touched = await convertDir(o);
   } else {
     const dispatcher = new EnvHttpProxyAgent();
@@ -501,7 +540,7 @@ export async function run(o: FetchOptions): Promise<Manifest> {
       await dispatcher.close();
     }
   }
-  const manifest = await writeManifest(o.out, o.fromDir ? `local:${o.fromDir}` : JEPX_SPOT_PAGE, touched);
+  const manifest = await writeManifest(o.out, local ? `local:${o.fromDirs.join(' | ')}` : JEPX_SPOT_PAGE, touched);
   const first = manifest.files[0];
   const last = manifest.files[manifest.files.length - 1];
   if (manifest.files.length > 0) {

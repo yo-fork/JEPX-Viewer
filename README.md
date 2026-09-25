@@ -72,7 +72,7 @@ npm run dev     # http://localhost:5173 を開く
 | `--no-curves` | 入札カーブを取得しない |
 | `--force` | 取得済みの年度・日も取り直す |
 | `--keep-csv` | 元の CSV を `public/data/raw/`（入札カーブは `raw/curves/`）にも保存する |
-| `--from-dir <ディレクトリ>` | 手元の CSV（ダウンロード・保存しておいたもの）を変換する（通信しない。下記） |
+| `--from-dir <ディレクトリ>` | 手元の CSV（ダウンロード・保存しておいたもの）を変換する（通信しない。複数指定できる。下記） |
 | `--url-template <URL>` | 取得元 URL（`{fy}` が年度に置き換わる） |
 | `--curves-url-template <URL>` | 入札カーブの取得元 URL（`{dir}` が `spot_bid_curves` / `spot_splitting_areas`、`{file}` がファイル名に置き換わる） |
 | `--delay <ミリ秒>` | 連続取得の間隔（既定: 1500） |
@@ -82,11 +82,12 @@ npm run dev     # http://localhost:5173 を開く
 `--from-dir` では、フォルダ（サブフォルダも含む）の CSV を、ファイル名ではなく列名で「取引結果」「入札カーブ」「分断エリア」に見分けて変換します。
 
 - 入札カーブの受渡日は CSV の「電力受渡日」の列で決まるので、ファイル名は問いません。1 つの CSV に何日分入っていても構いません。
+- `--from-dir` は複数指定できます。入札カーブと分断エリアの CSV が別々のフォルダにあっても、受渡日で突き合わせます。別々に変換した場合も、あとから変換した分断エリアの名前を、変換済みの入札カーブに付け直します。
 - システムプライスの行の「分断エリア連番」は、JEPX の形式（空）でも `-1` でも構いません。
 - 入札カーブは、既定ではフォルダにある分をすべて変換します（`--curves-from` / `--curves-to` を指定したときだけ、その受渡日に絞ります）。
 - 読めない CSV は飛ばし、最後に一覧を表示します。
 
-例: `npm run fetch -- --from-dir D:\JEPX\入札カーブ`
+例: `npm run fetch -- --from-dir D:\JEPX\bid_curves --from-dir E:\archive\splitting_areas`
 
 ### 2. CSV ファイルを直接読み込む
 

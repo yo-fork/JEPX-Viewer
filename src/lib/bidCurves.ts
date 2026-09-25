@@ -488,6 +488,25 @@ export function encodeCurveDay(raw: RawCurveDay, groups?: AreaGroup[][], tol?: n
   return { format: CURVE_DAY_FORMAT, date: isoFromDay(raw.day), slots, metrics };
 }
 
+/**
+ * 変換済みの 1 日分のファイルに、分断エリアの名前を付け直す（入札カーブと分断エリアの CSV を別々に変換したとき）。
+ * 名前が変わったグループがあれば true
+ */
+export function applyGroupNames(file: CurveDayFile, groups: AreaGroup[][]): boolean {
+  let changed = false;
+  file.slots.forEach((slot, s) => {
+    if (!slot) return;
+    const named = new Map((groups[s] ?? []).map((g) => [g.id, g]));
+    slot.groups = slot.groups.map((g) => {
+      const n = g.id === SYSTEM_GROUP ? undefined : named.get(g.id);
+      if (!n || (n.label === g.label && n.areas.join() === g.areas.join())) return g;
+      changed = true;
+      return { id: g.id, label: n.label, areas: n.areas };
+    });
+  });
+  return changed;
+}
+
 export function decodeCurveDay(json: unknown): CurveDay {
   const file = json as CurveDayFile;
   if (!file || file.format !== CURVE_DAY_FORMAT || !Array.isArray(file.slots)) throw new Error('入札カーブのファイルの形式が不正です');

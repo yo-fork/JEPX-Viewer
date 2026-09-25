@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  applyGroupNames,
   buyAtOrAbove,
   buyPriceAt,
   buyVolumeAt,
@@ -242,6 +243,17 @@ describe('ファイル形式', () => {
     expect(metrics[CURVE_METRIC_INDEX.sell001 * SLOTS + 0]).toBeCloseTo(35177.9, 1);
     expect(Number.isNaN(metrics[CURVE_METRIC_INDEX.sell001 * SLOTS + 2])).toBe(true);
     expect(curveDayFile(day)).toBe('curves/2026/20260925.json');
+  });
+
+  it('変換済みのファイルに、あとから分断エリアの名前を付け直せる', () => {
+    const day = dayFromYmd(2025, 5, 3);
+    const targets = Array.from({ length: SLOTS }, (_, s) => ({ system: 10, volume: 30000, east: 10, west: s % 2 ? 12 : 10 }));
+    const { raw, groups } = syntheticCurveDay(day, targets);
+    const file = encodeCurveDay(raw);
+    expect(file.slots[1]!.groups[1].label).toBe(`分断エリア ${groups[1][0].id}`);
+    expect(applyGroupNames(file, groups)).toBe(true);
+    expect(file).toEqual(encodeCurveDay(raw, groups));
+    expect(applyGroupNames(file, groups)).toBe(false);
   });
 
   it('名前の無い分断エリアは番号で表す', () => {
