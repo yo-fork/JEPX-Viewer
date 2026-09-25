@@ -8,6 +8,8 @@
  *   単エリアが 1 つなら、そのエリアの約定価格で交わるように売りか買いの一方に一定量を足して補正する
  *   （システムプライスのカーブと分断エリアのカーブで扱いの違う入札があるらしく、引いただけでは少しずれるため）。
  *   単エリアが複数なら、エリアごとには分けられないので、合わせたカーブ（補正なし）にする。
+ *   引いても入札量がほとんど残らないとき（公表されている分断エリアのカーブに単エリアの入札も含まれているとみられるとき）は、
+ *   推定できないとする。
  */
 import { buyVolumeAt, buyVolumesAt, sellVolumeAt, sellVolumesAt, stepPrices, SYSTEM_GROUP, SYSTEM_LABEL, type CurveDay, type CurveGroup } from './bidCurves';
 import { AREA_KEYS, SERIES_LABEL, type AreaKey } from './series';
@@ -101,8 +103,9 @@ export interface AreaCurve {
    * group: 公表されている分断エリアのカーブ
    * single: 単エリアのカーブ（推定）
    * combined: 単エリアが複数のとき、それらを合わせたカーブ（推定）
+   * unavailable: 単エリアだが、システムプライスのカーブから引いても入札量がほとんど残らず推定できない（sell・buy は空）
    */
-  kind: 'system' | 'group' | 'single' | 'combined';
+  kind: 'system' | 'group' | 'single' | 'combined' | 'unavailable';
   sell: Float64Array;
   buy: Float64Array;
   /** カーブの名前（システムプライス、東北・東京・中部、北海道、北海道・四国 など） */
@@ -115,7 +118,19 @@ export interface AreaCurve {
   subtracted?: string[];
   /** single: 約定価格で交わるように足した側と量（約定価格が分からなければ無し） */
   correction?: { side: 'sell' | 'buy'; mw: number; price: number };
+  /** unavailable: 売り・買いの入札量の合計（MW）。システムプライスと、公表されている分断エリアの合計 */
+  totals?: { systemSell: number; systemBuy: number; publishedSell: number; publishedBuy: number };
 }
+
+/**
+ * 単エリアのカーブとみなす最小の量: システムプライスの入札量の合計に対する割合と下限（MW）。
+ * いちばん小さいエリアでも入札量は全国の数 % あるので、引いた残りがこれより少なければ推定できないとする
+ */
+export const MIN_RESIDUAL_SHARE = 0.005;
+const MIN_RESIDUAL_MW = 100;
+
+/** 階段状のカーブの入札量の合計（売りは最も高い価格、買いは最も安い価格での累積。どちらも最後の点） */
+const totalOf = (steps: ArrayLike<number>): number => (steps.length >= 2 ? steps[steps.length - 1] : 0);
 
 export const areaLabel = (a: AreaKey): string => SERIES_LABEL[a];
 
@@ -136,8 +151,22 @@ export function areaCurve(groups: readonly CurveGroup[], target: CurveTarget, pr
 
   const residual = subtractCurves(system, split.published);
   const subtracted = split.published.map((g) => g.label);
+  const label = split.singles.map(areaLabel).join('・');
+  const minMw = Math.max(MIN_RESIDUAL_MW, MIN_RESIDUAL_SHARE * Math.max(totalOf(system.sell), totalOf(system.buy)));
+  if (totalOf(residual.sell) < minMw || totalOf(residual.buy) < minMw) {
+    const sum = (f: (g: CurveGroup) => ArrayLike<number>) => split.published.reduce((v, g) => v + totalOf(f(g)), 0);
+    return {
+      kind: 'unavailable',
+      sell: new Float64Array(0),
+      buy: new Float64Array(0),
+      label,
+      areas: split.singles,
+      subtracted,
+      totals: { systemSell: totalOf(system.sell), systemBuy: totalOf(system.buy), publishedSell: sum((g) => g.sell), publishedBuy: sum((g) => g.buy) },
+    };
+  }
   if (split.singles.length > 1) {
-    return { kind: 'combined', ...residual, label: split.singles.map(areaLabel).join('・'), areas: split.singles, subtracted };
+    return { kind: 'combined', ...residual, label, areas: split.singles, subtracted };
   }
   const price = priceOf(target);
   if (!Number.isFinite(price)) return { kind: 'single', ...residual, label: areaLabel(target), areas: [target], subtracted };

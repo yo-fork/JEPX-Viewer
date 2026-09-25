@@ -355,6 +355,13 @@ export class CurvesView extends View {
       this.curve.setEmpty(`${when} の入札カーブがありません。`);
       return;
     }
+    const published = this.price(date, slot, target);
+    const priceText = Number.isFinite(published) ? `・約定価格 ${fmtPrice(published)} ${PRICE_UNIT}` : '';
+    this.curve.setSubtitle(`${when}・${targetText(target, ac)}${priceText}`);
+    if (ac.kind === 'unavailable') {
+      this.curve.setEmpty(unavailableText(target, ac));
+      return;
+    }
     const sellColor = seriesColor('sellBid', theme);
     const buyColor = seriesColor('buyBid', theme);
     const estimate = isEstimate(ac);
@@ -367,8 +374,6 @@ export class CurvesView extends View {
     const xmax = volumeMax([ac], ymax, ['sell', 'buy']);
     const plotWidth = this.curve.chart.getWidth() - 100;
 
-    const published = this.price(date, slot, target);
-    this.curve.setSubtitle(`${when}・${targetText(target, ac)}` + (Number.isFinite(published) ? `・約定価格 ${fmtPrice(published)} ${PRICE_UNIT}` : ''));
     this.renderMethod(ac, day, slot);
 
     const series: Record<string, unknown>[] = [
@@ -452,7 +457,9 @@ export class CurvesView extends View {
     this.methodNote.hidden = false;
     if (ac.kind !== 'combined') return;
     const name = areaLabel(target);
+    // 補正した推定を見られる（推定できる）時間帯だけ
     const near = aloneSlots(day, target)
+      .filter((s) => areaCurve(day.slots[s]!, target, (a) => this.price(day.day, s, a))?.kind === 'single')
       .sort((a, b) => Math.abs(a - slot) - Math.abs(b - slot))
       .slice(0, 12)
       .sort((a, b) => a - b);
@@ -511,10 +518,17 @@ export class CurvesView extends View {
       raw = state.curvePicks.map((p) => ({ name: pickName(p), curve: this.resolveCurve(cs, p.day, p.slot) }));
       subtitle = '選んだ日・時間帯';
     }
-    const present = raw.filter((r): r is { name: string; curve: AreaCurve } => r.curve !== null);
-    const missing = raw.length - present.length;
+    const present = raw.filter((r): r is { name: string; curve: AreaCurve } => r.curve !== null && r.curve.kind !== 'unavailable');
+    const unavailable = raw.filter((r) => r.curve?.kind === 'unavailable').length;
+    const missing = raw.length - present.length - unavailable;
     if (present.length === 0) {
-      this.comparison.setEmpty(mode === 'picks' && raw.length === 0 ? '比べる日・時間帯を選んで「追加」を押してください。' : '比べる入札カーブがありません。');
+      this.comparison.setEmpty(
+        mode === 'picks' && raw.length === 0
+          ? '比べる日・時間帯を選んで「追加」を押してください。'
+          : unavailable > 0
+            ? `比べる入札カーブがありません（${targetLabel(target)}の単エリアのカーブを推定できない ${unavailable} 件を除きました）。`
+            : '比べる入札カーブがありません。',
+      );
       return;
     }
     const colored = Math.min(present.length, MAX_COLORED);
@@ -526,7 +540,8 @@ export class CurvesView extends View {
       `${targetLabel(target)}・${SIDE_LABEL[side]}・${subtitle}・${theme === 'light' ? '色が濃い' : '色が明るい'}ほど${later}` +
         (grayed > 0 ? `（灰色は古い ${grayed} 日）` : '') +
         (items.some((it) => isEstimate(it.curve)) ? '・破線は推定' : '') +
-        (missing > 0 ? `・カーブの無い ${missing} 件を除く` : ''),
+        (missing > 0 ? `・カーブの無い ${missing} 件を除く` : '') +
+        (unavailable > 0 ? `・単エリアを推定できない ${unavailable} 件を除く` : ''),
     );
 
     const crosses = items.map((it) => referencePrice(it.curve));
@@ -742,7 +757,21 @@ function targetText(target: CurveTarget, ac: AreaCurve): string {
       return `${name}（単エリア・推定）`;
     case 'combined':
       return `${name}（単エリア ${ac.areas.length} つを合わせた推定: ${ac.label}）`;
+    case 'unavailable':
+      return `${name}（単エリア・推定できません）`;
   }
+}
+
+/** 単エリアを推定できないときの説明（引く前後の入札量の合計を添えて、なぜ推定できないかが分かるようにする） */
+function unavailableText(target: CurveTarget, ac: AreaCurve): string {
+  const t = ac.totals!;
+  const gw = (mw: number) => `${fmtNum(mw / 1000, 1)} GW`;
+  return (
+    `${targetLabel(target)}のカーブは推定できませんでした。システムプライスのカーブから、公表されている分断エリア（${(ac.subtracted ?? []).join('、')}）のカーブを引くと、` +
+    `売り・買いの入札量がほとんど残りません（入札量の合計: システムプライスは売り ${gw(t.systemSell)}・買い ${gw(t.systemBuy)}、` +
+    `公表されている分断エリアは売り ${gw(t.publishedSell)}・買い ${gw(t.publishedBuy)}）。` +
+    `この時間帯は、公表されている分断エリアのカーブに${ac.label}の入札も含まれているとみられます。`
+  );
 }
 
 /** 比較の図で、それぞれのカーブがどのカーブかの短い説明 */
@@ -756,6 +785,8 @@ function curveNote(ac: AreaCurve): string {
       return '単エリア・推定';
     case 'combined':
       return `${ac.label}の合算・推定`;
+    case 'unavailable':
+      return '推定できません';
   }
 }
 

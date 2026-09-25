@@ -77,6 +77,21 @@ describe('areaCurve', () => {
     expect(c.sell.length).toBeGreaterThan(0);
   });
 
+  it('公表されている分断エリアのカーブに単エリアの入札も含まれていて、引いても残らないときは推定できないとする', () => {
+    const gs0 = slotGroups({ system: 10, volume: 30000, areas: { ...base, hokkaido: 12, kyushu: 9, shikoku: 5 } });
+    const system = gs0.find((g) => g.id === SYSTEM_GROUP)!;
+    const rest: AreaKey[] = ['hokkaido', 'tohoku', 'tokyo', 'chubu', 'hokuriku', 'kansai', 'chugoku', 'kyushu'];
+    // 四国以外のまとまりとして、システムプライスと同じカーブが公表されている
+    const gs: CurveGroup[] = [system, { id: 0, label: '北海道・東北・東京・中部・北陸・関西・中国・九州', areas: rest, sell: system.sell, buy: system.buy }];
+    const c = areaCurve(gs, 'shikoku', () => 8.74)!;
+    expect(c.kind).toBe('unavailable');
+    expect([c.sell.length, c.buy.length, c.label]).toEqual([0, 0, '四国']);
+    const total = (a: Float64Array) => a[a.length - 1];
+    expect(c.totals).toEqual({ systemSell: total(system.sell), systemBuy: total(system.buy), publishedSell: total(system.sell), publishedBuy: total(system.buy) });
+    // 分断エリアに入るエリアは、これまでどおりそのカーブ
+    expect(areaCurve(gs, 'tokyo', () => 10)!.kind).toBe('group');
+  });
+
   it('分断エリアの名前が無ければ、エリアを決められないのでシステムプライスのカーブにする', () => {
     const gs = slotGroups({ system: 10, volume: 30000, areas: { ...base, hokkaido: 12, kyushu: 9 } }).map((g) => (g.id === SYSTEM_GROUP ? g : { ...g, areas: [] }));
     expect(slotSplit(gs)).toEqual({ kind: 'unnamed' });
