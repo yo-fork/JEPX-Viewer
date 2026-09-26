@@ -16,18 +16,70 @@ import {
   parseBidCurveCsv,
   parseSplittingAreasCsv,
 } from '../src/lib/bidCurves';
+import { toCsv } from '../src/lib/csv';
 import { decodeFyFile, type Manifest } from '../src/lib/dataFile';
-import { dayFromYmd } from '../src/lib/dates';
+import { dayFromYmd, formatDay } from '../src/lib/dates';
 import { generateDemoDays } from '../src/lib/demo';
 import { syntheticCurveDay } from '../src/lib/demoCurves';
-import { formatSpotCsv, type DayMap } from '../src/lib/jepxCsv';
-import { SERIES_INDEX, SLOTS } from '../src/lib/series';
+import { formatSpotCsv, newDayValues, type DayMap } from '../src/lib/jepxCsv';
+import { SENSITIVITY_KEYS, SENSITIVITY_SIZES, sensitivityKey, SERIES_INDEX, SLOTS, type SeriesKey } from '../src/lib/series';
 
 /** 各年度の先頭 3 日ぶんの合成データ（Shift_JIS の CSV として配信する） */
 const FIXTURES = new Map<number, DayMap>([
   [2023, generateDemoDays(dayFromYmd(2023, 4, 1), dayFromYmd(2023, 4, 3), 1)],
   [2024, generateDemoDays(dayFromYmd(2024, 4, 1), dayFromYmd(2024, 4, 3), 2)],
 ]);
+
+const round2 = (v: number) => Math.round(v * 100) / 100;
+/** 価格感応度の CSV（virtualprice_{年度}.csv）の列と系列 */
+const SENS_COLUMNS: [string, SeriesKey][] = [
+  ['システムプライス', 'system'],
+  ...SENSITIVITY_SIZES.flatMap((mw): [string, SeriesKey][] => [
+    [`売${mw}MW`, sensitivityKey('sell', mw)],
+    [`買${mw}MW`, sensitivityKey('buy', mw)],
+  ]),
+];
+
+/** 合成データのシステムプライスから作った価格感応度。取引結果の無い翌日の行も入れる（取引結果のある日にだけ入ることを確かめる） */
+const SENS_FIXTURES = new Map<number, DayMap>(
+  [...FIXTURES].map(([fy, days]) => {
+    const out: DayMap = new Map();
+    const last = Math.max(...days.keys());
+    for (const [day, vals] of [...days, [last + 1, days.get(last)!] as const]) {
+      const v = newDayValues();
+      for (let s = 0; s < SLOTS; s++) {
+        const sys = vals[SERIES_INDEX.system * SLOTS + s];
+        v[SERIES_INDEX.system * SLOTS + s] = sys;
+        SENSITIVITY_SIZES.forEach((mw, i) => {
+          v[SERIES_INDEX[sensitivityKey('sell', mw)] * SLOTS + s] = Math.max(0.01, round2(sys - 0.3 * (i + 1)));
+          v[SERIES_INDEX[sensitivityKey('buy', mw)] * SLOTS + s] = round2(sys + 0.4 * (i + 1));
+        });
+      }
+      out.set(day, v);
+    }
+    return [fy, out];
+  }),
+);
+
+function formatSensitivityCsv(days: DayMap): string {
+  const rows: (string | number)[][] = [['年月日', '時刻コード', ...SENS_COLUMNS.map((c) => c[0])]];
+  for (const day of [...days.keys()].sort((a, b) => a - b)) {
+    const vals = days.get(day)!;
+    for (let s = 0; s < SLOTS; s++) rows.push([formatDay(day), s + 1, ...SENS_COLUMNS.map(([, k]) => vals[SERIES_INDEX[k] * SLOTS + s])]);
+  }
+  return toCsv(rows);
+}
+
+/** 取引結果に、その日の価格感応度を重ねた値（年度ファイルに入るはずの値） */
+function withSensitivity(fy: number, day: number, vals: Float64Array): Float64Array {
+  const out = Float64Array.from(vals);
+  const sens = SENS_FIXTURES.get(fy)!.get(day)!;
+  for (const k of SENSITIVITY_KEYS) out.set(sens.subarray(SERIES_INDEX[k] * SLOTS, (SERIES_INDEX[k] + 1) * SLOTS), SERIES_INDEX[k] * SLOTS);
+  return out;
+}
+
+const hasSensitivityValues = (vals: Float64Array | undefined) =>
+  !!vals && SENSITIVITY_KEYS.some((k) => vals.subarray(SERIES_INDEX[k] * SLOTS, (SERIES_INDEX[k] + 1) * SLOTS).some((v) => !Number.isNaN(v)));
 
 /** 合成データの価格の近くで交わる入札カーブ */
 function curveFixture(day: number) {
@@ -44,17 +96,27 @@ let server: Server;
 let baseUrl = '';
 let workdir = '';
 const requests: string[] = [];
+/** 取得元の URL（試験用のサーバー） */
+const urls = () => ({
+  urlTemplate: `${baseUrl}/csv_read.php?file=spot_summary_{fy}.csv`,
+  curvesUrlTemplate: `${baseUrl}/csv_read.php?dir={dir}&file={file}`,
+  sensitivityUrlTemplate: `${baseUrl}/csv_read.php?dir=virtualprice&file=virtualprice_{fy}.csv`,
+});
 
 beforeAll(async () => {
   workdir = await mkdtemp(path.join(tmpdir(), 'jepx-viewer-'));
   server = createServer((req, res) => {
     requests.push(req.url ?? '');
     const summary = /spot_summary_(\d{4})\.csv/.exec(req.url ?? '');
+    const sens = /virtualprice_(\d{4})\.csv/.exec(req.url ?? '');
     const curve = /(spot_bid_curves|spot_splitting_areas)_(\d{8})\.csv/.exec(req.url ?? '');
     let csv: string | null = null;
     if (summary) {
       const days = FIXTURES.get(Number(summary[1]));
       if (days) csv = formatSpotCsv(days);
+    } else if (sens) {
+      const days = SENS_FIXTURES.get(Number(sens[1]));
+      if (days) csv = formatSensitivityCsv(days);
     } else if (curve) {
       const f = curveFixture(dayFromYmd(Number(curve[2].slice(0, 4)), Number(curve[2].slice(4, 6)), Number(curve[2].slice(6))));
       if (f) csv = curve[1] === 'spot_bid_curves' ? formatBidCurveCsv(f.raw) : formatSplittingAreasCsv(f.raw.day, f.groups);
@@ -77,22 +139,26 @@ afterAll(async () => {
 });
 
 describe('データ取得スクリプト', () => {
-  it('年度別 CSV を取得して年度ファイルと manifest を作る', async () => {
+  it('年度別 CSV を取得して年度ファイルと manifest を作る（価格感応度は取引結果のある日に入れる）', async () => {
     const out = path.join(workdir, 'data');
     const logs: string[] = [];
     const manifest = await run({
       ...defaultOptions(),
+      ...urls(),
       from: 2022,
       to: 2024,
       out,
-      urlTemplate: `${baseUrl}/csv_read.php?file=spot_summary_{fy}.csv`,
       delayMs: 0,
       curves: false,
       log: (m) => logs.push(m),
     });
     expect(requests.some((r) => r.includes('spot_summary_2022.csv'))).toBe(true);
+    expect(requests.some((r) => r.includes('dir=virtualprice&file=virtualprice_2024.csv'))).toBe(true);
+    // 取引結果の無い年度は、価格感応度を取りに行かない
+    expect(requests.some((r) => r.includes('virtualprice_2022.csv'))).toBe(false);
     expect(requests.some((r) => r.includes('spot_bid_curves'))).toBe(false);
     expect(logs.some((l) => l.startsWith('2022年度') && l.includes('データがありません'))).toBe(true);
+    expect(logs).toContain('2024年度: 2024-04-01〜2024-04-03（3 日）を保存（価格感応度 3 日）');
     expect(manifest.files.map((f) => [f.fy, f.firstDate, f.lastDate, f.days])).toEqual([
       [2023, '2023-04-01', '2023-04-03', 3],
       [2024, '2024-04-01', '2024-04-03', 3],
@@ -101,7 +167,46 @@ describe('データ取得スクリプト', () => {
     const onDisk = JSON.parse(await readFile(path.join(out, 'manifest.json'), 'utf8')) as Manifest;
     expect(onDisk.files).toHaveLength(2);
     const back = decodeFyFile(JSON.parse(await readFile(path.join(out, 'spot', 'fy2024.json'), 'utf8')));
-    for (const [day, vals] of FIXTURES.get(2024)!) expect(back.get(day)).toEqual(vals);
+    for (const [day, vals] of FIXTURES.get(2024)!) expect(back.get(day)).toEqual(withSensitivity(2024, day, vals));
+    expect(back.has(dayFromYmd(2024, 4, 4))).toBe(false);
+  });
+
+  it('前の版で取得した年度ファイルには、価格感応度だけを取得して足す（2 回目からは取りに行かない）', async () => {
+    const out = path.join(workdir, 'upgrade');
+    const opts = { ...defaultOptions(), ...urls(), from: 2023, to: 2023, out, delayMs: 0, curves: false };
+    await run({ ...opts, sensitivity: false, log: () => {} });
+    const file = () => readFile(path.join(out, 'spot', 'fy2023.json'), 'utf8').then((t) => decodeFyFile(JSON.parse(t)));
+    expect(hasSensitivityValues((await file()).get(dayFromYmd(2023, 4, 1)))).toBe(false);
+
+    // 前年度より前の年度は取得済みならスキップするが、価格感応度が無ければそれだけ取得する
+    const before = requests.length;
+    const logs: string[] = [];
+    await run({ ...opts, log: (m) => logs.push(m) });
+    expect(requests.slice(before).map((r) => /(spot_summary|virtualprice)_\d{4}/.exec(r)?.[0])).toEqual(['virtualprice_2023']);
+    expect(logs).toContain('2023年度: 取得済みの取引結果に、価格感応度（3 日）を足しました');
+    for (const [day, vals] of FIXTURES.get(2023)!) expect((await file()).get(day)).toEqual(withSensitivity(2023, day, vals));
+
+    const again = requests.length;
+    const later: string[] = [];
+    await run({ ...opts, log: (m) => later.push(m) });
+    expect(requests.length).toBe(again);
+    expect(later).toContain('2023年度: 取得済みのためスキップ');
+  });
+
+  it('価格感応度を取得できなくても取引結果は保存し、前に取得した価格感応度は残す', async () => {
+    const out = path.join(workdir, 'no-sens');
+    const opts = { ...defaultOptions(), ...urls(), from: 2024, to: 2024, out, delayMs: 0, curves: false, force: true };
+    const first: string[] = [];
+    await run({ ...opts, sensitivityUrlTemplate: `${baseUrl}/missing/{fy}.csv`, log: (m) => first.push(m) });
+    expect(first).toContain('2024年度: 2024-04-01〜2024-04-03（3 日）を保存（価格感応度 0 日）');
+    const fy2024 = () => readFile(path.join(out, 'spot', 'fy2024.json'), 'utf8').then((t) => decodeFyFile(JSON.parse(t)));
+    expect(hasSensitivityValues((await fy2024()).get(dayFromYmd(2024, 4, 1)))).toBe(false);
+
+    await run({ ...opts, log: () => {} });
+    const logs: string[] = [];
+    await run({ ...opts, sensitivity: false, log: (m) => logs.push(m) });
+    expect(logs).toContain('2024年度: 2024-04-01〜2024-04-03（3 日）を保存（価格感応度 3 日。前に取得したもの）');
+    for (const [day, vals] of FIXTURES.get(2024)!) expect((await fy2024()).get(day)).toEqual(withSensitivity(2024, day, vals));
   });
 
   it('受渡日ごとの入札カーブを取得し、1 日分のファイル・指標の年度ファイル・一覧を作る', async () => {
@@ -109,11 +214,10 @@ describe('データ取得スクリプト', () => {
     const logs: string[] = [];
     const opts = {
       ...defaultOptions(),
+      ...urls(),
       from: 2024,
       to: 2024,
       out,
-      urlTemplate: `${baseUrl}/csv_read.php?file=spot_summary_{fy}.csv`,
-      curvesUrlTemplate: `${baseUrl}/csv_read.php?dir={dir}&file={file}`,
       curvesFrom: dayFromYmd(2024, 3, 31),
       curvesTo: dayFromYmd(2024, 4, 3),
       delayMs: 0,
@@ -143,22 +247,21 @@ describe('データ取得スクリプト', () => {
     expect(again.curves!.dates).toHaveLength(3);
   });
 
-  it('--keep-csv では、入札カーブと分断エリアの CSV も raw/curves に保存する（あとで --from-dir で変換し直せる）', async () => {
+  it('--keep-csv では、価格感応度・入札カーブ・分断エリアの CSV も raw に保存する（あとで --from-dir で変換し直せる）', async () => {
     const out = path.join(workdir, 'keep');
     await run({
       ...defaultOptions(),
+      ...urls(),
       from: 2024,
       to: 2024,
       out,
       keepCsv: true,
-      urlTemplate: `${baseUrl}/csv_read.php?file=spot_summary_{fy}.csv`,
-      curvesUrlTemplate: `${baseUrl}/csv_read.php?dir={dir}&file={file}`,
       curvesFrom: dayFromYmd(2024, 4, 1),
       curvesTo: dayFromYmd(2024, 4, 1),
       delayMs: 0,
       log: () => {},
     });
-    for (const f of ['spot_summary_2024.csv', 'curves/spot_bid_curves_20240401.csv', 'curves/spot_splitting_areas_20240401.csv']) {
+    for (const f of ['spot_summary_2024.csv', 'virtualprice_2024.csv', 'curves/spot_bid_curves_20240401.csv', 'curves/spot_splitting_areas_20240401.csv']) {
       expect(existsSync(path.join(out, 'raw', f))).toBe(true);
     }
   });
@@ -176,6 +279,45 @@ describe('データ取得スクリプト', () => {
     expect(manifest.source).toBe(`local:${csvDir}`);
     expect(manifest.curves?.dates).toEqual(['20230402']);
     expect(existsSync(path.join(out, 'curves', 'fy2023.json'))).toBe(true);
+  });
+
+  it('--from-dir: 価格感応度の CSV は取引結果のある日に重ね、取引結果の CSV が無い年度は変換済みの年度ファイルに足す', async () => {
+    const sjis = (csv: string) => iconv.encode(csv, 'Shift_JIS');
+    const both = path.join(workdir, 'sens-both');
+    await mkdir(both, { recursive: true });
+    // 名前の順で価格感応度を先に読む（後から読んだ取引結果で、価格感応度を消さない）
+    await writeFile(path.join(both, 'a_virtualprice_2024.csv'), sjis(formatSensitivityCsv(SENS_FIXTURES.get(2024)!)));
+    await writeFile(path.join(both, 'b_spot_summary_2024.csv'), sjis(formatSpotCsv(FIXTURES.get(2024)!)));
+    const out = path.join(workdir, 'sens-out');
+    const logs: string[] = [];
+    const manifest = await run({ ...defaultOptions(), out, fromDirs: [both], log: (m) => logs.push(m) });
+    // 取引結果の無い翌日（価格感応度だけの行）は入れない
+    expect(manifest.files.map((x) => [x.fy, x.days])).toEqual([[2024, 3]]);
+    const fy2024 = (dir: string) => readFile(path.join(dir, 'spot', 'fy2024.json'), 'utf8').then((t) => decodeFyFile(JSON.parse(t)));
+    for (const [day, vals] of FIXTURES.get(2024)!) expect((await fy2024(out)).get(day)).toEqual(withSensitivity(2024, day, vals));
+    expect(logs.some((l) => l.includes('fy2024.json') && l.includes('価格感応度 3 日'))).toBe(true);
+
+    // 取引結果だけを変換してから、価格感応度だけを変換する
+    const spotOnly = path.join(workdir, 'sens-spot');
+    const sensOnly = path.join(workdir, 'sens-only');
+    await mkdir(spotOnly, { recursive: true });
+    await mkdir(sensOnly, { recursive: true });
+    await writeFile(path.join(spotOnly, 'spot_summary_2024.csv'), sjis(formatSpotCsv(FIXTURES.get(2024)!)));
+    await writeFile(path.join(sensOnly, 'virtualprice_2023.csv'), sjis(formatSensitivityCsv(SENS_FIXTURES.get(2023)!)));
+    await writeFile(path.join(sensOnly, 'virtualprice_2024.csv'), sjis(formatSensitivityCsv(SENS_FIXTURES.get(2024)!)));
+    const apart = path.join(workdir, 'sens-apart');
+    await run({ ...defaultOptions(), out: apart, fromDirs: [spotOnly], log: () => {} });
+    const later: string[] = [];
+    const m2 = await run({ ...defaultOptions(), out: apart, fromDirs: [sensOnly], log: (m) => later.push(m) });
+    expect(later).toContain('2023年度: 取引結果が無いため、価格感応度だけでは変換しません（取引結果の CSV も指定してください）');
+    expect(m2.files.map((x) => x.fy)).toEqual([2024]);
+    for (const [day, vals] of FIXTURES.get(2024)!) expect((await fy2024(apart)).get(day)).toEqual(withSensitivity(2024, day, vals));
+
+    // 取引結果を変換し直しても、変換済みの価格感応度は残す
+    const again: string[] = [];
+    await run({ ...defaultOptions(), out: apart, fromDirs: [spotOnly], log: (m) => again.push(m) });
+    expect(again.some((l) => l.includes('fy2024.json') && l.includes('変換済みの価格感応度 3 日を残す'))).toBe(true);
+    for (const [day, vals] of FIXTURES.get(2024)!) expect((await fy2024(apart)).get(day)).toEqual(withSensitivity(2024, day, vals));
   });
 
   it('--from-dir は名前の違う CSV・サブフォルダ・複数日の CSV・分断エリア連番が -1 のシステムプライスも変換する', async () => {
@@ -317,6 +459,8 @@ describe('データ取得スクリプト', () => {
     expect(o.curvesRangeSet).toBe(false);
     expect(o.fromDirs).toEqual([]);
     expect(parseArgs(['--from-dir', 'a', '--from-dir', 'b']).fromDirs).toEqual(['a', 'b']);
+    expect(o.sensitivity).toBe(true);
+    expect(parseArgs(['--no-sensitivity', '--sensitivity-url-template', 'http://x/{fy}.csv'])).toMatchObject({ sensitivity: false, sensitivityUrlTemplate: 'http://x/{fy}.csv' });
     const d = defaultOptions();
     expect(d.curvesTo - d.curvesFrom + 1).toBe(90);
     expect(() => parseArgs(['--from', '2020', '--to', '2016'])).toThrow();

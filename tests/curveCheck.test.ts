@@ -5,13 +5,14 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { checkCurves, parseCheckArgs } from '../scripts/check-curves';
 import { defaultOptions, run } from '../scripts/fetch-jepx';
 import type { SpotBids } from '../src/lib/areaCurves';
-import { decodeCurveDay, encodeCurveDay, formatBidCurveCsv, formatSplittingAreasCsv, SYSTEM_GROUP, type CurveGroup, type RawCurveDay } from '../src/lib/bidCurves';
+import { crossing, decodeCurveDay, encodeCurveDay, formatBidCurveCsv, formatSplittingAreasCsv, SYSTEM_GROUP, type CurveGroup, type RawCurveDay } from '../src/lib/bidCurves';
+import { toCsv } from '../src/lib/csv';
 import { checkSlot, isFlat, median, share, slotKind, varies } from '../src/lib/curveCheck';
-import { dayFromYmd, isoFromDay } from '../src/lib/dates';
+import { dayFromYmd, formatDay, isoFromDay } from '../src/lib/dates';
 import { generateDemoDays } from '../src/lib/demo';
 import { syntheticCurveDay, type SlotTarget } from '../src/lib/demoCurves';
 import { formatSpotCsv } from '../src/lib/jepxCsv';
-import { AREA_KEYS, SERIES_INDEX, SLOTS, type AreaKey, type PriceKey } from '../src/lib/series';
+import { AREA_KEYS, SENSITIVITY_SIZES, SERIES_INDEX, SLOTS, type AreaKey, type PriceKey } from '../src/lib/series';
 
 const base = { tohoku: 12, tokyo: 12, chubu: 9, hokuriku: 9, kansai: 9, chugoku: 9, shikoku: 9 };
 const lastOf = (a: ArrayLike<number>) => (a.length >= 2 ? a[a.length - 1] : 0);
@@ -93,6 +94,8 @@ describe('npm run check:curves', () => {
     const csv = path.join(dir, 'csv');
     await mkdir(csv);
     const days = generateDemoDays(dayFromYmd(2026, 9, 24), dayFromYmd(2026, 9, 26), 7);
+    // 価格感応度の公表値（ここでは間引く前のシステムプライスのカーブをずらした価格）
+    const sens: (string | number)[][] = [['年月日', '時刻コード', 'システムプライス', ...SENSITIVITY_SIZES.flatMap((mw) => [`売${mw}MW`, `買${mw}MW`])]];
     for (const [day, vals] of days) {
       const at = (k: keyof typeof SERIES_INDEX, s: number) => vals[SERIES_INDEX[k] * SLOTS + s];
       const targets = Array.from({ length: SLOTS }, (_, s) => ({ system: at('system', s), volume: at('volume', s) / 500, areas: Object.fromEntries(AREA_KEYS.map((a) => [a, at(a, s)])) }));
@@ -103,12 +106,15 @@ describe('npm run check:curves', () => {
         vals[SERIES_INDEX.sellBid * SLOTS + s] = Math.round(Math.max(...rows.map((r) => r.sell))) * 500;
         vals[SERIES_INDEX.buyBid * SLOTS + s] = Math.round(Math.max(...rows.map((r) => r.buy))) * 500;
         for (const k of ['sellBlockBid', 'sellBlockVolume', 'buyBlockBid', 'buyBlockVolume'] as const) vals[SERIES_INDEX[k] * SLOTS + s] = 0;
+        const at = (mw: number) => crossing(rows, mw)?.price ?? '';
+        sens.push([formatDay(day), s + 1, vals[SERIES_INDEX.system * SLOTS + s], ...SENSITIVITY_SIZES.flatMap((mw) => [at(-mw), at(mw)])]);
       }
       const ymd = isoFromDay(day).replace(/-/g, '');
       await writeFile(path.join(csv, `spot_bid_curves_${ymd}.csv`), formatBidCurveCsv(raw));
       await writeFile(path.join(csv, `spot_splitting_areas_${ymd}.csv`), formatSplittingAreasCsv(day, groups));
     }
     await writeFile(path.join(csv, 'spot_summary_2026.csv'), formatSpotCsv(days));
+    await writeFile(path.join(csv, 'virtualprice_2026.csv'), toCsv(sens));
     await run({ ...defaultOptions(), fromDirs: [csv], out: path.join(dir, 'out'), log: () => {} });
   });
   afterAll(async () => {
@@ -124,6 +130,11 @@ describe('npm run check:curves', () => {
     expect(text).toMatch(/推定できた \d+・推定できない（引いた差が価格によらずほぼ一定）0/);
     expect(text).toMatch(/補正しなくても約定価格で売りと買いが釣り合う: \d+ コマ/);
     expect(text).not.toContain('前の版で変換したファイル');
+    // 価格感応度: 公表値（ここでは間引く前のカーブをずらした価格）と、間引いたカーブをずらした目安はほぼ同じ
+    expect(text).toContain('■ 価格感応度: JEPX の公表値と');
+    expect(text).toContain('公表値のある 144 コマ');
+    expect(text).toMatch(/買い \+0\.5GW\s+144\s/);
+    expect(text).toMatch(/買い −5GW\s+144\s/);
     // 1 日だけのときはコマごとの一覧も出す
     const day = (await checkCurves(parseCheckArgs(['--data', path.join(dir, 'out'), '--date', '2026-09-26']))).join('\n');
     expect(day).toContain('■ コマごと');
@@ -140,6 +151,8 @@ describe('npm run check:curves', () => {
     expect(text).toContain(`（${n} コマ目）: 単エリア 1 つ`);
     expect(text).toContain('分断エリアの合計 − システム');
     expect(text).toContain('取引結果（MW）');
+    expect(text).toContain('価格感応度（円/kWh。目安はシステムプライスのカーブをずらしたもの）');
+    expect(text).toMatch(/約定価格が変わる買いの増減: 0\.01 円になる .+・20 円を超える .+・売りが尽きる \+[\d,.]+ GW/);
     expect(text).toContain('ブロック入札の約定の違い: システムプライスの計算と市場分断の計算とで同じだけ約定');
     expect(text).toContain('システムプライス − 分断エリアの合計（MW。間引く前のカーブから）');
     expect(text).toMatch(/推定した.+のカーブ: ブロック入札の約定の違いを差し引き、売り・買いに [\d,]+ MW を足すと、交点は/);

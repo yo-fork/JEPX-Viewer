@@ -119,6 +119,25 @@ describe('JEPX スポット CSV', () => {
     expect(res.warnings.some((w) => w.includes('1 行'))).toBe(true);
   });
 
+  it('価格感応度の CSV（virtualprice）を読む（エリアプライスが無くても知らせない）', () => {
+    const text = [
+      '年月日,時刻コード,システムプライス,売500MW,買500MW,売1000MW,買1000MW,売5000MW,買5000MW',
+      '2026/09/23,25,10.06,9.84,10.26,9.78,10.40,7.79,12.23',
+      '2026/09/23,26,10.13,10.00,10.35,9.83,10.54,8.01,12.40',
+    ].join('\r\n');
+    const res = parseSpotCsv(iconv.decode(iconv.encode(text, 'Shift_JIS'), 'Shift_JIS'));
+    expect(res.sensitivity).toBe(true);
+    expect(res.warnings).toEqual([]);
+    expect(res.columns).toEqual(['system', 'vpSell500', 'vpBuy500', 'vpSell1000', 'vpBuy1000', 'vpSell5000', 'vpBuy5000']);
+    const vals = res.days.get(dayFromYmd(2026, 9, 23))!;
+    expect(vals[SERIES_INDEX.system * SLOTS + 24]).toBe(10.06);
+    expect(vals[SERIES_INDEX.vpBuy1000 * SLOTS + 24]).toBe(10.4);
+    expect(vals[SERIES_INDEX.vpSell5000 * SLOTS + 25]).toBe(8.01);
+    expect(vals[SERIES_INDEX.tokyo * SLOTS + 24]).toBeNaN();
+    // 取引結果の CSV は価格感応度ではない
+    expect(parseSpotCsv(jepxLikeCsv([row('2024/04/01', 1, '10.00')])).sensitivity).toBe(false);
+  });
+
   it('JEPX 以外の CSV はエラーにする', () => {
     expect(() => parseSpotCsv('a,b,c\n1,2,3\n')).toThrow(SpotCsvFormatError);
   });

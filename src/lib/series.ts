@@ -20,13 +20,23 @@ export type PriceKey = 'system' | AreaKey;
 export type VolumeKey = 'sellBid' | 'buyBid' | 'volume';
 /** ブロック入札の量（取引結果の付帯列。入札カーブの単エリアの推定に使う） */
 export type BlockKey = 'sellBlockBid' | 'sellBlockVolume' | 'buyBlockBid' | 'buyBlockVolume';
-export type SeriesKey = PriceKey | VolumeKey | BlockKey;
+/** 価格感応度で足す入札の量（MW） */
+export const SENSITIVITY_SIZES = [500, 1000, 5000] as const;
+export type SensitivitySize = (typeof SENSITIVITY_SIZES)[number];
+/**
+ * JEPX が公表している価格感応度: 48 コマすべてに、0.01 円の売り（sell）か 999 円の買い（buy）を足して約定計算をやり直したときの
+ * システムプライス（2021 年度から。ブロック入札の約定も判定し直している）
+ */
+export type SensitivityKey = `vp${'Sell' | 'Buy'}${SensitivitySize}`;
+export type SeriesKey = PriceKey | VolumeKey | BlockKey | SensitivityKey;
 
 export const AREA_KEYS: AreaKey[] = AREAS.map((a) => a.key);
 export const PRICE_KEYS: PriceKey[] = ['system', ...AREA_KEYS];
 export const VOLUME_KEYS: VolumeKey[] = ['sellBid', 'buyBid', 'volume'];
 export const BLOCK_KEYS: BlockKey[] = ['sellBlockBid', 'sellBlockVolume', 'buyBlockBid', 'buyBlockVolume'];
-export const SERIES_KEYS: SeriesKey[] = [...PRICE_KEYS, ...VOLUME_KEYS, ...BLOCK_KEYS];
+export const sensitivityKey = (side: 'sell' | 'buy', mw: SensitivitySize): SensitivityKey => `vp${side === 'sell' ? 'Sell' : 'Buy'}${mw}`;
+export const SENSITIVITY_KEYS: SensitivityKey[] = SENSITIVITY_SIZES.flatMap((mw) => [sensitivityKey('sell', mw), sensitivityKey('buy', mw)]);
+export const SERIES_KEYS: SeriesKey[] = [...PRICE_KEYS, ...VOLUME_KEYS, ...BLOCK_KEYS, ...SENSITIVITY_KEYS];
 export const SERIES_COUNT = SERIES_KEYS.length;
 
 /** 1 日あたりのコマ数（30 分 × 48） */
@@ -47,6 +57,12 @@ export const SERIES_LABEL: Record<SeriesKey, string> = {
   sellBlockVolume: '売りブロック約定総量',
   buyBlockBid: '買いブロック入札総量',
   buyBlockVolume: '買いブロック約定総量',
+  ...(Object.fromEntries(
+    SENSITIVITY_SIZES.flatMap((mw) => [
+      [sensitivityKey('sell', mw), `売り ${mw / 1000}GW を足したときのシステムプライス（価格感応度）`],
+      [sensitivityKey('buy', mw), `買い ${mw / 1000}GW を足したときのシステムプライス（価格感応度）`],
+    ]),
+  ) as Record<SensitivityKey, string>),
 };
 
 /** チップや凡例用の短い表記 */

@@ -152,6 +152,12 @@ const SERIES_SLOT: Record<SeriesKey, number> = {
   sellBlockVolume: 0,
   buyBlockBid: 1,
   buyBlockVolume: 1,
+  vpSell500: 0,
+  vpSell1000: 0,
+  vpSell5000: 0,
+  vpBuy500: 1,
+  vpBuy1000: 1,
+  vpBuy5000: 1,
 };
 
 export function seriesColor(key: SeriesKey, theme: ThemeName): string {

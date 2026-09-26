@@ -9,6 +9,7 @@
  *
  * 市場分断したときの入札カーブの作り（分断エリアのカーブに連系線でやりとりする量が入っているか、システムプライスのカーブに
  * 単エリアの入札が入っているか）と、単エリアのカーブの推定が約定価格で交わるかを、手元のデータで確かめる（src/lib/curveCheck.ts）。
+ * 取引結果に JEPX の価格感応度の公表値があれば、システムプライスのカーブをずらして計算した目安（src/lib/sensitivity.ts）と比べる。
  */
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -41,7 +42,8 @@ import { decodeFyFile, MANIFEST_FORMAT, type Manifest } from '../src/lib/dataFil
 import { formatDay, isoFromDay, parseDateString, slotRangeLabel } from '../src/lib/dates';
 import { fmtNum, fmtPct, fmtPrice, fmtSigned } from '../src/lib/format';
 import type { DayMap } from '../src/lib/jepxCsv';
-import { AREA_KEYS, kwhToMw, SERIES_INDEX, SERIES_LABEL, SLOTS, type PriceKey, type SeriesKey } from '../src/lib/series';
+import { curveSensitivity, SPIKE_PRICES, type Sensitivity } from '../src/lib/sensitivity';
+import { AREA_KEYS, kwhToMw, SENSITIVITY_SIZES, sensitivityKey, SERIES_INDEX, SERIES_LABEL, SLOTS, type PriceKey, type SeriesKey } from '../src/lib/series';
 
 export interface CheckOptions {
   /** 取得済みデータ（npm run fetch の出力先） */
@@ -180,6 +182,33 @@ interface Checked {
   c: SlotCheck;
 }
 
+/** JEPX が公表している価格感応度（システムプライス） */
+interface Published {
+  system: number;
+  up: number[];
+  down: number[];
+}
+
+/** 1 コマの、システムプライスのカーブをずらして計算した目安と公表値 */
+interface SensitivityChecked {
+  est: Sensitivity;
+  pub: Published | null;
+}
+
+function publishedOf(l: Loaded, day: number, slot: number): Published | null {
+  const vals = l.spot.get(day);
+  const at = (k: SeriesKey) => (vals ? vals[SERIES_INDEX[k] * SLOTS + slot] : Number.NaN);
+  const up = SENSITIVITY_SIZES.map((mw) => at(sensitivityKey('buy', mw)));
+  const down = SENSITIVITY_SIZES.map((mw) => at(sensitivityKey('sell', mw)));
+  return [...up, ...down].some(Number.isFinite) ? { system: at('system'), up, down } : null;
+}
+
+function sensitivityCheck(l: Loaded, day: CurveDay, slot: number): SensitivityChecked | null {
+  const system = day.slots[slot]?.find((g) => g.id === SYSTEM_GROUP);
+  const est = system ? curveSensitivity(system) : null;
+  return est ? { est, pub: publishedOf(l, day.day, slot) } : null;
+}
+
 // ---- まとめ ----
 
 function summary(list: Checked[]): string[] {
@@ -270,6 +299,59 @@ function summary(list: Checked[]): string[] {
   return out;
 }
 
+const mean = (v: number[]) => (v.length > 0 ? v.reduce((a, b) => a + b, 0) / v.length : Number.NaN);
+const sizeText = (mw: number) => `${mw / 1000}GW`;
+
+/** 価格感応度: 公表値と目安の、約定価格の動き（買いを増減したときの価格 − 増減しないときの価格）の比べ */
+function sensitivitySummary(list: SensitivityChecked[]): string[] {
+  const out = ['', '■ 価格感応度: JEPX の公表値と、システムプライスのカーブ（描画用に間引いたもの）をずらして計算した目安'];
+  const pub = list.filter((x): x is SensitivityChecked & { pub: Published } => x.pub !== null);
+  if (pub.length === 0) {
+    out.push('  取引結果に価格感応度の公表値がありません（npm run fetch で取引結果と一緒に取得します。2021 年度から）');
+    return out;
+  }
+  out.push(`  公表値のある ${fmtNum(pub.length)} コマ。カーブの交点 − 公表されているシステムプライス: ${within(pub.map((x) => x.est.base - x.pub.system))}`);
+  out.push('  目安はブロック入札の約定を変えずにカーブをずらしたもの。公表値は約定計算をやり直し、ブロック入札の約定も判定し直している');
+  const rows = SENSITIVITY_SIZES.flatMap((mw, k) =>
+    (['up', 'down'] as const).map((dir) => {
+      const pairs = pub
+        .map((x) => ({
+          est: (dir === 'up' ? x.est.up[k] : x.est.down[k]) - x.est.base,
+          pub: (dir === 'up' ? x.pub.up[k] : x.pub.down[k]) - x.pub.system,
+        }))
+        .filter((q) => Number.isFinite(q.est) && Number.isFinite(q.pub));
+      const diffs = pairs.map((q) => q.pub - q.est);
+      return [
+        `買い ${dir === 'up' ? '+' : '−'}${sizeText(mw)}`,
+        fmtNum(pairs.length),
+        pct(share(diffs, withinPrice(0.01))),
+        pct(share(diffs, withinPrice(0.1))),
+        `${fmtPrice(mean(pairs.map((q) => Math.abs(q.pub))))} / ${fmtPrice(mean(pairs.map((q) => Math.abs(q.est))))} 円`,
+        `${fmtPrice(mean(diffs.map(Math.abs)))} 円`,
+        pct(share(pairs.map((q) => Math.abs(q.pub) - Math.abs(q.est)), (v) => v <= 0.005)),
+      ];
+    }),
+  );
+  out.push(...table(['買いの増減', 'コマ数', '動きが同じ', '差が 0.1 円以内', '動きの大きさの平均（公表値 / 目安）', '差の大きさの平均', '公表値の動きが目安以下'], rows));
+  return out;
+}
+
+/** 1 コマの価格感応度（目安と公表値）と、0.01 円・高騰・売りが尽きるまでの買いの増減 */
+function sensitivityDetail(sc: SensitivityChecked): string[] {
+  const { est, pub } = sc;
+  const rows: string[][] = [['増減なし', fmtPrice(est.base), pub ? fmtPrice(pub.system) : '']];
+  SENSITIVITY_SIZES.forEach((mw, k) => {
+    rows.push([`買い +${sizeText(mw)}`, fmtPrice(est.up[k]), pub ? fmtPrice(pub.up[k]) : '']);
+    rows.push([`買い −${sizeText(mw)}`, fmtPrice(est.down[k]), pub ? fmtPrice(pub.down[k]) : '']);
+  });
+  const shift = (v: number) => (Number.isFinite(v) ? signedGw(v) : v === Number.NEGATIVE_INFINITY ? 'なし（買いが無くても）' : 'なし（売りが尽きるまで）');
+  return [
+    '  価格感応度（円/kWh。目安はシステムプライスのカーブをずらしたもの）',
+    ...table(['買いの増減', '目安', 'JEPX の公表値'], rows, '    '),
+    `  約定価格が変わる買いの増減: 0.01 円になる ${shift(est.floor)}・${SPIKE_PRICES.map((p, i) => `${p} 円を超える ${shift(est.spike[i])}`).join('・')}・売りが尽きる ${signedGw(est.limit)}`,
+  ];
+}
+
 /** 1 日分のコマごとの一覧 */
 function slotList(list: Checked[]): string[] {
   return [
@@ -328,6 +410,8 @@ function detail(l: Loaded, day: CurveDay, slot: number): string[] {
       '    ',
     ),
   );
+  const sc = sensitivityCheck(l, day, slot);
+  if (sc) out.push(...sensitivityDetail(sc));
   if (c.blocks) {
     out.push(
       `  ブロック入札の約定の違い: ${blockGapText(c.blocks)}` +
@@ -386,6 +470,7 @@ export async function checkCurves(o: CheckOptions): Promise<string[]> {
   const l = await load(o);
   if (l.days.length === 0) throw new Error('指定した期間に入札カーブがありません');
   const list: Checked[] = [];
+  const sens: SensitivityChecked[] = [];
   let unread = 0;
   let detailLines: string[] = [];
   for (const dayNum of l.days) {
@@ -400,6 +485,8 @@ export async function checkCurves(o: CheckOptions): Promise<string[]> {
       if (!groups) return;
       const c = checkSlot(slotInput(l, day, slot));
       if (c) list.push({ day: dayNum, slot, c });
+      const sc = sensitivityCheck(l, day, slot);
+      if (sc) sens.push(sc);
       if (o.slot === slot) detailLines = detail(l, day, slot);
     });
   }
@@ -413,6 +500,7 @@ export async function checkCurves(o: CheckOptions): Promise<string[]> {
     return [...out, ...detailLines];
   }
   out.push(...summary(list));
+  out.push(...sensitivitySummary(sens));
   if (first === last) out.push(...slotList(list));
   return out;
 }

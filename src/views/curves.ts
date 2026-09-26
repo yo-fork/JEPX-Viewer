@@ -1,9 +1,8 @@
 /**
  * 入札カーブ：受渡日・時間帯ごとの売り・買いの入札カーブ（価格ごとの累積の入札量）と、
- * カーブから計算した指標（価格帯ごとの入札量・価格感応度）の推移。
+ * カーブから計算した指標（価格帯ごとの入札量）の推移。価格感応度の図は curveSensitivity.ts。
  * 売り入札は青、買い入札は橙（入札・約定量のタブと同じ色）。同じ側の線を何本も重ねるときは、その色相の濃淡で順序を表す。
  */
-import { GRANULARITY_LABEL } from '../lib/aggregate';
 import {
   aloneSlots,
   areaCurve,
@@ -30,7 +29,6 @@ import {
   SIMPLIFY_RATIO,
   stepPath,
   stepPrices,
-  SYSTEM_LABEL,
   type CurveDay,
   type CurveMetricKey,
 } from '../lib/bidCurves';
@@ -62,6 +60,22 @@ import {
   styledLine,
   valueAxis,
 } from './common';
+import {
+  curveNote,
+  fileDate,
+  fmtGw,
+  fmtMw,
+  granText,
+  isEstimate,
+  legendTextWidth,
+  namedTooltip,
+  PLOT_TOP,
+  targetLabel,
+  targetText,
+  wrappedLegend,
+  type AxisParam,
+} from './curveCommon';
+import { SensitivitySection } from './curveSensitivity';
 import { buildGrid, colorRange, gridTable, heatmapHeight, heatmapOption, type Grid } from './heatmap';
 import { autoGranularity, breakGaps, buildSeriesPoints, periodLabel, TIME_AXIS_LABEL } from './timeseries';
 
@@ -79,9 +93,6 @@ const LABEL_GAP = 6;
 /** 交点のラベルの幅の目安（px。1 行・2 行に折り返したとき） */
 const CROSS_LABEL_WIDTH = 176;
 const CROSS_LABEL_WIDTH_WRAPPED = 120;
-/** グラフ領域の上端（凡例 1 行と縦軸の名前の分）と、凡例が折り返したときの 1 行の高さ */
-const PLOT_TOP = 36;
-const LEGEND_ROW = 24;
 /** 入札の大きな段として並べる数（何度も出てくる段では、各コマのこの数の段を集める） */
 const STEP_COUNT = 10;
 
@@ -114,22 +125,12 @@ const DEPTH: Record<CurveSide, { key: CurveMetricKey; name: string }[]> = {
   ],
 };
 
-const SENSITIVITY: { key: CurveMetricKey; name: string; short: string }[] = [
-  { key: 'upPrice', name: '買いが 1GW 増えたときの上昇幅', short: '上昇幅' },
-  { key: 'downPrice', name: '買いが 1GW 減ったときの下落幅', short: '下落幅' },
-];
-
-type AxisParam = { axisValue?: unknown; seriesIndex: number; value: unknown };
-
 interface CompareItem {
   name: string;
   curve: AreaCurve;
   color: string;
 }
 
-const targetLabel = (t: CurveTarget): string => (t === 'system' ? SYSTEM_LABEL : areaLabel(t));
-/** 推定したカーブ（単エリア）。線を破線にする */
-const isEstimate = (c: AreaCurve): boolean => c.kind === 'single' || c.kind === 'combined';
 const pickName = (p: CurvePick): string => `${shortDay(p.day)} ${slotStartLabel(p.slot)}`;
 
 export class CurvesView extends View {
@@ -180,8 +181,8 @@ export class CurvesView extends View {
   /** 表示中の、何度も出てくる段（押したマス・棒からコマを引く） */
   private recurring: { area: AreaKey; cells: Map<string, StepCell>; top: StepCell[] } | null = null;
   private disposed = false;
+  private sens!: SensitivitySection;
   private depth!: ChartCard;
-  private sensitivity!: ChartCard;
   private heat!: ChartCard;
   /** 凡例で非表示にした系列（ツールチップに出さない）。描き直すと凡例は全部表示に戻る */
   private hidden = new Map<ChartCard, Record<string, boolean>>();
@@ -314,6 +315,18 @@ export class CurvesView extends View {
     this.sellSteps = this.card(g1, { title: '売り入札の大きな段', height: 340 });
     this.buySteps = this.card(g1, { title: '買い入札の大きな段', height: 340 });
 
+    this.sens = new SensitivitySection(
+      {
+        ctx: () => this.ctx,
+        card: (parent, opts) => this.card(parent, opts),
+        set: (patch) => this.set(patch),
+        curveOf: (day, slot, target) => this.curveOf(day, slot, target),
+        value: (day, slot, key) => this.price(day, slot, key),
+        disposed: () => this.disposed,
+      },
+      this.content,
+    );
+
     this.aloneNote = h('p', { class: 'view-note' });
     this.content.append(h('h2', { class: 'view-section-title' }, '単エリアが 1 つだけのコマ'), this.aloneNote);
     const ga = h('div', { class: 'card-grid' });
@@ -338,9 +351,8 @@ export class CurvesView extends View {
     this.content.append(h('h2', { class: 'view-section-title' }, '期間で見る'), this.periodNote);
     const g2 = h('div', { class: 'card-grid' });
     this.content.append(g2);
-    this.depth = this.card(g2, { title: '価格帯ごとの入札量の推移', height: 340 });
+    this.depth = this.card(g2, { title: '価格帯ごとの入札量の推移', height: 340, wide: true });
     this.depth.addControls(this.depthSide.el);
-    this.sensitivity = this.card(g2, { title: '価格感応度の推移', height: 340 });
     this.heat = this.card(g2, { title: '指標のヒートマップ', height: 480, wide: true });
     this.heat.addControls(this.metric.el);
     for (const card of [this.curve, this.comparison]) {
@@ -392,6 +404,7 @@ export class CurvesView extends View {
     this.renderCurve(cs, date);
     this.renderSteps(cs, date);
     this.renderComparison(cs, date);
+    this.sens.render(cs, date);
     this.renderAlone(cs);
     this.renderRecurring(cs);
     this.renderPeriod(cs);
@@ -1188,7 +1201,7 @@ export class CurvesView extends View {
     this.periodNote.textContent =
       `入札カーブの指標は ${formatDay(cs.metricsFirst)}〜${formatDay(cs.metricsLast)}（${fmtNum(cs.metricDays)} 日分）にあります。` +
       '上の絞り込み条件（期間・曜日・時間帯）のうち、この範囲に入る分を、システムプライスのカーブから計算した指標で集計します。';
-    const cards = [this.depth, this.sensitivity, this.heat];
+    const cards = [this.depth, this.heat];
     const selC = from <= to ? reselect(sel, from, to) : null;
     if (!selC || selC.days.length === 0) {
       const msg = `選択した条件（${formatDay(sel.from)}〜${formatDay(sel.to)}）に入札カーブのデータがありません。期間を ${formatDay(cs.metricsFirst)}〜${formatDay(cs.metricsLast)} に含めてください。`;
@@ -1196,7 +1209,6 @@ export class CurvesView extends View {
       return;
     }
     this.renderDepth(cs, selC);
-    this.renderSensitivity(cs, selC);
     this.renderHeat(cs, selC);
   }
 
@@ -1243,47 +1255,6 @@ export class CurvesView extends View {
     );
   }
 
-  private renderSensitivity(cs: CurveStore, sel: Selection): void {
-    const { ds, state, theme } = this.ctx;
-    const t = TOKENS[theme];
-    const colors = [t.cat[2], t.cat[3]];
-    const gran = autoGranularity(sel);
-    const raw = buildSeriesPoints(sel, SENSITIVITY.map((d) => ({ a: cs.metricArray(ds, d.key) })), gran, 'mean');
-    const data = raw.map((r) => r.points);
-    this.sensitivity.setSubtitle(`${describeSelection(sel, state)}・カーブの交点から価格がどれだけ動くか（円/kWh、${granText(gran)}）`);
-    const ends = endLabels(SENSITIVITY.map((d) => d.short), data.map((d) => d.map((p) => p[1])), theme, 260);
-    const legend = wrappedLegend(
-      SENSITIVITY.map((d) => d.name),
-      this.sensitivity.chart.getWidth(),
-    );
-    this.sensitivity.setOption(
-      {
-        grid: grid({ top: legend.top + 8, right: labelRoom(SENSITIVITY.length) }),
-        legend: legend.legend,
-        tooltip: {
-          trigger: 'axis',
-          formatter: namedTooltip(
-            SENSITIVITY.map((d) => d.name),
-            colors,
-            (p) => periodLabel(Number((p.value as number[])[0]), gran),
-            (v) => `${fmtPrice(v)} 円`,
-          ),
-        },
-        xAxis: { type: 'time', axisLabel: TIME_AXIS_LABEL },
-        yAxis: valueAxis(PRICE_UNIT, { min: 0 }),
-        series: SENSITIVITY.map((d, i) =>
-          styledLine(d.name, colors[i], theme, gran === 'slot' ? breakGaps(data[i]) : data[i], false, { sampling: 'lttb', ...ends[i] }),
-        ),
-      },
-      {
-        columns: ['期間', ...SENSITIVITY.map((d) => `${d.name}（円/kWh）`)],
-        rows: data[0].map((p, r) => [periodLabel(p[0], gran), ...data.map((d) => d[r][1])]),
-        digits: [null, 2, 2],
-        filename: `jepx_bidcurve_sensitivity_${rangeTag(sel)}.csv`,
-      },
-    );
-  }
-
   private renderHeat(cs: CurveStore, sel: Selection): void {
     const { ds, state, theme } = this.ctx;
     const t = TOKENS[theme];
@@ -1312,31 +1283,6 @@ function toGw(steps: Float64Array): [number, number][] {
   return stepPath(steps).map(([v, p]) => [v / 1000, p]);
 }
 
-/** 副題に出す、対象と表示しているカーブの説明 */
-function targetText(target: CurveTarget, ac: AreaCurve): string {
-  if (target === 'system') return SYSTEM_LABEL;
-  const name = areaLabel(target);
-  switch (ac.kind) {
-    case 'system':
-      return ac.unnamed ? `${name}（分断エリアの名前が分からないため、システムプライスのカーブ）` : `${name}（市場分断なし: システムプライスのカーブ）`;
-    case 'group':
-      return `${name}（分断エリア: ${ac.label}）`;
-    case 'single':
-      return `${name}（単エリア・推定）`;
-    case 'combined':
-      return `${name}（単エリア ${ac.areas.length} つを合わせた推定: ${ac.label}）`;
-    case 'unavailable':
-      return `${name}（単エリア・推定できません）`;
-  }
-}
-
-/** 小さい量は MW、大きい量は GW で */
-function fmtMw(mw: number): string {
-  return Math.abs(mw) < 1000 ? `${fmtNum(mw, 0)} MW` : `${fmtNum(mw / 1000, 2)} GW`;
-}
-
-const fmtGw = (mw: number) => `${fmtNum(mw / 1000, 2)} GW`;
-
 /**
  * 単エリアの入札がシステムプライスのカーブに入っていることの裏付け（引いた差が価格によって変わる）と、入札量の合計。
  * 公表されている分断エリアの合計がシステムプライスより多いのは、連系線でやりとりする量が入っているため
@@ -1362,22 +1308,6 @@ function unavailableText(target: CurveTarget, ac: AreaCurve): string {
     `公表されている分断エリアのカーブの合計は売り ${fmtGw(t.publishedSell)}・買い ${fmtGw(t.publishedBuy)}）。` +
     `システムプライスのカーブに${ac.label}の入札が入っていないか、公表されている分断エリアのカーブに含まれているとみられます。`
   );
-}
-
-/** 比較の図で、それぞれのカーブがどのカーブかの短い説明 */
-function curveNote(ac: AreaCurve): string {
-  switch (ac.kind) {
-    case 'system':
-      return ac.unnamed ? 'システムプライス' : '分断なし';
-    case 'group':
-      return ac.label;
-    case 'single':
-      return '単エリア・推定';
-    case 'combined':
-      return `${ac.label}の合算・推定`;
-    case 'unavailable':
-      return '推定できません';
-  }
 }
 
 /** 縦軸の範囲を決めるのに使う価格（交点。補正した単エリアは約定価格、単エリアの合算は無し） */
@@ -1577,65 +1507,8 @@ function priceProbe(priceTop: number): Record<string, unknown> {
   };
 }
 
-/** 名前・色を指定した系列の軸ツールチップ（系列の順に並べる） */
-function namedTooltip(
-  names: string[],
-  colors: string[],
-  header: (first: AxisParam) => string,
-  format: (v: number) => string,
-): (params: AxisParam | AxisParam[]) => string {
-  return (params) => {
-    const ps = (Array.isArray(params) ? params : [params]).slice().sort((a, b) => a.seriesIndex - b.seriesIndex);
-    if (ps.length === 0) return '';
-    let html = ttHeader(header(ps[0]));
-    for (const p of ps) {
-      const name = names[p.seriesIndex];
-      if (name === undefined) continue;
-      const v = Array.isArray(p.value) ? Number(p.value[1]) : Number(p.value);
-      html += ttRow(colors[p.seriesIndex], format(v), name);
-    }
-    return html;
-  };
-}
-
 /** 凡例に並べる短い日付（9/25(金)） */
 function shortDay(day: number): string {
   const { m, d } = ymdFromDay(day);
   return `${m}/${d}(${DOW_LABEL[dowOfDay(day)]})`;
-}
-
-/** 文字列の幅の目安（px、12px の文字。全角は 1 文字 12px、半角は 7.5px。少し広めに見積もる） */
-function legendTextWidth(text: string): number {
-  let w = 0;
-  for (const ch of text) w += ch.charCodeAt(0) > 0x2e7f ? 12 : 7.5;
-  return w * 1.05;
-}
-
-/**
- * 項目が多いときは折り返す凡例（スクロールで隠れる項目を作らない）と、その行数に合わせたグラフ領域の上端。
- * @param width グラフの幅（px）
- */
-function wrappedLegend(names: string[], width: number, dashed: boolean[] = []): { legend: Record<string, unknown>; top: number } {
-  // 凡例の内側の余白（左右 5px）を除いた幅に並べる
-  const room = width - 10;
-  let rows = 1;
-  let x = 0;
-  for (const name of names) {
-    // 線の見本 18px + 見本と文字の間 5px + 文字 + 項目の間 16px
-    const w = 18 + 5 + legendTextWidth(name);
-    if (x > 0 && x + w > room) {
-      rows++;
-      x = 0;
-    }
-    x += w + 16;
-  }
-  return { legend: lineLegend(names.map((name, i) => ({ name, dashed: dashed[i] })), { type: 'plain' }), top: PLOT_TOP + (rows - 1) * LEGEND_ROW };
-}
-
-function granText(gran: ReturnType<typeof autoGranularity>): string {
-  return gran === 'slot' ? '30分値' : `${GRANULARITY_LABEL[gran]}ごとの平均`;
-}
-
-function fileDate(day: number): string {
-  return isoFromDay(day).replace(/-/g, '');
 }

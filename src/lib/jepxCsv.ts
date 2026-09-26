@@ -9,7 +9,7 @@
  */
 import { parseCsv, toCsv } from './csv';
 import { formatDay, parseDateString } from './dates';
-import { AREAS, SERIES_COUNT, SERIES_INDEX, SLOTS, type SeriesKey } from './series';
+import { AREAS, SENSITIVITY_KEYS, SENSITIVITY_SIZES, sensitivityKey, SERIES_COUNT, SERIES_INDEX, SLOTS, type SeriesKey } from './series';
 
 export type DayValues = Float64Array; // SERIES_COUNT × SLOTS（系列ごとに 48 コマ）
 export type DayMap = Map<number, DayValues>;
@@ -22,6 +22,8 @@ export interface SpotCsvResult {
   firstDay: number;
   lastDay: number;
   warnings: string[];
+  /** 価格感応度の CSV（virtualprice_YYYY.csv）だった */
+  sensitivity: boolean;
 }
 
 export function newDayValues(): DayValues {
@@ -44,6 +46,11 @@ const SERIES_MATCHERS: [SeriesKey, Matcher][] = [
   ['sellBlockVolume', (h) => /売り?ブロック約定(総)?量/.test(h)],
   ['buyBlockBid', (h) => /買い?ブロック入札(総)?量/.test(h)],
   ['buyBlockVolume', (h) => /買い?ブロック約定(総)?量/.test(h)],
+  // 価格感応度の CSV（virtualprice_YYYY.csv）の「売500MW」「買1000MW」などの列
+  ...SENSITIVITY_SIZES.flatMap((mw): [SeriesKey, Matcher][] => [
+    [sensitivityKey('sell', mw), (h) => h === `売${mw}MW`],
+    [sensitivityKey('buy', mw), (h) => h === `買${mw}MW`],
+  ]),
 ];
 
 function findColumn(headers: string[], tests: Matcher[]): number {
@@ -115,8 +122,12 @@ export function parseSpotCsv(text: string): SpotCsvResult {
   }
 
   const warnings: string[] = [];
+  // 価格感応度の CSV（システムプライスと価格感応度の列だけ）には、エリアプライスの列が無い
+  const sensitivity = columns.some((k) => (SENSITIVITY_KEYS as SeriesKey[]).includes(k));
   const missingAreas = AREAS.filter((a) => !columns.includes(a.key)).map((a) => a.label);
-  if (missingAreas.length > 0) warnings.push(`エリアプライス列が見つかりません: ${missingAreas.join('、')}`);
+  if (missingAreas.length > 0 && !(sensitivity && missingAreas.length === AREAS.length)) {
+    warnings.push(`エリアプライス列が見つかりません: ${missingAreas.join('、')}`);
+  }
 
   const days: DayMap = new Map();
   let rowCount = 0;
@@ -149,7 +160,7 @@ export function parseSpotCsv(text: string): SpotCsvResult {
   if (rowCount === 0) throw new SpotCsvFormatError('CSV にデータ行がありません。');
   if (skipped > 0) warnings.push(`日付または時刻コードを解釈できない ${skipped} 行を読み飛ばしました。`);
 
-  return { days, columns, rowCount, firstDay, lastDay, warnings };
+  return { days, columns, rowCount, firstDay, lastDay, warnings, sensitivity };
 }
 
 /** JEPX と同じ列名・並び（主要列のみ）で CSV を書き出す */

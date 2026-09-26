@@ -6,10 +6,10 @@
  * 九州の 0.01 円コマ、2021 年 1 月のような高騰）を持つ値を擬似乱数で作る。
  * **実際の約定価格ではない**ため、画面上では常に「デモデータ」と明示する。
  */
-import { dowOfDay, fiscalYearOf, ymdFromDay } from './dates';
+import { dayFromYmd, dowOfDay, fiscalYearOf, ymdFromDay } from './dates';
 import { isNationalHoliday } from './holidays';
 import { newDayValues, type DayMap } from './jepxCsv';
-import { SERIES_INDEX, SLOTS, type SeriesKey } from './series';
+import { isFloorPrice, kwhToMw, SENSITIVITY_SIZES, sensitivityKey, SERIES_INDEX, SLOTS, type SeriesKey } from './series';
 
 /** 年度ごとの価格水準（円/kWh）と 1 コマあたり約定量（kWh）の目安 */
 const LEVEL: Record<number, [number, number]> = {
@@ -134,4 +134,33 @@ export function generateDemoDays(fromDay: number, toDay: number, seed = 20240401
     days.set(day, vals);
   }
   return days;
+}
+
+/** JEPX が価格感応度を公表し始めた受渡日（2021 年度） */
+const SENSITIVITY_FROM = dayFromYmd(2021, 4, 1);
+
+/**
+ * デモ用の価格感応度（JEPX の公表値に似せた値）を、2021 年度からの日に足す。
+ * システムプライスと約定量から、足す量の約定量に対する割合に応じて価格を動かす（価格が高いほど上がりやすい）。
+ * 取引結果とは別の擬似乱数を使うので、取引結果の値は変わらない
+ */
+export function addDemoSensitivity(days: DayMap, seed = 20220126): void {
+  const rand = mulberry32(seed);
+  for (const [day, vals] of days) {
+    if (day < SENSITIVITY_FROM) continue;
+    for (let s = 0; s < SLOTS; s++) {
+      const p = vals[SERIES_INDEX.system * SLOTS + s];
+      const q = kwhToMw(vals[SERIES_INDEX.volume * SLOTS + s]);
+      if (!(p > 0) || !(q > 0)) continue;
+      const k = 0.8 + 0.6 * rand() + Math.min(2, p / 25);
+      for (const mw of SENSITIVITY_SIZES) {
+        const x = Math.min(0.9, mw / q);
+        // 最低価格のコマは、売りが余っているので少しの買いでは上がらない
+        const up = isFloorPrice(p) ? (mw >= 5000 && rand() < 0.5 ? 2 + 4 * rand() : 0) : p * ((1 + x) ** k - 1);
+        const down = isFloorPrice(p) ? 0 : p * (1 - (1 - x) ** k);
+        vals[SERIES_INDEX[sensitivityKey('buy', mw)] * SLOTS + s] = round2(p + up);
+        vals[SERIES_INDEX[sensitivityKey('sell', mw)] * SLOTS + s] = round2(p - down);
+      }
+    }
+  }
 }

@@ -170,8 +170,8 @@ export const CURVE_METRICS = [
   { key: 'buyTotal', label: '買い入札の合計', unit: 'MW' },
   { key: 'clearPrice', label: 'カーブの交点の価格', unit: '円/kWh' },
   { key: 'clearVolume', label: 'カーブの交点の量', unit: 'MW' },
-  { key: 'upPrice', label: '買いが 1GW 増えたときの価格上昇', unit: '円/kWh' },
-  { key: 'downPrice', label: '買いが 1GW 減ったときの価格下落', unit: '円/kWh' },
+  { key: 'upPrice', label: '買いが 1GW 増えたときの価格上昇（目安）', unit: '円/kWh' },
+  { key: 'downPrice', label: '買いが 1GW 減ったときの価格下落（目安）', unit: '円/kWh' },
 ] as const;
 
 export type CurveMetricKey = (typeof CURVE_METRICS)[number]['key'];

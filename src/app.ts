@@ -4,7 +4,7 @@
 import { COMPARE_DAYS, CurveStore } from './lib/curveStore';
 import { decodeFyFile, MANIFEST_FORMAT, type Manifest, type ManifestEntry } from './lib/dataFile';
 import { fiscalYearEnd, fiscalYearOfDay, fiscalYearStart, formatDay, parseDateString, todayJst } from './lib/dates';
-import { generateDemoDays } from './lib/demo';
+import { addDemoSensitivity, generateDemoDays } from './lib/demo';
 import { LOCAL_MANIFEST, loadDataScript, localDataMode, readEmbedded } from './lib/localData';
 import { decodeCsvBytes } from './lib/encoding';
 import { fmtNum } from './lib/format';
@@ -456,7 +456,7 @@ export class App implements AppApi {
         this.store.addDays(res.days, 'upload');
         first = Math.min(first, res.firstDay);
         last = Math.max(last, res.lastDay);
-        done.push(`${file.name}（${formatDay(res.firstDay)}〜${formatDay(res.lastDay)}、${fmtNum(res.rowCount)} コマ）`);
+        done.push(`${file.name}（${res.sensitivity ? '価格感応度、' : ''}${formatDay(res.firstDay)}〜${formatDay(res.lastDay)}、${fmtNum(res.rowCount)} コマ）`);
         for (const w of res.warnings) errors.push(`${file.name}: ${w}`);
       } catch (err) {
         errors.push(`${file.name}: ${(err as Error).message}`);
@@ -479,7 +479,9 @@ export class App implements AppApi {
     const today = todayJst();
     const from = fiscalYearStart(fiscalYearOfDay(today) - 6);
     this.store.clear();
-    this.store.addDays(generateDemoDays(from, today + 1), 'demo');
+    const demo = generateDemoDays(from, today + 1);
+    addDemoSensitivity(demo);
+    this.store.addDays(demo, 'demo');
     const ds = this.store.dataset();
     this.curves = ds ? CurveStore.demo(ds) : null;
     this.syncUrl();

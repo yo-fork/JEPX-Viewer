@@ -7,7 +7,8 @@ import type { Granularity } from './lib/aggregate';
 import type { DayType } from './lib/select';
 import { CURVE_TARGETS, type CurveTarget } from './lib/areaCurves';
 import { CURVE_METRIC_KEYS, type CurveMetricKey } from './lib/bidCurves';
-import { AREA_KEYS, PRICE_KEYS, type AreaKey, type PriceKey } from './lib/series';
+import { SPIKE_PRICES, type SpikePrice } from './lib/sensitivity';
+import { AREA_KEYS, PRICE_KEYS, SENSITIVITY_SIZES, type AreaKey, type PriceKey, type SensitivitySize } from './lib/series';
 
 export const TABS = [
   { id: 'overview', label: '概要' },
@@ -117,6 +118,10 @@ export interface AppState {
   curveDepth: CurveSide;
   /** 何度も出てくる段で見る側 */
   stepSide: CurveSide;
+  /** 価格感応度で見る買いの増減の量（MW） */
+  sensSize: SensitivitySize;
+  /** 高騰の目安にする価格（円/kWh） */
+  spikePrice: SpikePrice;
   /** 入札カーブのヒートマップの指標 */
   curveMetric: CurveMetricKey;
   yearMetric: YearMetric;
@@ -160,6 +165,8 @@ export const DEFAULT_STATE: AppState = {
   curveSide: 'sell',
   curveDepth: 'sell',
   stepSide: 'sell',
+  sensSize: 1000,
+  spikePrice: 20,
   curveMetric: 'sell001',
   yearMetric: 'mean',
   tableUnit: 'month',
@@ -223,6 +230,11 @@ const picksCodec: Codec<CurvePick[]> = {
     return picks.length > 0 ? normalizePicks(picks) : undefined;
   },
 };
+/** 決まった数の中から選ぶ数値 */
+const numOf = <T extends number>(allowed: readonly T[]): Codec<T> => ({
+  enc: (v) => String(v),
+  dec: (s) => allowed.find((x) => String(x) === s),
+});
 const presetCodec: Codec<string> = {
   enc: (v) => v,
   dec: (s) => (/^(last(7|30|90|365)|fy\d{4}|all|custom)$/.test(s) ? s : undefined),
@@ -263,6 +275,8 @@ const SCHEMA: { [K in keyof AppState]: [string, Codec<AppState[K]>] } = {
   curveSide: ['csd', oneOf<CurveSide>(['sell', 'buy'])],
   curveDepth: ['cdp', oneOf<CurveSide>(['sell', 'buy'])],
   stepSide: ['ssd', oneOf<CurveSide>(['sell', 'buy'])],
+  sensSize: ['vps', numOf(SENSITIVITY_SIZES)],
+  spikePrice: ['spk', numOf(SPIKE_PRICES)],
   curveMetric: ['cm2', oneOf<CurveMetricKey>(CURVE_METRIC_KEYS)],
   yearMetric: ['ym', oneOf<YearMetric>(['mean', 'max', 'min', 'floor'])],
   tableUnit: ['tu', oneOf<TableUnit>(['day', 'week', 'month', 'fy', 'year', 'dow', 'slot', 'all'])],

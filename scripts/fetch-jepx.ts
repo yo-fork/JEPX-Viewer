@@ -1,10 +1,11 @@
 /**
- * JEPX「スポット市場 取引結果」の年度別 CSV と、受渡日ごとの入札カーブを取得し、ビューア用のデータ（public/data）に変換する。
+ * JEPX「スポット市場 取引結果」・価格感応度の年度別 CSV と、受渡日ごとの入札カーブを取得し、ビューア用のデータ（public/data）に変換する。
  *
- *   npm run fetch                             取引結果（2005 年度〜今年度）と、直近 90 日の入札カーブを取得（取得済みはスキップ）
+ *   npm run fetch                             取引結果（2005 年度〜今年度）と価格感応度（2021 年度〜）、直近 90 日の入札カーブを取得（取得済みはスキップ）
  *   npm run fetch -- --from 2016              取引結果は 2016 年度以降だけ
  *   npm run fetch -- --curves-from 2025-04-01 入札カーブを 2025/4/1 の受渡分から取得
  *   npm run fetch -- --no-curves              入札カーブを取得しない
+ *   npm run fetch -- --no-sensitivity         価格感応度（JEPX の公表値）を取得しない
  *   npm run fetch -- --force                  取得済みの年度・日も取り直す
  *   npm run fetch -- --keep-csv               元の CSV も public/data/raw/ に保存する
  *   npm run fetch -- --from-dir ./csv         手元の CSV（ダウンロード・保存しておいたもの）を変換する（通信なし。複数指定できる）
@@ -47,11 +48,15 @@ import {
 import { fiscalYearOfDay, isoFromDay, parseDateString, todayJst } from '../src/lib/dates';
 import { decodeCsvBytes } from '../src/lib/encoding';
 import { parseSpotCsv, type DayMap } from '../src/lib/jepxCsv';
+import { SENSITIVITY_KEYS, SERIES_COUNT, SERIES_INDEX, SLOTS, type SeriesKey } from '../src/lib/series';
 
 export const JEPX_SPOT_PAGE = 'https://www.jepx.jp/electricpower/market-data/spot/';
 export const DEFAULT_URL_TEMPLATE = 'https://www.jepx.jp/js/csv_read.php?dir=spot_summary&file=spot_summary_{fy}.csv';
 /** 入札カーブの取得元（{dir} は spot_bid_curves または spot_splitting_areas、{file} はファイル名） */
 export const DEFAULT_CURVES_URL_TEMPLATE = 'https://www.jepx.jp/js/csv_read.php?dir={dir}&file={file}';
+/** JEPX が公表している価格感応度（年度ごと。2021 年度から） */
+export const DEFAULT_SENSITIVITY_URL_TEMPLATE = 'https://www.jepx.jp/js/csv_read.php?dir=virtualprice&file=virtualprice_{fy}.csv';
+export const FIRST_SENSITIVITY_FY = 2021;
 /** JEPX のスポット市場は 2005 年 4 月に開始 */
 export const FIRST_FY = 2005;
 /** 入札カーブを既定で取得する日数（翌日受渡分までの直近の日数） */
@@ -76,6 +81,9 @@ export interface FetchOptions {
   /** --curves-from / --curves-to を指定した（--from-dir では、指定したときだけ受渡日で絞る） */
   curvesRangeSet: boolean;
   curvesUrlTemplate: string;
+  /** JEPX が公表している価格感応度を取得して、取引結果の年度ファイルに入れる */
+  sensitivity: boolean;
+  sensitivityUrlTemplate: string;
 }
 
 export function defaultOptions(): FetchOptions {
@@ -95,6 +103,8 @@ export function defaultOptions(): FetchOptions {
     curvesTo: tomorrow,
     curvesRangeSet: false,
     curvesUrlTemplate: DEFAULT_CURVES_URL_TEMPLATE,
+    sensitivity: true,
+    sensitivityUrlTemplate: DEFAULT_SENSITIVITY_URL_TEMPLATE,
     fromDirs: [],
   };
 }
@@ -152,6 +162,12 @@ export function parseArgs(argv: string[], base = defaultOptions()): FetchOptions
       case '--curves-url-template':
         o.curvesUrlTemplate = next();
         break;
+      case '--no-sensitivity':
+        o.sensitivity = false;
+        break;
+      case '--sensitivity-url-template':
+        o.sensitivityUrlTemplate = next();
+        break;
       case '-h':
       case '--help':
         console.log(HELP);
@@ -172,12 +188,14 @@ const HELP = `使い方: npm run fetch -- [オプション]
   --curves-from <日付>   入札カーブを取得する最初の受渡日（既定: 直近 ${DEFAULT_CURVE_DAYS} 日）
   --curves-to <日付>     入札カーブを取得する最後の受渡日（既定: 翌日）
   --no-curves            入札カーブを取得しない
+  --no-sensitivity       価格感応度（JEPX の公表値、${FIRST_SENSITIVITY_FY} 年度から）を取得しない
   --out <ディレクトリ>   出力先（既定: public/data）
   --force                取得済みの年度・日も取り直す
   --keep-csv             元の CSV を <出力先>/raw/ に保存する
   --from-dir <ディレクトリ>  手元の CSV を変換する（通信しない。サブフォルダも含め、ファイル名は問わず中身で判定。複数指定できる）
   --url-template <URL>   取引結果の取得元 URL（{fy} が年度に置き換わる）
   --curves-url-template <URL>  入札カーブの取得元 URL（{dir}・{file} が置き換わる）
+  --sensitivity-url-template <URL>  価格感応度の取得元 URL（{fy} が年度に置き換わる）
   --delay <ミリ秒>       連続取得の間隔（既定: 1500）`;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -208,6 +226,72 @@ async function download(url: string, dispatcher: EnvHttpProxyAgent): Promise<Uin
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
   return new Uint8Array(await res.arrayBuffer());
+}
+
+/**
+ * 日別データに、別の CSV から読んだ値を重ねる（値のある所だけ上書きし、ほかの系列は残す）。
+ * keys を指定すると、その系列だけを、すでにある日にだけ重ねる。値を重ねた日の数を返す
+ */
+export function mergeDays(into: DayMap, from: DayMap, keys?: readonly SeriesKey[]): number {
+  const only = keys ? new Set(keys.map((k) => SERIES_INDEX[k])) : null;
+  let n = 0;
+  for (const [day, vals] of from) {
+    const cur = into.get(day);
+    if (!cur) {
+      if (only) continue;
+      into.set(day, vals);
+      n++;
+      continue;
+    }
+    let any = false;
+    for (let si = 0; si < SERIES_COUNT; si++) {
+      if (only && !only.has(si)) continue;
+      for (let s = 0; s < SLOTS; s++) {
+        const v = vals[si * SLOTS + s];
+        if (Number.isNaN(v)) continue;
+        cur[si * SLOTS + s] = v;
+        any = true;
+      }
+    }
+    if (any) n++;
+  }
+  return n;
+}
+
+const hasSensitivity = (f: FyFile) => SENSITIVITY_KEYS.some((k) => f.series[k] !== undefined);
+
+/** 出力先にある年度ファイルの日別データ（無いか読めなければ null） */
+async function readFyDays(out: string, fy: number): Promise<DayMap | null> {
+  if (!existsSync(fyPath(out, fy))) return null;
+  try {
+    return decodeFyFile(JSON.parse(await readFile(fyPath(out, fy), 'utf8')));
+  } catch {
+    return null;
+  }
+}
+
+/** JEPX が公表している価格感応度の 1 年度分（取得できなければ null） */
+async function fetchSensitivity(o: FetchOptions, dispatcher: EnvHttpProxyAgent, pace: () => Promise<void>, fy: number): Promise<DayMap | null> {
+  await pace();
+  let bytes: Uint8Array | null;
+  try {
+    bytes = await download(o.sensitivityUrlTemplate.replace(/\{fy\}/g, String(fy)), dispatcher);
+  } catch (err) {
+    o.log(`${fy}年度: 価格感応度を取得できませんでした（${(err as Error).message}）`);
+    return null;
+  }
+  if (!bytes || bytes.length === 0) return null;
+  if (o.keepCsv) {
+    await mkdir(path.join(o.out, 'raw'), { recursive: true });
+    await writeFile(path.join(o.out, 'raw', `virtualprice_${fy}.csv`), bytes);
+  }
+  try {
+    const res = parseSpotCsv(decodeCsvBytes(bytes).text);
+    return res.sensitivity ? res.days : null;
+  } catch (err) {
+    o.log(`${fy}年度: 価格感応度の CSV を解釈できませんでした（${(err as Error).message}）`);
+    return null;
+  }
 }
 
 async function writeFyFile(out: string, fy: number, days: DayMap): Promise<FyFile> {
@@ -321,7 +405,8 @@ async function readHead(file: string, size = 8192): Promise<string> {
 
 /**
  * 手元の CSV（--from-dir のフォルダ。サブフォルダも含む）を変換する。入札カーブを保存した年度を返す。
- * - 取引結果・入札カーブ・分断エリアのどれかは、ファイル名ではなく列名で見分ける（保存したときの名前やフォルダは問わない）
+ * - 取引結果・価格感応度・入札カーブ・分断エリアのどれかは、ファイル名ではなく列名で見分ける（保存したときの名前やフォルダは問わない）
+ * - 価格感応度は、取引結果のある日にだけ入れる（取引結果の CSV が無い年度は、変換済みの年度ファイルに足す）
  * - 入札カーブと分断エリアは受渡日の列で突き合わせる。1 つの CSV に何日分入っていてもよい
  *   （同じ日が複数あれば後に読んだもの。フォルダは指定の順、フォルダの中は名前の順に読む）
  * - 分断エリアだけがある日は、変換済みの入札カーブがあれば名前を付け直す（別々に変換したとき）
@@ -351,8 +436,9 @@ async function convertDir(o: FetchOptions): Promise<Set<number>> {
   };
   const inRange = (day: number) => !o.curvesRangeSet || (day >= o.curvesFrom && day <= o.curvesTo);
 
-  // 1 周目: 取引結果と分断エリアの名前を読み、入札カーブの CSV（大きいので 2 周目に 1 つずつ読む）を見つける
+  // 1 周目: 取引結果・価格感応度と分断エリアの名前を読み、入札カーブの CSV（大きいので 2 周目に 1 つずつ読む）を見つける
   const days: DayMap = new Map();
+  const sensDays: DayMap = new Map();
   const groups = new Map<number, AreaGroup[][]>();
   const curveFiles: typeof files = [];
   for (const f of files) {
@@ -367,17 +453,36 @@ async function convertDir(o: FetchOptions): Promise<Set<number>> {
         for (const [day, g] of parseSplittingAreasCsv(text)) groups.set(day, g);
       } else {
         const res = parseSpotCsv(text);
-        for (const [day, vals] of res.days) days.set(day, vals);
-        o.log(`${f.label}: ${isoFromDay(res.firstDay)}〜${isoFromDay(res.lastDay)}（${res.rowCount} コマ）${res.warnings.length ? ` ※${res.warnings.join(' / ')}` : ''}`);
+        // 同じ日が複数の CSV にあれば、値のある系列ごとに後から読んだもので上書きする（ほかの系列は消さない）
+        mergeDays(res.sensitivity ? sensDays : days, res.days);
+        o.log(
+          `${f.label}: ${res.sensitivity ? '価格感応度 ' : ''}${isoFromDay(res.firstDay)}〜${isoFromDay(res.lastDay)}（${res.rowCount} コマ）${res.warnings.length ? ` ※${res.warnings.join(' / ')}` : ''}`,
+        );
       }
     } catch (err) {
       fail(f.label, err);
     }
   }
-  for (const [fy, fyDays] of splitByFiscalYear(days)) {
+  // 価格感応度は、取引結果のある日にだけ入れる。取引結果の CSV が無い年度は変換済みの年度ファイルに足し、
+  // 価格感応度の CSV が無い年度は、変換済みの年度ファイルの価格感応度を残す
+  const byFy = splitByFiscalYear(days);
+  const sensByFy = splitByFiscalYear(sensDays);
+  let savedFy = 0;
+  for (const fy of [...new Set([...byFy.keys(), ...sensByFy.keys()])].sort((a, b) => a - b)) {
     if (fy < o.from || fy > o.to) continue;
+    const onDisk = await readFyDays(o.out, fy);
+    const fyDays = byFy.get(fy) ?? onDisk;
+    if (!fyDays) {
+      o.log(`${fy}年度: 取引結果が無いため、価格感応度だけでは変換しません（取引結果の CSV も指定してください）`);
+      continue;
+    }
+    const sens = sensByFy.get(fy);
+    const kept = !sens && byFy.has(fy) && onDisk ? mergeDays(fyDays, onDisk, SENSITIVITY_KEYS) : 0;
+    const added = sens ? mergeDays(fyDays, sens, SENSITIVITY_KEYS) : 0;
     await writeFyFile(o.out, fy, fyDays);
-    o.log(`→ ${fyPath(o.out, fy)}（${fyDays.size} 日）`);
+    savedFy++;
+    const note = sens ? `、価格感応度 ${added} 日` : kept > 0 ? `、変換済みの価格感応度 ${kept} 日を残す` : '';
+    o.log(`→ ${fyPath(o.out, fy)}（${fyDays.size} 日${note}）`);
   }
 
   // 2 周目: 入札カーブ
@@ -430,16 +535,27 @@ async function convertDir(o: FetchOptions): Promise<Set<number>> {
   if (orphan > 0) o.log(`分断エリアの CSV だけがあり、入札カーブが無い日: ${orphan} 日（その日の入札カーブを変換すると名前が付きます）`);
   if (outside > 0) o.log(`入札カーブ: --curves-from / --curves-to の範囲外の ${outside} 日は変換しませんでした`);
   if (failed.length > 0) o.log(`読み込めなかった CSV: ${failed.length} 件（${failed.join(', ')}）`);
-  if (days.size === 0 && touched.size === 0 && renamed === 0) throw new Error(`${where} に変換できる CSV がありません`);
+  if (days.size === 0 && savedFy === 0 && touched.size === 0 && renamed === 0) throw new Error(`${where} に変換できる CSV がありません`);
   return touched;
 }
 
 async function fetchAll(o: FetchOptions, dispatcher: EnvHttpProxyAgent, pace: () => Promise<void>): Promise<void> {
   const currentFy = fiscalYearOfDay(todayJst());
   for (let fy = o.from; fy <= o.to; fy++) {
+    const withSensitivity = o.sensitivity && fy >= FIRST_SENSITIVITY_FY;
     // 前年度以前は確定済みとみなし、取得済みなら再取得しない（今年度・前年度は毎回更新）
     if (!o.force && fy < currentFy - 1 && existsSync(fyPath(o.out, fy))) {
-      o.log(`${fy}年度: 取得済みのためスキップ`);
+      // 価格感応度の入っていない年度ファイル（前の版で取得したもの）には、価格感応度だけを取得して足す
+      const file = withSensitivity ? (JSON.parse(await readFile(fyPath(o.out, fy), 'utf8')) as FyFile) : null;
+      const sens = file && !hasSensitivity(file) ? await fetchSensitivity(o, dispatcher, pace, fy) : null;
+      if (file && sens) {
+        const days = decodeFyFile(file);
+        const n = mergeDays(days, sens, SENSITIVITY_KEYS);
+        await writeFyFile(o.out, fy, days);
+        o.log(`${fy}年度: 取得済みの取引結果に、価格感応度（${n} 日）を足しました`);
+      } else {
+        o.log(`${fy}年度: 取得済みのためスキップ`);
+      }
       continue;
     }
     await pace();
@@ -476,9 +592,14 @@ async function fetchAll(o: FetchOptions, dispatcher: EnvHttpProxyAgent, pace: ()
       o.log(`${fy}年度: データがありません`);
       continue;
     }
+    // 価格感応度は、取引結果のある日にだけ重ねる。取得しなかった・できなかったときは、前に取得したものを残す
+    const fetched = withSensitivity ? await fetchSensitivity(o, dispatcher, pace, fy) : null;
+    const sens = fetched ?? (await readFyDays(o.out, fy));
+    const sensDays = sens ? mergeDays(days, sens, SENSITIVITY_KEYS) : 0;
     await writeFyFile(o.out, fy, days);
     const keys = [...days.keys()].sort((a, b) => a - b);
-    o.log(`${fy}年度: ${isoFromDay(keys[0])}〜${isoFromDay(keys[keys.length - 1])}（${days.size} 日）を保存`);
+    const sensNote = withSensitivity || sensDays > 0 ? `（価格感応度 ${sensDays} 日${!fetched && sensDays > 0 ? '。前に取得したもの' : ''}）` : '';
+    o.log(`${fy}年度: ${isoFromDay(keys[0])}〜${isoFromDay(keys[keys.length - 1])}（${days.size} 日）を保存${sensNote}`);
   }
 }
 
