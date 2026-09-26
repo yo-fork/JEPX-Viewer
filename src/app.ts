@@ -388,7 +388,8 @@ export class App implements AppApi {
     if (!cs) return null;
     const date = cs.resolve(this.state.curveDate);
     const { curveCompare: compare, curvePicks: picks } = this.state;
-    const days = compare === 'days' ? cs.recent(date, COMPARE_DAYS) : compare === 'picks' ? [date, ...picks.map((p) => p.day)] : [date];
+    // 比較の図の日と、価格感応度でブロック入札の約定の変化を見込むのに使う直近の日
+    const days = [...new Set([...(compare === 'picks' ? [date, ...picks.map((p) => p.day)] : []), ...cs.recent(date, COMPARE_DAYS)])];
     const from = Math.max(range.from, cs.metricsFirst);
     const to = Math.min(range.to, cs.metricsLast);
     const jobs = [cs.ensureDays(days), from <= to ? cs.ensureMetrics(from, to) : null].filter((p): p is Promise<void> => p !== null);

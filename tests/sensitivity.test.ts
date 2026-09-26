@@ -2,12 +2,22 @@ import { describe, expect, it } from 'vitest';
 import { crossing, rowsFromSteps } from '../src/lib/bidCurves';
 import { mulberry32 } from '../src/lib/demo';
 import {
+  absorbedAt,
+  absorbedMw,
+  adjustSensitivity,
+  adjustThreshold,
+  blockModels,
   curveSensitivity,
+  effectiveShift,
   exceedShift,
+  isCompleteShare,
   priceAtShift,
   priceResponse,
+  publishedShare,
   SENS_FIELD_INDEX,
   sensitivityValues,
+  shareQuantile,
+  shiftRangeAt,
   type PriceResponse,
 } from '../src/lib/sensitivity';
 
@@ -97,5 +107,69 @@ describe('買いの増減と約定価格', () => {
         expect(stepPrice(r, mw)).toBe(crossing(rows, mw)?.price ?? Number.NaN);
       }
     }
+  });
+});
+
+describe('ブロック入札の約定の変化の見込み', () => {
+  it('公表値の価格になるカーブのずらし方から、効かなかった量を求める', () => {
+    const r = priceResponse(CURVE)!;
+    expect(shiftRangeAt(r, 10)).toEqual([-500, 500]);
+    expect(shiftRangeAt(r, 12)).toEqual([500, 1500]);
+    // その価格の段が無ければ、またぐ境目
+    expect(shiftRangeAt(r, 11)).toEqual([500, 500]);
+    expect(shiftRangeAt(r, 100)).toEqual([3000, 3000]);
+    // 買い +1GW: カーブでも公表値でも 12 円なら 0、公表値が 10 円のままなら 500MW 効かなかった（段の内側に 0.5MW 入れる）
+    expect(absorbedMw(r, 10, 1000, 2)).toBe(0);
+    expect(absorbedMw(r, 10, 1000, 0)).toBe(500.5);
+    // 公表値が下がった（足した量より多く効かなかった）
+    expect(absorbedMw(r, 10, 1000, -1)).toBe(1500);
+    // 買い −1GW で公表値が 10 円のまま
+    expect(absorbedMw(r, 10, -1000, 0)).toBe(500.5);
+  });
+
+  it('そのコマの公表値から割合を求め、見込みで価格と境目をずらす', () => {
+    const r = priceResponse(CURVE)!;
+    const share = publishedShare(r, 10, { system: 10, up: [10, 10, 30], down: [10, 8, 0.01] });
+    const round = (v: number[]) => v.map((x) => Math.round(x * 1000) / 1000);
+    expect({ up: round(share.up), down: round(share.down) }).toEqual({ up: [0.001, 0.5, 0.5], down: [0.001, 0, 0] });
+    expect(isCompleteShare(share)).toBe(true);
+    expect(isCompleteShare(publishedShare(r, 10, { system: 10, up: [10, Number.NaN, 30], down: [10, 8, 0.01] }))).toBe(false);
+    // 以下は割合をそろえた見込み: 効かない量は 0.5GW で 0、1GW で 500MW、その間は直線、5GW を超える分は割合（0.5）× tail
+    const { mid, less, more } = blockModels({ up: [0, 0.5, 0.5], down: [0, 0, 0] });
+    expect(absorbedAt(mid, true, 750)).toBe(250);
+    expect(absorbedAt(mid, true, 5000)).toBe(2500);
+    expect(absorbedAt(mid, true, 7000)).toBe(3000);
+    expect(absorbedAt(less, true, 7000)).toBe(2500);
+    expect(absorbedAt(more, true, 7000)).toBe(3500);
+    expect(effectiveShift(mid, 1000)).toBe(500);
+    expect(effectiveShift(mid, -1000)).toBe(-1000);
+    // 20 円を超える境目 +1500MW は、効く量が 1500MW になる +3000MW に移る
+    expect(adjustThreshold(mid, 1500)).toBe(3000);
+    expect(adjustThreshold(mid, 2500)).toBe(5000);
+    expect(adjustThreshold(mid, 3000)).toBeCloseTo(5000 + 500 / 0.75, 9);
+    expect(adjustThreshold(mid, -1800)).toBe(-1800);
+    expect(adjustThreshold(mid, Number.NaN)).toBeNaN();
+    // 5GW を超える分がすべて効かないと届かない
+    expect(adjustThreshold({ share: { up: [0, 0.5, 1], down: [0, 0, 0] }, tail: { up: 1, down: 0 } }, 6000)).toBeNaN();
+    // 5GW を超える分のうち効かない割合は MAX_TAIL_SHARE まで。1 コマの見込みでは、直近の日の割合を使える
+    expect(blockModels({ up: [0, 0.5, 1], down: [0, 0, 0] }).more.tail).toEqual({ up: 0.75, down: 0 });
+    const q = { up: [0, 0.2, 0.3], down: [0, 0.1, 0.2] };
+    const withTail = blockModels({ up: [0, 0.5, 0.9], down: [0, 0, 0] }, undefined, undefined, { mid: q, more: q });
+    expect(withTail.mid.tail).toEqual({ up: 0.15, down: 0.1 });
+    expect(withTail.more.tail).toEqual({ up: 0.3, down: 0.2 });
+    // そのコマの公表値から求めた見込みでは、公表値の価格が再現される
+    const adj = adjustSensitivity(curveSensitivity(CURVE)!, blockModels(share).mid);
+    expect(adj.up).toEqual([10, 10, 30]);
+    expect(adj.down).toEqual([10, 8, 0.01]);
+    expect(adj.floor).toBeCloseTo(-1800, 0);
+    expect(adj.spike[0]).toBeCloseTo(3000, -1);
+  });
+
+  it('いくつものコマの割合の分位点（足りなければ NaN）', () => {
+    const s = (v: number) => ({ up: [v, v, v], down: [v, v, Number.NaN] });
+    const q = shareQuantile([s(0), s(0.2), s(0.4), s(0.6)], 0.5, 2);
+    expect(q.up.map((v) => Math.round(v * 100) / 100)).toEqual([0.3, 0.3, 0.3]);
+    expect(q.down[2]).toBeNaN();
+    expect(shareQuantile([s(0.1)], 0.5, 2).up[0]).toBeNaN();
   });
 });

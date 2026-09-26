@@ -93,8 +93,14 @@ export function legendTextWidth(text: string): number {
 /**
  * 項目が多いときは折り返す凡例（スクロールで隠れる項目を作らない）と、その行数に合わせたグラフ領域の上端。
  * @param width グラフの幅（px）
+ * @param icons 線の見本の代わりにする見本の形（'diamond' など。指定しない項目は線）
  */
-export function wrappedLegend(names: string[], width: number, dashed: boolean[] = []): { legend: Record<string, unknown>; top: number } {
+export function wrappedLegend(
+  names: string[],
+  width: number,
+  dashed: boolean[] = [],
+  icons: (string | undefined)[] = [],
+): { legend: Record<string, unknown>; top: number } {
   // 凡例の内側の余白（左右 5px）を除いた幅に並べる
   const room = width - 10;
   let rows = 1;
@@ -108,7 +114,9 @@ export function wrappedLegend(names: string[], width: number, dashed: boolean[] 
     }
     x += w + 16;
   }
-  return { legend: lineLegend(names.map((name, i) => ({ name, dashed: dashed[i] })), { type: 'plain' }), top: PLOT_TOP + (rows - 1) * LEGEND_ROW };
+  const legend = lineLegend(names.map((name, i) => ({ name, dashed: dashed[i] })), { type: 'plain' });
+  if (icons.some(Boolean)) legend.data = (legend.data as { name: string; icon: string }[]).map((d, i) => (icons[i] ? { ...d, icon: icons[i] } : d));
+  return { legend, top: PLOT_TOP + (rows - 1) * LEGEND_ROW };
 }
 
 export function granText(gran: ReturnType<typeof autoGranularity>): string {

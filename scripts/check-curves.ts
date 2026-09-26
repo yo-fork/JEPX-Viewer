@@ -42,7 +42,7 @@ import { decodeFyFile, MANIFEST_FORMAT, type Manifest } from '../src/lib/dataFil
 import { formatDay, isoFromDay, parseDateString, slotRangeLabel } from '../src/lib/dates';
 import { fmtNum, fmtPct, fmtPrice, fmtSigned } from '../src/lib/format';
 import type { DayMap } from '../src/lib/jepxCsv';
-import { curveSensitivity, SPIKE_PRICES, type Sensitivity } from '../src/lib/sensitivity';
+import { curveSensitivity, publishedShare, shareQuantile, SPIKE_PRICES, type Sensitivity } from '../src/lib/sensitivity';
 import { AREA_KEYS, kwhToMw, SENSITIVITY_SIZES, sensitivityKey, SERIES_INDEX, SERIES_LABEL, SLOTS, type PriceKey, type SeriesKey } from '../src/lib/series';
 
 export interface CheckOptions {
@@ -312,6 +312,10 @@ function sensitivitySummary(list: SensitivityChecked[]): string[] {
   }
   out.push(`  公表値のある ${fmtNum(pub.length)} コマ。カーブの交点 − 公表されているシステムプライス: ${within(pub.map((x) => x.est.base - x.pub.system))}`);
   out.push('  目安はブロック入札の約定を変えずにカーブをずらしたもの。公表値は約定計算をやり直し、ブロック入札の約定も判定し直している');
+  out.push('  効かなかった割合 = 公表値の価格になるようにカーブをずらす量と、足した量との差 ÷ 足した量（画面のブロック入札の変化の見込みに使う割合）');
+  // 足した量のうち効かなかった割合の、25%・50%・75% 点
+  const shares = pub.map((x) => publishedShare(x.est.response, x.est.base, x.pub));
+  const [q25, q50, q75] = [0.25, 0.5, 0.75].map((q) => shareQuantile(shares, q));
   const rows = SENSITIVITY_SIZES.flatMap((mw, k) =>
     (['up', 'down'] as const).map((dir) => {
       const pairs = pub
@@ -329,10 +333,16 @@ function sensitivitySummary(list: SensitivityChecked[]): string[] {
         `${fmtPrice(mean(pairs.map((q) => Math.abs(q.pub))))} / ${fmtPrice(mean(pairs.map((q) => Math.abs(q.est))))} 円`,
         `${fmtPrice(mean(diffs.map(Math.abs)))} 円`,
         pct(share(pairs.map((q) => Math.abs(q.pub) - Math.abs(q.est)), (v) => v <= 0.005)),
+        `${pct(q50[dir][k])}〔${pct(q25[dir][k])}〜${pct(q75[dir][k])}〕`,
       ];
     }),
   );
-  out.push(...table(['買いの増減', 'コマ数', '動きが同じ', '差が 0.1 円以内', '動きの大きさの平均（公表値 / 目安）', '差の大きさの平均', '公表値の動きが目安以下'], rows));
+  out.push(
+    ...table(
+      ['買いの増減', 'コマ数', '動きが同じ', '差が 0.1 円以内', '動きの大きさの平均（公表値 / 目安）', '差の大きさの平均', '公表値の動きが目安以下', '効かなかった割合（中央値〔25〜75%〕）'],
+      rows,
+    ),
+  );
   return out;
 }
 

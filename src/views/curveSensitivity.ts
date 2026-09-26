@@ -4,22 +4,36 @@
  * - 1 コマ: 対象のカーブの買いの増減と約定価格、エリア別の価格感応度、エリア別の 0.01 円・高騰までの買いの増減
  * - 期間: 価格感応度の推移（システムプライスは JEPX の公表値と入札カーブから計算した目安）と、0.01 円・高騰までの買いの増減の推移
  * エリアの期間の値は、エリアの価格を決めたカーブを 1 日ずつ読んで計算する（1 日分が数百 KB あるので、ボタンを押したときだけ）。
+ * 1 コマの図には、JEPX の公表値から求めた「ブロック入札の約定が変わって効かない分」を見込んだ値と範囲も重ねる（lib/sensitivity.ts）。
  */
+import type { CustomSeriesRenderItemAPI, CustomSeriesRenderItemReturn } from 'echarts';
 import { areaLabel, CURVE_TARGETS, type AreaCurve, type CurveTarget } from '../lib/areaCurves';
-import { SENSITIVITY_MW, type CurveDay, type CurveMetricKey } from '../lib/bidCurves';
+import { SENSITIVITY_MW, SYSTEM_GROUP, type CurveDay, type CurveMetricKey } from '../lib/bidCurves';
 import type { Source } from '../lib/aggregate';
-import type { CurveStore } from '../lib/curveStore';
+import { COMPARE_DAYS, type CurveStore } from '../lib/curveStore';
 import { formatDay, slotRangeLabel, slotStartLabel } from '../lib/dates';
 import { fmtNum, fmtPrice, fmtSigned } from '../lib/format';
 import { reselect, type Selection } from '../lib/select';
 import {
+  adjustSensitivity,
+  blockModels,
   curveSensitivity,
+  effectiveShift,
   exceedStep,
+  isCompleteShare,
   priceAtShift,
+  priceResponse,
+  publishedShare,
   SENS_FIELD_INDEX,
   SENS_FIELDS,
   sensitivityValues,
+  shareQuantile,
   SPIKE_PRICES,
+  type AdjustedSensitivity,
+  type BlockModel,
+  type BlockModels,
+  type BlockShare,
+  type PublishedSensitivity,
   type SensField,
   type Sensitivity,
   type SpikePrice,
@@ -35,7 +49,7 @@ import { renderTiles, type StatTile } from '../ui/kpi';
 import { TOKENS, type ThemeName } from '../ui/theme';
 import { ttHeader, ttNote, ttRow } from '../ui/tooltip';
 import type { ViewContext } from './base';
-import { DASH_ICON, describeSelection, endLabels, grid, legend, LINE_ICON, PRICE_UNIT, rangeTag, styledLine, valueAxis, withAlpha } from './common';
+import { describeSelection, endLabels, grid, legend, PRICE_UNIT, rangeTag, styledLine, valueAxis, withAlpha } from './common';
 import { curveNote, fileDate, fmtGw, granText, isEstimate, legendTextWidth, namedTooltip, PLOT_TOP, targetLabel, targetText, wrappedLegend, type AxisParam } from './curveCommon';
 import { autoGranularity, breakGaps, buildSeriesPoints, periodLabel, TIME_AXIS_LABEL } from './timeseries';
 
@@ -61,7 +75,31 @@ interface TargetRow {
   estimate: boolean;
   /** 計算できないときの理由 */
   reason: string;
+  /** ブロック入札の約定の変化を見込んだ価格感応度（見込めなければ null） */
+  block: RowBlock | null;
 }
+
+/** ブロック入札の約定の変化を見込んだ価格感応度: 見込み（mid）と、範囲の両端（less: 効かない分が少ない側、more: 多い側） */
+interface RowBlock {
+  /** slot: そのコマの公表値から、recent: 直近の日のシステムプライスの公表値から求めた割合で見込んだ */
+  source: 'slot' | 'recent';
+  models: BlockModels;
+  mid: AdjustedSensitivity;
+  less: AdjustedSensitivity;
+  more: AdjustedSensitivity;
+}
+
+/** 直近の日のシステムプライスの公表値から求めた、足した量のうち効かなかった割合（中央値と 25%・75% 点） */
+interface Calibration {
+  /** 割合を求めたコマの数と日数 */
+  slots: number;
+  days: number;
+  q25: BlockShare;
+  q50: BlockShare;
+  q75: BlockShare;
+}
+/** 割合を求めるのに要るコマの数（1 日分） */
+const MIN_CALIBRATION = SLOTS;
 
 /** エリアの期間の価格感応度（コマごとに SENS_FIELDS の値。集めたときの取引結果が変われば集め直す） */
 interface AreaSensitivity {
@@ -96,6 +134,36 @@ function sensitivityOf(ac: AreaCurve | null): Sensitivity | null {
   return curveSensitivity(ac, ac.correction?.price);
 }
 
+/**
+ * その行のカーブで、ブロック入札の約定の変化を見込んだ価格感応度（見込めなければ null）。
+ * システムプライスのカーブ（分断していないエリアも）は、そのコマの公表値に合う割合で、ほかは直近の日の割合で見込む
+ */
+function blockOf(r: TargetRow, slotShare: BlockShare | null, cal: Calibration | null): RowBlock | null {
+  if (!r.s || !r.ac) return null;
+  let source: RowBlock['source'];
+  let models: BlockModels;
+  if (r.ac.kind === 'system' && !r.ac.unnamed && slotShare && isCompleteShare(slotShare)) {
+    source = 'slot';
+    // 5GW を超える分は、1 コマの割合（ばらつきが大きい）ではなく直近の日の割合で伸ばす
+    models = blockModels(slotShare, slotShare, slotShare, cal ? { mid: cal.q50, more: cal.q75 } : undefined);
+  } else if (cal && [cal.q25, cal.q50, cal.q75].every(isCompleteShare)) {
+    source = 'recent';
+    models = blockModels(cal.q50, cal.q25, cal.q75);
+  } else {
+    return null;
+  }
+  return { source, models, mid: adjustSensitivity(r.s, models.mid), less: adjustSensitivity(r.s, models.less), more: adjustSensitivity(r.s, models.more) };
+}
+
+/** エリア別の図の行に書く、計算できない理由（計算できれば null） */
+function shortReason(r: TargetRow): string | null {
+  if (r.s) return null;
+  if (!r.ac) return 'カーブなし';
+  if (r.ac.kind === 'combined') return '単エリアが複数のため計算できない';
+  if (r.ac.kind === 'unavailable') return '単エリアを推定できない';
+  return '交わらない';
+}
+
 function unusableReason(ac: AreaCurve | null): string {
   if (!ac) return 'カーブがありません';
   if (ac.kind === 'combined') return '単エリアが複数あり、エリアごとのカーブが分かりません';
@@ -119,6 +187,10 @@ export class SensitivitySection {
   /** 値を集めているエリア（集めていなければ null） */
   private collecting: AreaKey | null = null;
   private readonly aligned = new Map<string, Float64Array>();
+  /** ブロック入札の変化の見込み方の説明（1 コマの図の下） */
+  private readonly blockNote: HTMLElement;
+  /** 直近の日の公表値から求めた割合（入札カーブ・取引結果・使った日が同じあいだ使い回す） */
+  private cal: { cs: CurveStore; ds: Dataset; key: string; value: Calibration | null } | null = null;
 
   constructor(
     private readonly host: SensitivityHost,
@@ -152,8 +224,10 @@ export class SensitivitySection {
 
     this.response = host.card(g, { title: '買いの増減と約定価格', height: 380, wide: true });
     this.tiles = h('div', { class: 'kpis', 'aria-label': '約定価格が 0.01 円になる・高騰する買いの増減' });
+    this.blockNote = h('p', { class: 'card-note' });
     this.response.footer.append(
       this.tiles,
+      this.blockNote,
       h(
         'p',
         { class: 'card-note' },
@@ -188,6 +262,7 @@ export class SensitivitySection {
       'ブロック入札の約定と、分断エリアのカーブでは連系線でやりとりする量を変えない目安です。' +
       'JEPX もシステムプライスの価格感応度を公表していますが（2021 年度から。npm run fetch で取引結果と一緒に取得します）、' +
       '0.01 円の売りか 999 円の買いを足して約定計算をやり直し、ブロック入札の約定も判定し直しているため、この目安より動きが小さいことが多くあります。' +
+      '1 コマの図には、公表値から求めた「ブロック入札の約定が変わって効かない分」を見込んだ値と、その範囲も重ねます。' +
       (cs.isDemo ? 'デモ表示では、公表値も合成した値です。' : '');
     this.renderSlot(cs, date);
     this.renderPeriod(cs);
@@ -205,7 +280,7 @@ export class SensitivitySection {
         if (!done.has(ac.sell)) done.set(ac.sell, sensitivityOf(ac));
         s = done.get(ac.sell)!;
       }
-      return { target, ac, s, estimate: !!ac && isEstimate(ac), reason: s ? '' : unusableReason(ac) };
+      return { target, ac, s, estimate: !!ac && isEstimate(ac), reason: s ? '' : unusableReason(ac), block: null };
     });
   }
 
@@ -221,7 +296,15 @@ export class SensitivitySection {
       return;
     }
     const rows = this.slotRows(day, slot);
-    this.renderResponse(rows.find((r) => r.target === state.curveArea)!, date, slot, when);
+    // ブロック入札の約定の変化の見込み: システムプライスのカーブはこのコマの公表値から、ほかは直近の日の公表値から
+    const pub = this.published(date, slot);
+    const sys = rows.find((r) => r.target === 'system')?.s;
+    const slotShare = pub && sys ? publishedShare(sys.response, sys.base, pub) : null;
+    const cal = this.calibration(cs, date);
+    for (const r of rows) r.block = blockOf(r, slotShare, cal);
+    const target = rows.find((r) => r.target === state.curveArea)!;
+    this.renderBlockNote(target, cal, !!slotShare);
+    this.renderResponse(target, date, slot, when);
     if (!rows.some((r) => r.s)) {
       for (const c of [this.areaSens, this.areaMargin]) c.setEmpty(`${when} の入札カーブがありません。`);
       return;
@@ -231,8 +314,70 @@ export class SensitivitySection {
     this.renderAreaMargin(rows, date, slot, when);
   }
 
+  /**
+   * 直近の日（表示している日まで COMPARE_DAYS 日。読み込んだ日だけ）のシステムプライスのカーブと公表値から、
+   * 足した量のうち効かなかった割合を求める（MIN_CALIBRATION コマに満たなければ null）
+   */
+  private calibration(cs: CurveStore, date: number): Calibration | null {
+    const { ds } = this.host.ctx();
+    const days = cs.recent(date, COMPARE_DAYS).filter((d) => cs.getDay(d));
+    const key = days.join(',');
+    if (this.cal && this.cal.cs === cs && this.cal.ds === ds && this.cal.key === key) return this.cal.value;
+    const samples: BlockShare[] = [];
+    let used = 0;
+    for (const d of days) {
+      const before = samples.length;
+      cs.getDay(d)!.slots.forEach((groups, s) => {
+        const sys = groups?.find((g) => g.id === SYSTEM_GROUP);
+        const pub = sys ? this.published(d, s) : null;
+        const r = sys && pub ? priceResponse(sys) : null;
+        if (r && pub) samples.push(publishedShare(r, priceAtShift(r, 0), pub));
+      });
+      if (samples.length > before) used++;
+    }
+    const value =
+      samples.length >= MIN_CALIBRATION
+        ? {
+            slots: samples.length,
+            days: used,
+            q25: shareQuantile(samples, 0.25, MIN_CALIBRATION),
+            q50: shareQuantile(samples, 0.5, MIN_CALIBRATION),
+            q75: shareQuantile(samples, 0.75, MIN_CALIBRATION),
+          }
+        : null;
+    this.cal = { cs, ds, key, value };
+    return value;
+  }
+
+  /** ブロック入札の変化の見込み方と、直近の日の公表値から求めた割合（1 コマの図の下） */
+  private renderBlockNote(target: TargetRow, cal: Calibration | null, slot: boolean): void {
+    if (!cal && !slot) {
+      this.blockNote.textContent = 'ブロック入札の約定の変化を見込むには、価格感応度の公表値が要ります（npm run fetch で取引結果と一緒に取得します）。';
+      return;
+    }
+    const pct = (v: number) => `${fmtNum(v * 100)}%`;
+    const shares = cal
+      ? SENSITIVITY_SIZES.flatMap((mw, i) =>
+          (['up', 'down'] as const).map(
+            (side) => `買い ${side === 'up' ? '+' : '−'}${sizeText(mw)} ${pct(cal.q50[side][i])}〔${pct(cal.q25[side][i])}〜${pct(cal.q75[side][i])}〕`,
+          ),
+        ).join('、')
+      : '';
+    this.blockNote.textContent =
+      '灰色の線と帯（エリア別の図では点と線）は、ブロック入札の約定が変わる分を見込んだ値と範囲です。' +
+      'JEPX の公表値の計算では、足した量の一部が効きません（価格が上がると、それまで約定しなかった売りのブロック入札が約定するなど）。' +
+      'そこで公表値から、足した量のうち効かなかった割合を求め、カーブをずらす量をその分減らしています。' +
+      (slot ? 'システムプライスのカーブ（分断していないエリアも同じカーブ）は、この時間帯の公表値（±0.5GW、±1GW、±5GW）に合うように割合を決め、その間は量について直線で結びます。' : '') +
+      (cal
+        ? `分断エリアや単エリアのカーブは、直近 ${fmtNum(cal.days)} 日（${fmtNum(cal.slots)} コマ）のシステムプライスの公表値から求めた割合の中央値で見込み、範囲は 25〜75% 点とします。`
+        : '直近の日の公表値が無いため、分断エリアや単エリアのカーブは見込めません。') +
+      '5GW を超える増減は、効かない量が 5GW のときから増えない場合と、割合のまま増える場合の間を範囲とし、その中間を見込みにしています。' +
+      (cal ? `効かなかった割合の中央値〔25〜75% 点〕: ${shares}。` : '') +
+      (target.block ? '' : '（このカーブは見込めません）');
+  }
+
   /** JEPX が公表している、そのコマの価格感応度（システムプライス。無ければ null） */
-  private published(day: number, slot: number): { system: number; up: number[]; down: number[] } | null {
+  private published(day: number, slot: number): PublishedSensitivity | null {
     const v = (k: SeriesKey) => this.host.value(day, slot, k);
     const up = SENSITIVITY_SIZES.map((mw) => v(sensitivityKey('buy', mw)));
     const down = SENSITIVITY_SIZES.map((mw) => v(sensitivityKey('sell', mw)));
@@ -264,10 +409,15 @@ export class SensitivitySection {
     const probeStep = niceStep((axis.max - axis.min) / 2000);
     const lineName = '入札カーブから計算した目安';
     const pubName = 'JEPX の公表値';
+    const block = r.block;
+    const adjColor = t.ink2;
+    const adjName = 'ブロック込みの見込み';
+    const bandName = block?.source === 'slot' ? '見込みの範囲（5GW 超）' : '見込みの範囲（25〜75%）';
     card.setSubtitle(
       `${when}・${targetText(r.target, r.ac)}・約定価格 ${fmtPrice(s.base)} ${PRICE_UNIT}・横軸は買いの増減（GW）、縦軸はそのときの約定価格` +
         (r.estimate ? '・破線は推定のカーブ' : '') +
-        (pub ? `・◆は ${pubName}（買い ±0.5・1・5GW）` : ''),
+        (pub ? `・◆は ${pubName}（買い ±0.5・1・5GW）` : '') +
+        (block ? '・灰色の線と帯はブロック入札の変化を見込んだ値と範囲' : ''),
     );
 
     const series: Record<string, unknown>[] = [
@@ -327,14 +477,34 @@ export class SensitivitySection {
         itemStyle: { color: t.ink, borderColor: t.surface, borderWidth: 1.5 },
       });
     }
+    if (block) series.push(...blockSeries(s, block, axis, adjName, bandName, adjColor, theme));
     series.push(shiftProbe(axis.min, axis.max, probeStep));
+    // ツールチップの、ブロック入札の変化を見込んだ値（範囲の幅が 0.005 円未満なら範囲は出さない）
+    const blockRow = (mw: number): string => {
+      if (!block) return '';
+      const at = (m: BlockModel) => priceAtShift(s.response, effectiveShift(m, mw));
+      const [mid, a, b] = [at(block.models.mid), at(block.models.less), at(block.models.more)];
+      if (!Number.isFinite(mid)) return ttRow(adjColor, '交わらない', adjName, 'line');
+      const range = Number.isFinite(a) && Number.isFinite(b) && Math.abs(a - b) >= 0.005 ? `、範囲 ${fmtPrice(Math.min(a, b))}〜${fmtPrice(Math.max(a, b))} 円` : '';
+      return ttRow(adjColor, `${fmtPrice(mid)} ${PRICE_UNIT}`, `${adjName}（${fmtSigned(mid - s.base)} 円${range}）`, 'line');
+    };
 
+    // 凡例は折り返す（ページ送りで隠れる項目を作らない）
+    const items: [string, boolean, string | undefined][] = [
+      [lineName, r.estimate, undefined],
+      ...(pub ? [[pubName, false, 'diamond'] as [string, boolean, string]] : []),
+      ...(block ? ([[adjName, false, undefined], [bandName, false, 'rect']] as [string, boolean, string | undefined][]) : []),
+    ];
+    const lg = wrappedLegend(
+      items.map((x) => x[0]),
+      card.chart.getWidth(),
+      items.map((x) => x[1]),
+      items.map((x) => x[2]),
+    );
     card.setOption(
       {
-        grid: grid({ top: PLOT_TOP, bottom: 30, right: 28 }),
-        legend: legend({
-          data: [{ name: lineName, icon: r.estimate ? DASH_ICON : LINE_ICON }, ...(pub ? [{ name: pubName, icon: 'diamond' }] : [])],
-        }),
+        grid: grid({ top: lg.top, bottom: 30, right: 28 }),
+        legend: lg.legend,
         tooltip: {
           trigger: 'axis',
           axisPointer: { type: 'line', axis: 'x', snap: false },
@@ -351,7 +521,7 @@ export class SensitivitySection {
             const k = SENSITIVITY_SIZES.findIndex((mw2) => mw2 === Math.abs(mw));
             const v = pub && k >= 0 ? (mw > 0 ? pub.up[k] : pub.down[k]) : Number.NaN;
             if (pub && Number.isFinite(v)) html += ttRow(t.ink, `${fmtPrice(v)} ${PRICE_UNIT}`, `${pubName}（${fmtSigned(v - pub.system)} 円）`, 'none');
-            return html;
+            return html + blockRow(mw);
           },
         },
         xAxis: {
@@ -369,9 +539,9 @@ export class SensitivitySection {
         yAxis: valueAxis(PRICE_UNIT, { min: 0, max: top, axisLine: { onZero: false } }),
         series,
       },
-      responseTable(s, pub, r.target, date, slot),
+      responseTable(s, pub, block, r.target, date, slot),
     );
-    renderTiles(this.tiles, responseTiles(s, state.sensSize, pub));
+    renderTiles(this.tiles, responseTiles(s, state.sensSize, pub, block));
   }
 
   /** エリア別の、買いを ±N 増減したときの約定価格の上昇幅・下落幅（右: 上昇、左: 下落） */
@@ -386,26 +556,38 @@ export class SensitivitySection {
     const up = rows.map((r) => (r.s ? r.s.up[k] - r.s.base : Number.NaN));
     const down = rows.map((r) => (r.s ? r.s.down[k] - r.s.base : Number.NaN));
     const pub = this.published(date, slot);
+    const adjName = 'ブロック込みの見込み';
+    const withBlock = rows.some((r) => r.block);
     this.areaSens.setSubtitle(
       `${when}・買いが ${size} 増えたとき（右）・減ったとき（左）の約定価格の動き（円/kWh。各エリアの価格を決めたカーブから計算した目安）` +
         (rows.some((r) => r.estimate && r.s) ? '・破線の枠は推定のカーブ' : '') +
+        (withBlock ? '・点と線はブロック入札の変化を見込んだ値と範囲' : '') +
         '・押すと対象をそのエリアにします',
     );
-    // 買いを増やすと売りが尽きるときは、棒の代わりにそう書く
-    const exhausted = rows.map((r, i) => (r.s && !Number.isFinite(up[i]) ? '売りが尽きる' : null));
-    const bars = (name: string, color: string, values: number[], notes: (string | null)[], position: 'left' | 'right') => ({
+    const whisk = (side: 'up' | 'down') =>
+      rows.map((r) => {
+        if (!r.block || !r.s) return null;
+        const [mid, a, b] = [r.block.mid, r.block.less, r.block.more].map((x) => x[side][k] - r.s!.base);
+        return { mid, lo: Math.min(a, b), hi: Math.max(a, b) };
+      });
+    // 計算できないカーブと、買いを増やすと売りが尽きるときは、棒の代わりにそう書く
+    const upNotes = rows.map((r, i) => shortReason(r) ?? (r.s && !Number.isFinite(up[i]) ? '売りが尽きる' : null));
+    const upW = whisk('up');
+    const downW = whisk('down');
+    // 見込みの範囲がある棒は、値のラベルを範囲の外に置く（棒のラベルは出さない）
+    const bars = (name: string, color: string, values: number[], notes: (string | null)[], position: 'left' | 'right', w: (Whisker | null)[]) => ({
       type: 'bar',
       name,
       stack: 'sens',
       barMaxWidth: 16,
       color,
-      data: barItems(values, notes, color, rows, position),
+      data: barItems(values, notes, color, rows, position, w.map((x) => !!x && whiskerDrawn(x))),
       label: { show: true, color: t.ink2, fontSize: 11, formatter: (p: { value: number }) => (Number.isFinite(p.value) ? fmtSigned(p.value) : '') },
     });
     this.areaSens.setOption(
       {
         grid: grid({ top: PLOT_TOP, right: 56, bottom: 28 }),
-        legend: legend({ data: [upName, downName] }),
+        legend: legend({ data: [upName, downName, ...(withBlock ? [{ name: adjName, icon: 'circle' }] : [])] }),
         tooltip: {
           trigger: 'axis',
           axisPointer: { type: 'shadow' },
@@ -416,6 +598,15 @@ export class SensitivitySection {
             if (!r.s) return html + ttNote(r.reason);
             html += ttRow(pos, priceMove(r.s.up[k], r.s.base), upName, 'rect');
             html += ttRow(neg, priceMove(r.s.down[k], r.s.base), downName, 'rect');
+            if (r.block) {
+              const b = r.block;
+              for (const [side, name] of [
+                ['up', upName],
+                ['down', downName],
+              ] as const) {
+                html += ttRow(t.ink2, blockMoveText(b.mid[side][k], b.less[side][k], b.more[side][k], r.s.base), `見込み（${name}）`, 'line');
+              }
+            }
             html += ttNote(`約定価格 ${fmtPrice(r.s.base)} ${PRICE_UNIT}${r.estimate ? '・推定のカーブ' : ''}`);
             if (r.target === 'system' && pub && Number.isFinite(pub.up[k]) && Number.isFinite(pub.down[k])) {
               html += ttNote(`JEPX の公表値: ${fmtSigned(pub.up[k] - pub.system)} 円 / ${fmtSigned(pub.down[k] - pub.system)} 円`);
@@ -423,9 +614,18 @@ export class SensitivitySection {
             return html;
           },
         },
-        xAxis: barValueAxis(PRICE_UNIT, [...up, ...down], theme),
+        xAxis: barValueAxis(PRICE_UNIT, [...up, ...down, ...[...upW, ...downW].flatMap((w) => (w ? [w.lo, w.hi] : []))], theme),
         yAxis: { type: 'category', data: rows.map((r) => shortTarget(r.target)), inverse: true, axisLabel: { interval: 0 } },
-        series: [bars(upName, pos, up, exhausted, 'right'), bars(downName, neg, down, rows.map(() => null), 'left')],
+        series: [
+          bars(upName, pos, up, upNotes, 'right', upW),
+          bars(downName, neg, down, rows.map(() => null), 'left', downW),
+          ...(withBlock
+            ? [
+                whiskerSeries(adjName, t.ink2, theme, upW, { values: up, format: (v) => fmtSigned(v) }),
+                whiskerSeries(adjName, t.ink2, theme, downW, { values: down, format: (v) => fmtSigned(v) }),
+              ]
+            : []),
+        ],
       },
       areaTable(rows, date, slot),
     );
@@ -442,27 +642,41 @@ export class SensitivitySection {
     const spikeName = `${x} 円を超える`;
     const floor = rows.map((r) => (r.s && Number.isFinite(r.s.floor) ? r.s.floor / 1000 : Number.NaN));
     const spike = rows.map((r) => (r.s && Number.isFinite(r.s.spike[k]) ? r.s.spike[k] / 1000 : Number.NaN));
+    const adjName = 'ブロック込みの見込み';
+    const withBlock = rows.some((r) => r.block);
     this.areaMargin.setSubtitle(
       `${when}・約定価格が 0.01 円になる買いの減少（左）と、${x} 円を超える買いの増加（右）（GW。各エリアの価格を決めたカーブから計算した目安）` +
         (rows.some((r) => r.estimate && r.s) ? '・破線の枠は推定のカーブ' : '') +
+        (withBlock ? '・点と線はブロック入札の変化を見込んだ値と範囲' : '') +
         '・押すと対象をそのエリアにします',
     );
+    const whisk = (pick: (a: AdjustedSensitivity) => number) =>
+      rows.map((r) => {
+        if (!r.block) return null;
+        const [mid, a, b] = [r.block.mid, r.block.less, r.block.more].map((v) => pick(v) / 1000);
+        return { mid, lo: Math.min(a, b), hi: Math.max(a, b) };
+      });
+    const floorW = whisk((a) => a.floor);
+    const spikeW = whisk((a) => a.spike[k]);
+    const layout = (index: number) => ({ index, count: 2, barMaxWidth: 12, barGap: '20%' });
     // 0.01 円にならない・高騰の目安を超えないときは、棒の代わりにそう書く
-    const floorNotes = rows.map((r) => (!r.s || Number.isFinite(r.s.floor) ? null : r.s.floor === Number.NEGATIVE_INFINITY ? '0.01 円にならない' : '売りが尽きるまで 0.01 円'));
+    const floorNotes = rows.map(
+      (r) => shortReason(r) ?? (!r.s || Number.isFinite(r.s.floor) ? null : r.s.floor === Number.NEGATIVE_INFINITY ? '0.01 円にならない' : '売りが尽きるまで 0.01 円'),
+    );
     const spikeNotes = rows.map((r) => (!r.s || Number.isFinite(r.s.spike[k]) ? null : Number.isNaN(r.s.spike[k]) ? '売りが尽きるまで超えない' : '買いが無くても超える'));
-    const bars = (name: string, color: string, values: number[], notes: (string | null)[]) => ({
+    const bars = (name: string, color: string, values: number[], notes: (string | null)[], w: (Whisker | null)[]) => ({
       type: 'bar',
       name,
       barMaxWidth: 12,
       barGap: '20%',
       color,
-      data: barItems(values, notes, color, rows),
+      data: barItems(values, notes, color, rows, undefined, w.map((x) => !!x && whiskerDrawn(x))),
       label: { show: true, color: t.ink2, fontSize: 11, formatter: (p: { value: number }) => (Number.isFinite(p.value) ? fmtSigned(p.value, 1) : '') },
     });
     this.areaMargin.setOption(
       {
         grid: grid({ top: PLOT_TOP, right: 48, bottom: 28, left: 8 }),
-        legend: legend({ data: [floorName, spikeName] }),
+        legend: legend({ data: [floorName, spikeName, ...(withBlock ? [{ name: adjName, icon: 'circle' }] : [])] }),
         tooltip: {
           trigger: 'axis',
           axisPointer: { type: 'shadow' },
@@ -473,13 +687,28 @@ export class SensitivitySection {
             if (!r.s) return html + ttNote(r.reason);
             html += ttRow(neg, floorText(r.s.floor), floorName, 'rect');
             html += ttRow(pos, spikeText(r.s.spike[k], x), spikeName, 'rect');
+            if (r.block) {
+              const b = r.block;
+              const text = (pick: (a: AdjustedSensitivity) => number) => blockShiftText(pick(b.mid), pick(b.less), pick(b.more))?.replace('ブロック込みの見込み ', '') ?? '—';
+              html += ttRow(t.ink2, text((a) => a.floor), `見込み（${floorName}）`, 'line');
+              html += ttRow(t.ink2, text((a) => a.spike[k]), `見込み（${spikeName}）`, 'line');
+            }
             html += ttNote(`約定価格 ${fmtPrice(r.s.base)} ${PRICE_UNIT}・買いが ${fmtGw(r.s.limit)} より増えると売りが尽きる${r.estimate ? '・推定のカーブ' : ''}`);
             return html;
           },
         },
-        xAxis: barValueAxis('GW', [...floor, ...spike], theme),
+        xAxis: barValueAxis('GW', [...floor, ...spike, ...[...floorW, ...spikeW].flatMap((w) => (w ? [w.lo, w.hi] : []))], theme),
         yAxis: { type: 'category', data: rows.map((r) => shortTarget(r.target)), inverse: true, axisLabel: { interval: 0 } },
-        series: [bars(floorName, neg, floor, floorNotes), bars(spikeName, pos, spike, spikeNotes)],
+        series: [
+          bars(floorName, neg, floor, floorNotes, floorW),
+          bars(spikeName, pos, spike, spikeNotes, spikeW),
+          ...(withBlock
+            ? [
+                whiskerSeries(adjName, t.ink2, theme, floorW, { values: floor, format: (v) => fmtSigned(v, 1), bar: layout(0) }),
+                whiskerSeries(adjName, t.ink2, theme, spikeW, { values: spike, format: (v) => fmtSigned(v, 1), bar: layout(1) }),
+              ]
+            : []),
+        ],
       },
       areaTable(rows, date, slot),
     );
@@ -827,9 +1056,18 @@ function barStyle(color: string, estimate: boolean, positive: boolean): Record<s
  * エリア別の図の棒（推定のカーブは薄い塗りと破線の枠）。値が無く理由があるところは、0 の位置に理由だけを書く
  * @param position 値ラベルの位置（省略すると値の符号で左右を決める）
  */
-function barItems(values: number[], notes: (string | null)[], color: string, rows: TargetRow[], position?: 'left' | 'right'): Record<string, unknown>[] {
+function barItems(
+  values: number[],
+  notes: (string | null)[],
+  color: string,
+  rows: TargetRow[],
+  position?: 'left' | 'right',
+  hideLabel: boolean[] = [],
+): Record<string, unknown>[] {
   return values.map((v, i) => {
-    if (Number.isFinite(v)) return { value: v, itemStyle: barStyle(color, rows[i].estimate, v >= 0), label: { position: position ?? (v >= 0 ? 'right' : 'left') } };
+    if (Number.isFinite(v)) {
+      return { value: v, itemStyle: barStyle(color, rows[i].estimate, v >= 0), label: { show: !hideLabel[i], position: position ?? (v >= 0 ? 'right' : 'left') } };
+    }
     const note = notes[i];
     return note ? { value: 0, itemStyle: { color: 'transparent' }, label: { position: position ?? 'right', formatter: note } } : { value: Number.NaN };
   });
@@ -893,6 +1131,108 @@ function responsePath(s: Sensitivity, lo: number, hi: number): [number, number][
   return out;
 }
 
+/** 1 コマの図の、ブロック入札の変化を見込んだ値の線と、範囲の帯（下端は透明、上端との差を面で塗る） */
+function blockSeries(
+  s: Sensitivity,
+  block: RowBlock,
+  axis: { min: number; max: number },
+  name: string,
+  bandName: string,
+  color: string,
+  theme: ThemeName,
+): Record<string, unknown>[] {
+  const n = 600;
+  const xs = Array.from({ length: n + 1 }, (_, i) => axis.min + ((axis.max - axis.min) * i) / n);
+  const at = (m: BlockModel, x: number) => priceAtShift(s.response, effectiveShift(m, x * 1000));
+  const a = xs.map((x) => at(block.models.less, x));
+  const b = xs.map((x) => at(block.models.more, x));
+  const line = { type: 'line', symbol: 'none', lineStyle: { opacity: 0 }, silent: true, z: 1, stack: 'block' };
+  return [
+    { ...line, name: '_low', data: xs.map((x, i) => [x, Math.min(a[i], b[i])]) },
+    { ...line, name: bandName, color, data: xs.map((x, i) => [x, Math.abs(a[i] - b[i])]), areaStyle: { color, opacity: TOKENS[theme].bandAlpha } },
+    styledLine(name, color, theme, xs.map((x) => [x, at(block.models.mid, x)]), false, { symbol: 'none', z: 4 }),
+  ];
+}
+
+type Whisker = { lo: number; hi: number; mid: number };
+/** 誤差の線を描く（見込みと範囲の値がそろっている） */
+const whiskerDrawn = (w: Whisker) => [w.lo, w.hi, w.mid].every(Number.isFinite);
+
+/**
+ * エリア別の図の、ブロック入札の変化を見込んだ値（点）と範囲（両端に短い縦線の付いた横線）。
+ * 重ねる棒の値のラベルも、棒の先と範囲の端のうち外側に書く（棒のラベルと線が重ならないように）
+ * @param opts.values 重ねる棒の値、opts.format その値のラベル、opts.bar 並べた棒のうちどれに重ねるか（1 本だけなら省略）
+ */
+function whiskerSeries(
+  name: string,
+  color: string,
+  theme: ThemeName,
+  items: (Whisker | null)[],
+  opts: { values: number[]; format: (v: number) => string; bar?: { index: number; count: number; barMaxWidth: number; barGap: string } },
+): Record<string, unknown> {
+  const t = TOKENS[theme];
+  const surface = t.surface;
+  const bar = opts.bar;
+  return {
+    type: 'custom',
+    name,
+    color,
+    z: 6,
+    silent: true,
+    tooltip: { show: false },
+    data: items.map((it, i) => (it && whiskerDrawn(it) ? [it.lo, it.hi, it.mid, i] : [Number.NaN, Number.NaN, Number.NaN, i])),
+    encode: { x: [0, 1, 2], y: 3 },
+    renderItem: (_params: unknown, api: CustomSeriesRenderItemAPI): CustomSeriesRenderItemReturn => {
+      const [lo, hi, mid, i] = [0, 1, 2, 3].map((d) => Number(api.value(d)));
+      if (![lo, hi, mid].every(Number.isFinite)) return null;
+      // 並べた棒のうち、重ねる棒の中心（棒と同じ設定で並べたときの位置）
+      const layout = bar ? api.barLayout({ count: bar.count, barMaxWidth: bar.barMaxWidth, barGap: bar.barGap }) : null;
+      const offset = bar && layout ? (layout[bar.index]?.offsetCenter ?? 0) : 0;
+      const [x0, y0] = api.coord([lo, i]);
+      const [x1] = api.coord([hi, i]);
+      const [xm] = api.coord([mid, i]);
+      const y = y0 + offset;
+      const style = { stroke: color, lineWidth: 1.5 };
+      const range =
+        Math.abs(x1 - x0) >= 2
+          ? [
+              { type: 'line' as const, shape: { x1: x0, y1: y, x2: x1, y2: y }, style },
+              { type: 'line' as const, shape: { x1: x0, y1: y - 4, x2: x0, y2: y + 4 }, style },
+              { type: 'line' as const, shape: { x1: x1, y1: y - 4, x2: x1, y2: y + 4 }, style },
+            ]
+          : [];
+      const v = opts.values[i];
+      const label = [];
+      if (Number.isFinite(v)) {
+        const [xb] = api.coord([v, i]);
+        const right = v >= 0;
+        const edge = right ? Math.max(xb, x0, x1) : Math.min(xb, x0, x1);
+        label.push({
+          type: 'text' as const,
+          style: { text: opts.format(v), x: edge + (right ? 6 : -6), y, align: (right ? 'left' : 'right') as 'left' | 'right', verticalAlign: 'middle' as const, fill: t.ink2, font: api.font({ fontSize: 11 }) },
+        });
+      }
+      return { type: 'group', children: [...range, { type: 'circle', shape: { cx: xm, cy: y, r: 3.5 }, style: { fill: color, stroke: surface, lineWidth: 1.5 } }, ...label] };
+    },
+  };
+}
+
+/** ブロック入札の変化を見込んだ境目（MW）: 見込みと、範囲（効かない分が少ない側〜多い側） */
+function blockShiftText(mid: number, less: number, more: number): string | undefined {
+  if (Number.isNaN(mid)) return 'ブロック込みの見込みでは届かない';
+  if (!Number.isFinite(mid)) return undefined;
+  const end = (v: number) => (Number.isFinite(v) ? signedGw(v) : '届かない');
+  const range = Math.abs(less - more) >= 5 || Number.isFinite(less) !== Number.isFinite(more) ? `（${end(less)}〜${end(more)}）` : '';
+  return `ブロック込みの見込み ${signedGw(mid)} GW${range}`;
+}
+
+/** ブロック入札の変化を見込んだ価格の動き（円/kWh）: 見込みと、範囲 */
+function blockMoveText(mid: number, less: number, more: number, base: number): string {
+  if (!Number.isFinite(mid)) return '売りが尽きる';
+  const range = Number.isFinite(less) && Number.isFinite(more) && Math.abs(less - more) >= 0.005 ? `（${fmtSigned(less - base)}〜${fmtSigned(more - base)}）` : '';
+  return `${fmtSigned(mid - base)} 円${range}`;
+}
+
 /** 横軸のツールチップ用の見えない系列（横軸を細かく刻んだ点。curves.ts の priceProbe の横軸版） */
 function shiftProbe(min: number, max: number, step: number): Record<string, unknown> {
   const n = Math.floor((max - min) / step + 1e-9);
@@ -926,34 +1266,38 @@ function spikeText(spike: number, price: number): string {
   return spike > 0 ? `買いが ${fmtGw(spike)} 増えると` : `今は ${price} 円を超えている（買いが ${fmtGw(-spike)} 減ると ${price} 円以下）`;
 }
 
-/** 1 コマの図の下に並べる、0.01 円・高騰・売りが尽きるまでの量と、選んだ量の価格感応度 */
-function responseTiles(s: Sensitivity, size: SensitivitySize, pub: { system: number; up: number[]; down: number[] } | null): StatTile[] {
+/** 1 コマの図の下に並べる、0.01 円・高騰・売りが尽きるまでの量と、選んだ量の価格感応度（ブロック入札の変化の見込みも） */
+function responseTiles(s: Sensitivity, size: SensitivitySize, pub: PublishedSensitivity | null, block: RowBlock | null): StatTile[] {
   const k = SENSITIVITY_SIZES.indexOf(size);
   const finite = (v: number) => Number.isFinite(v);
+  const shift = (pick: (a: AdjustedSensitivity) => number) => (block ? blockShiftText(pick(block.mid), pick(block.less), pick(block.more)) : undefined);
   const tiles: StatTile[] = [
     {
       label: '0.01 円になる',
       value: finite(s.floor) ? signedGw(s.floor) : '—',
       unit: finite(s.floor) ? 'GW' : undefined,
+      delta: shift((a) => a.floor),
       sub: floorText(s.floor),
     },
     ...SPIKE_PRICES.map((p, i) => ({
       label: `${p} 円を超える`,
       value: finite(s.spike[i]) ? signedGw(s.spike[i]) : '—',
       unit: finite(s.spike[i]) ? 'GW' : undefined,
+      delta: shift((a) => a.spike[i]),
       sub: spikeText(s.spike[i], p),
     })),
     { label: '売り入札が尽きる', value: signedGw(s.limit), unit: 'GW', sub: `買いが ${fmtGw(Math.max(0, s.limit))} より増えると、売りが足りない` },
   ];
   const sz = sizeText(size);
-  for (const [dir, price, pubPrice] of [
-    ['+', s.up[k], pub?.up[k]],
-    ['−', s.down[k], pub?.down[k]],
-  ] as const) {
+  for (const side of ['up', 'down'] as const) {
+    const price = s[side][k];
+    const pubPrice = pub?.[side][k];
     tiles.push({
-      label: `買い ${dir}${sz}`,
+      label: `買い ${side === 'up' ? '+' : '−'}${sz}`,
       value: finite(price) ? fmtSigned(price - s.base) : '—',
       unit: finite(price) ? '円/kWh' : undefined,
+      // このコマの公表値に合わせた見込みは公表値と同じなので、公表値だけを出す
+      delta: block && block.source === 'recent' ? `ブロック込みの見込み ${blockMoveText(block.mid[side][k], block.less[side][k], block.more[side][k], s.base)}` : undefined,
       sub:
         (finite(price) ? `${fmtPrice(price)} 円になる` : '売りが尽きる') +
         (pub && pubPrice !== undefined && finite(pubPrice) ? `（JEPX の公表値 ${fmtSigned(pubPrice - pub.system)} 円）` : ''),
@@ -962,22 +1306,36 @@ function responseTiles(s: Sensitivity, size: SensitivitySize, pub: { system: num
   return tiles;
 }
 
-/** 1 コマの図の表: 買いの増減ごとの約定価格の目安と公表値、0.01 円・高騰・売りが尽きるまでの量 */
-function responseTable(s: Sensitivity, pub: { system: number; up: number[]; down: number[] } | null, target: CurveTarget, date: number, slot: number): TableData {
-  const rows: (string | number)[][] = [['増減なし', 0, s.base, pub?.system ?? '']];
+/**
+ * 1 コマの図の表: 買いの増減ごとの約定価格の目安と公表値、0.01 円・高騰・売りが尽きるまでの量と、
+ * ブロック入札の変化を見込んだ値（価格の行は約定価格、境目の行は買いの増減）
+ */
+function responseTable(s: Sensitivity, pub: PublishedSensitivity | null, block: RowBlock | null, target: CurveTarget, date: number, slot: number): TableData {
+  const blockCols = (pick: (a: AdjustedSensitivity) => number) => (block ? [pick(block.mid), pick(block.less), pick(block.more)] : ['', '', '']);
+  const rows: (string | number)[][] = [['増減なし', 0, s.base, pub?.system ?? '', s.base, s.base, s.base]];
   SENSITIVITY_SIZES.forEach((mw, k) => {
-    rows.push([`買い +${sizeText(mw)}`, mw, s.up[k], pub?.up[k] ?? '']);
-    rows.push([`買い −${sizeText(mw)}`, -mw, s.down[k], pub?.down[k] ?? '']);
+    rows.push([`買い +${sizeText(mw)}`, mw, s.up[k], pub?.up[k] ?? '', ...blockCols((a) => a.up[k])]);
+    rows.push([`買い −${sizeText(mw)}`, -mw, s.down[k], pub?.down[k] ?? '', ...blockCols((a) => a.down[k])]);
   });
   const at = (mw: number) => priceAtShift(s.response, mw);
-  rows.push(['0.01 円になる（これより買いが減ると）', s.floor, Number.isFinite(s.floor) ? at(s.floor - 1) : '', '']);
+  rows.push(['0.01 円になる（これより買いが減ると）', s.floor, Number.isFinite(s.floor) ? at(s.floor - 1) : '', '', ...blockCols((a) => a.floor)]);
   // 超えた直後の価格（段の境目ちょうどの買いの増減では、まだ超える前の価格で交わることがある）
-  SPIKE_PRICES.forEach((p, i) => rows.push([`${p} 円を超える（これより買いが増えると）`, s.spike[i], exceedStep(s.response, p)?.price ?? '', '']));
-  rows.push(['売り入札が尽きる（これより買いが増えると）', s.limit, '', '']);
+  SPIKE_PRICES.forEach((p, i) =>
+    rows.push([`${p} 円を超える（これより買いが増えると）`, s.spike[i], exceedStep(s.response, p)?.price ?? '', '', ...blockCols((a) => a.spike[i])]),
+  );
+  rows.push(['売り入札が尽きる（これより買いが増えると）', s.limit, '', '', '', '', '']);
   return {
-    columns: ['買いの増減', '買いの増減（MW）', '約定価格の目安（円/kWh）', 'JEPX の公表値（円/kWh）'],
+    columns: [
+      '買いの増減',
+      '買いの増減（MW）',
+      '約定価格の目安（円/kWh）',
+      'JEPX の公表値（円/kWh）',
+      'ブロック込みの見込み（価格の行は円/kWh、境目の行は買いの増減 MW）',
+      'ブロック込みの範囲・効かない分が少ない側',
+      'ブロック込みの範囲・効かない分が多い側',
+    ],
     rows: rows.map((r) => r.map((v) => (typeof v === 'number' && !Number.isFinite(v) ? '' : v))),
-    digits: [null, 0, 2, 2],
+    digits: [null, 0, 2, 2, 2, 2, 2],
     filename: `jepx_sensitivity_${fileDate(date)}_${slotStartLabel(slot).replace(':', '')}${target === 'system' ? '' : `_${target}`}.csv`,
   };
 }
@@ -993,9 +1351,14 @@ function areaTable(rows: TargetRow[], date: number, slot: number): TableData {
       '0.01 円になる買いの増減（MW）',
       ...SPIKE_PRICES.map((p) => `${p} 円を超える買いの増減（MW）`),
       '売りが尽きる買いの増減（MW）',
+      'ブロック込みの見込みのもと',
+      ...SENSITIVITY_SIZES.flatMap((mw) => [`ブロック込み 買い +${sizeText(mw)}（円/kWh）`, `ブロック込み 買い −${sizeText(mw)}（円/kWh）`]),
+      'ブロック込み 0.01 円になる買いの増減（MW）',
+      ...SPIKE_PRICES.map((p) => `ブロック込み ${p} 円を超える買いの増減（MW）`),
     ],
     rows: rows.map((r) => {
       const s = r.s;
+      const b = r.block?.mid;
       const num = (v: number | undefined) => (v !== undefined && Number.isFinite(v) ? v : '');
       return [
         targetLabel(r.target),
@@ -1005,9 +1368,25 @@ function areaTable(rows: TargetRow[], date: number, slot: number): TableData {
         num(s?.floor),
         ...SPIKE_PRICES.map((_, i) => num(s?.spike[i])),
         num(s?.limit),
+        r.block ? (r.block.source === 'slot' ? 'このコマの公表値' : '直近の日の公表値') : '',
+        ...SENSITIVITY_SIZES.flatMap((_, k) => [num(b?.up[k]), num(b?.down[k])]),
+        num(b?.floor),
+        ...SPIKE_PRICES.map((_, i) => num(b?.spike[i])),
       ];
     }),
-    digits: [null, null, 2, ...SENSITIVITY_SIZES.flatMap(() => [2, 2]), 0, ...SPIKE_PRICES.map(() => 0), 0],
+    digits: [
+      null,
+      null,
+      2,
+      ...SENSITIVITY_SIZES.flatMap(() => [2, 2]),
+      0,
+      ...SPIKE_PRICES.map(() => 0),
+      0,
+      null,
+      ...SENSITIVITY_SIZES.flatMap(() => [2, 2]),
+      0,
+      ...SPIKE_PRICES.map(() => 0),
+    ],
     filename: `jepx_sensitivity_areas_${fileDate(date)}_${slotStartLabel(slot).replace(':', '')}.csv`,
   };
 }

@@ -2,7 +2,7 @@
  * ECharts の初期化（必要なチャート・コンポーネントだけを取り込む）とテーマ登録。
  */
 import * as echarts from 'echarts/core';
-import { BarChart, BoxplotChart, HeatmapChart, LineChart, ScatterChart } from 'echarts/charts';
+import { BarChart, BoxplotChart, CustomChart, HeatmapChart, LineChart, ScatterChart } from 'echarts/charts';
 import {
   CalendarComponent,
   DataZoomComponent,
@@ -23,6 +23,7 @@ echarts.use([
   HeatmapChart,
   ScatterChart,
   BoxplotChart,
+  CustomChart,
   GridComponent,
   TooltipComponent,
   LegendComponent,
