@@ -17,6 +17,7 @@ import {
 import type { CurveIndex } from './dataFile';
 import { fiscalYearEnd, fiscalYearStart, parseDateString } from './dates';
 import { syntheticCurveDay } from './demoCurves';
+import { absorbedOfDay, publishedAt } from './sensitivity';
 import { AREA_KEYS, kwhToMw, SERIES_INDEX, SLOTS, type SeriesKey } from './series';
 import type { Dataset } from './store';
 
@@ -242,7 +243,9 @@ export class CurveStore {
       areas: Object.fromEntries(AREA_KEYS.map((a) => [a, at(a, s)])),
     }));
     const { raw, groups } = syntheticCurveDay(day, targets);
-    return encodeCurveDay(raw, groups);
+    const file = encodeCurveDay(raw, groups);
+    const absorbed = absorbedOfDay(raw, (s) => publishedAt((k) => at(k, s)));
+    return absorbed.some(Boolean) ? { ...file, absorbed } : file;
   }
 
   private buildDemoMetrics(ds: Dataset): void {

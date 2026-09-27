@@ -239,12 +239,38 @@ describe('データ取得スクリプト', () => {
     expect(day.residuals![expected.groups.findIndex((g) => g.length === 0)]).toBeNull();
     const metrics = decodeCurveMetrics(JSON.parse(await readFile(path.join(out, 'curves', 'fy2024.json'), 'utf8')));
     expect(metrics.size).toBe(3);
+    // 取引結果に価格感応度の公表値があるので、ブロック入札の約定の変化の推定に使う値（間引く前のカーブから）も入れる
+    expect(day.absorbed).toHaveLength(SLOTS);
+    expect(day.absorbed!.some((a) => a !== null && Number.isFinite(a[0]))).toBe(true);
 
     // 2 回目は取得済みの日を取り直さない
     const before = requests.length;
     const again = await run({ ...opts, from: 2025, to: 2025 });
     expect(requests.slice(before).filter((r) => r.includes('spot_bid_curves'))).toEqual([expect.stringContaining('20240331')]);
     expect(again.curves!.dates).toHaveLength(3);
+  });
+
+  it('公表値を取得する前に保存した入札カーブには、あとで入札カーブだけを取り直して、ブロック入札の推定に使う値を足す', async () => {
+    const out = path.join(workdir, 'absorbed');
+    const day1 = dayFromYmd(2024, 4, 1);
+    const opts = { ...defaultOptions(), ...urls(), from: 2024, to: 2024, out, curvesFrom: day1, curvesTo: day1, delayMs: 0 };
+    await run({ ...opts, sensitivity: false, log: () => {} });
+    const file = path.join(out, curveDayFile(day1));
+    expect(JSON.parse(await readFile(file, 'utf8')).absorbed).toBeUndefined();
+
+    const before = requests.length;
+    const logs: string[] = [];
+    await run({ ...opts, log: (m) => logs.push(m) });
+    const again = requests.slice(before);
+    expect(again.filter((r) => r.includes('spot_bid_curves_20240401'))).toHaveLength(1);
+    expect(again.some((r) => r.includes('spot_splitting_areas'))).toBe(false);
+    expect(logs.some((l) => l.includes('ブロック入札の約定の変化の推定のために取り直しました'))).toBe(true);
+    expect(decodeCurveDay(JSON.parse(await readFile(file, 'utf8'))).absorbed!.some(Boolean)).toBe(true);
+
+    // 足した後は取り直さない
+    const third = requests.length;
+    await run({ ...opts, log: () => {} });
+    expect(requests.slice(third).some((r) => r.includes('spot_bid_curves'))).toBe(false);
   });
 
   it('--keep-csv では、価格感応度・入札カーブ・分断エリアの CSV も raw に保存する（あとで --from-dir で変換し直せる）', async () => {

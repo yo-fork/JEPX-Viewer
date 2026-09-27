@@ -5,13 +5,14 @@
  * - 期間: 価格感応度の推移（システムプライスは JEPX の公表値と入札カーブから計算した目安）と、0.01 円・高騰までの買いの増減の推移
  * エリアの期間の値は、エリアの価格を決めたカーブを 1 日ずつ読んで計算する（1 日分が数百 KB あるので、ボタンを押したときだけ）。
  * 1 コマの図には、JEPX の公表値から求めた「ブロック入札の約定が変わって効かない分」を見込んだ値と範囲も重ねる（lib/sensitivity.ts）。
+ * その効かなかった量の 1 日の並びから、約定が変わったとみられるブロック入札（時間帯と量）も推定する。
  */
 import type { CustomSeriesRenderItemAPI, CustomSeriesRenderItemReturn } from 'echarts';
 import { areaLabel, CURVE_TARGETS, type AreaCurve, type CurveTarget } from '../lib/areaCurves';
 import { SENSITIVITY_MW, SYSTEM_GROUP, type CurveDay, type CurveMetricKey } from '../lib/bidCurves';
 import type { Source } from '../lib/aggregate';
 import { COMPARE_DAYS, type CurveStore } from '../lib/curveStore';
-import { formatDay, slotRangeLabel, slotStartLabel } from '../lib/dates';
+import { formatDay, isoFromDay, slotRangeLabel, slotStartLabel } from '../lib/dates';
 import { fmtNum, fmtPrice, fmtSigned } from '../lib/format';
 import { reselect, type Selection } from '../lib/select';
 import {
@@ -20,7 +21,10 @@ import {
   curveSensitivity,
   effectiveShift,
   exceedStep,
+  flipBlocks,
+  flipPlateaus,
   isCompleteShare,
+  MIN_FLIP_MW,
   priceAtShift,
   priceResponse,
   publishedShare,
@@ -33,6 +37,8 @@ import {
   type BlockModel,
   type BlockModels,
   type BlockShare,
+  type FlipBlock,
+  type FlipPlateau,
   type PublishedSensitivity,
   type SensField,
   type Sensitivity,
@@ -100,6 +106,21 @@ interface Calibration {
 }
 /** 割合を求めるのに要るコマの数（1 日分） */
 const MIN_CALIBRATION = SLOTS;
+
+const NO_FLIPS =
+  'この日の入札カーブのファイルには、ブロック入札の約定の変化の推定に使う値がありません。' +
+  '間引く前のカーブが要るため、npm run fetch を実行すると、公表値のある日の入札カーブを取り直して求めます（--from-dir では、入札カーブの CSV と取引結果・価格感応度の CSV を一緒に変換すると求めます）。';
+const FLIP_NOTES = [
+  'JEPX の公表値は、48 コマすべてに買い（売り）を足して約定計算をやり直したもので、価格が動くとブロック入札の約定が変わり、足した量の一部が効かなくなります。' +
+    'コマごとに、公表値の価格になるように入札カーブをずらす量と、足した量との差（効かなかった量）を求めました。縦線は、公表値の価格の段の幅から決まる、その量の範囲です。' +
+    'ブロック入札は連続するコマに同じ量で入るので、1 日をできるだけ少ない一定の量の区切りで説明し（階段の線）、区切りの量が増えるところから減るところまでを、約定が変わったブロック入札らしきものとしています。',
+  '入札価格の目安は、ブロック入札はその時間帯の平均価格で約定が決まるとみて、約定計算をやり直す前と後の、その時間帯のシステムプライスの平均の間としたものです。' +
+    '公表されている入札カーブには、ブロック入札は入札価格の位置に入りません（約定したものは価格によらない量として入り、約定しなかったものは入らない）。そのため、カーブの段からは見分けられず、この推定の分け方も 1 つには決まりません。誰の入札かも分かりません。' +
+    '±5GW では多くのブロックが入れ替わるので、±0.5GW で見るとはっきりします。効かなかった量は、取得するときに間引く前のカーブから求めています。',
+];
+/** 別の日の、同じブロック入札とみなす量の差（MW と、量に対する割合） */
+const SAME_FLIP_MW = 3;
+const SAME_FLIP_SHARE = 0.015;
 
 /** エリアの期間の価格感応度（コマごとに SENS_FIELDS の値。集めたときの取引結果が変われば集め直す） */
 interface AreaSensitivity {
@@ -177,6 +198,9 @@ export class SensitivitySection {
   private readonly tiles: HTMLElement;
   private readonly areaSens: ChartCard;
   private readonly areaMargin: ChartCard;
+  private readonly flips: ChartCard;
+  /** 推定したブロック入札の一覧（ブロック入札の約定の変化の図の下） */
+  private readonly flipList: HTMLElement;
   private readonly trend: ChartCard;
   private readonly margin: ChartCard;
   private readonly sizes: Segmented<`${SensitivitySize}`>[] = [];
@@ -246,6 +270,14 @@ export class SensitivitySection {
         if (target) host.set({ curveArea: target });
       });
     }
+    this.flips = host.card(g, { title: 'ブロック入札の約定の変化（公表値からの推定）', height: 380, wide: true });
+    this.flips.addControls(sizeControl());
+    this.flipList = h('div', { class: 'flip-list' });
+    this.flips.footer.append(this.flipList, ...FLIP_NOTES.map((text) => h('p', { class: 'card-note' }, text)));
+    this.flips.chart.on('click', (e: unknown) => {
+      const slot = (e as { dataIndex: number }).dataIndex;
+      if (slot >= 0 && slot < SLOTS) host.set({ curveSlot: slot });
+    });
     this.trend = host.card(g, { title: '価格感応度の推移', height: 340 });
     this.collectBtn = h('button', { type: 'button', class: 'btn btn-sm', hidden: true, onclick: () => this.onCollect() }, '計算する');
     this.trend.addControls(sizeControl(), this.collectBtn);
@@ -292,9 +324,11 @@ export class SensitivitySection {
     this.rowTargets = [];
     if (!day) {
       this.tiles.replaceChildren();
-      for (const c of [this.response, this.areaSens, this.areaMargin]) c.setEmpty(`${formatDay(date, true)} の入札カーブを読み込めませんでした。`);
+      this.flipList.replaceChildren();
+      for (const c of [this.response, this.areaSens, this.areaMargin, this.flips]) c.setEmpty(`${formatDay(date, true)} の入札カーブを読み込めませんでした。`);
       return;
     }
+    this.renderFlips(cs, day);
     const rows = this.slotRows(day, slot);
     // ブロック入札の約定の変化の見込み: システムプライスのカーブはこのコマの公表値から、ほかは直近の日の公表値から
     const pub = this.published(date, slot);
@@ -374,6 +408,182 @@ export class SensitivitySection {
       '5GW を超える増減は、効かない量が 5GW のときから増えない場合と、割合のまま増える場合の間を範囲とし、その中間を見込みにしています。' +
       (cal ? `効かなかった割合の中央値〔25〜75% 点〕: ${shares}。` : '') +
       (target.block ? '' : '（このカーブは見込めません）');
+  }
+
+  /** 公表値の計算で効かなかった量の 1 日の並びと、そこから推定した、約定が変わったブロック入札（システムプライス） */
+  private renderFlips(cs: CurveStore, day: CurveDay): void {
+    const { state, theme } = this.host.ctx();
+    const t = TOKENS[theme];
+    const [neg, pos] = poles(theme);
+    const card = this.flips;
+    const date = day.day;
+    const mw = state.sensSize;
+    const k = SENSITIVITY_SIZES.indexOf(mw);
+    const size = sizeText(mw);
+    this.flipList.replaceChildren();
+    card.setSubtitle(
+      `${formatDay(date, true)}・システムプライス・買いを ${size} 増やしたとき（上）と減らしたとき（下）に、公表値の計算で効かなかった量（MW）` +
+        '・縦線は公表値を説明できる範囲、階段の線はそれを少ない区切りで説明した量・押すとそのコマを表示',
+    );
+    const upR = flipRanges(day, k, true);
+    const downR = flipRanges(day, k, false);
+    if (!upR || !downR) {
+      card.setEmpty(day.absorbed ? 'この日は価格感応度の公表値がありません。' : NO_FLIPS);
+      return;
+    }
+    const upP = flipPlateaus(upR);
+    const downP = flipPlateaus(downR);
+    const level = (plateaus: FlipPlateau[]) => {
+      const out = new Array<number>(SLOTS).fill(Number.NaN);
+      for (const q of plateaus) for (let s = q.from; s < q.to; s++) out[s] = q.mw;
+      return out;
+    };
+    const upL = level(upP);
+    const downL = level(downP);
+    // 縦軸は、有限の値がすべて入る範囲（上限の無い範囲は、その端まで線を伸ばす）
+    const finite = (vals: number[]) => vals.filter(Number.isFinite);
+    const top = Math.max(1, ...finite([...upR.flatMap((r) => (r ? r : [])), ...upL]));
+    const bottom = Math.max(1, ...finite([...downR.flatMap((r) => (r ? r : [])), ...downL]));
+    const axisMax = niceStep(top / 4) * Math.ceil(top / niceStep(top / 4));
+    const axisMin = -niceStep(bottom / 4) * Math.ceil(bottom / niceStep(bottom / 4));
+    const upName = `買い +${size} で効かなかった量`;
+    const downName = `買い −${size} で効かなかった量`;
+    const lineName = '区切りで説明した量';
+    const bars = (name: string, color: string, ranges: ([number, number] | null)[], sign: 1 | -1, cap: number) => ({
+      type: 'custom',
+      name,
+      color,
+      z: 3,
+      data: ranges.map((r, i) => (r ? [i, sign * r[0], sign * Math.min(r[1], cap), Number.isFinite(r[1]) && r[1] <= cap ? 1 : 0] : [i, Number.NaN, Number.NaN, 0])),
+      encode: { x: 0, y: [1, 2] },
+      renderItem: (_p: unknown, api: CustomSeriesRenderItemAPI): CustomSeriesRenderItemReturn => {
+        const [i, a, b, closed] = [0, 1, 2, 3].map((d) => Number(api.value(d)));
+        if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
+        const [x, y0] = api.coord([i, a]);
+        const [, y1] = api.coord([i, b]);
+        const style = { stroke: color, lineWidth: 2 };
+        return {
+          type: 'group',
+          children: [
+            { type: 'line' as const, shape: { x1: x, y1: y0, x2: x, y2: y1 }, style },
+            { type: 'line' as const, shape: { x1: x - 3, y1: y0, x2: x + 3, y2: y0 }, style },
+            // 上限（下限）の無い範囲は、端の横線を付けない
+            ...(closed ? [{ type: 'line' as const, shape: { x1: x - 3, y1: y1, x2: x + 3, y2: y1 }, style }] : []),
+          ],
+        };
+      },
+    });
+    const hhmm = (slot: number) => (slot >= SLOTS ? '24:00' : slotStartLabel(slot));
+    const rangeText = (r: [number, number] | null) => (r ? `${fmtNum(r[0], 1)}〜${Number.isFinite(r[1]) ? fmtNum(r[1], 1) : '上限なし'} MW` : '—');
+    card.setOption(
+      {
+        grid: grid({ top: PLOT_TOP, bottom: 28, right: 24 }),
+        legend: legend({ data: [{ name: upName, icon: 'rect' }, { name: downName, icon: 'rect' }, lineName] }),
+        tooltip: {
+          trigger: 'axis',
+          formatter: (ps: { dataIndex: number }[]) => {
+            const i = ps[0]?.dataIndex;
+            if (i === undefined) return '';
+            return (
+              ttHeader(slotRangeLabel(i)) +
+              ttRow(pos, rangeText(upR[i]), `${upName}（区切り ${fmtNum(upL[i], 1)} MW）`, 'rect') +
+              ttRow(neg, rangeText(downR[i]), `${downName}（区切り ${fmtNum(downL[i], 1)} MW）`, 'rect')
+            );
+          },
+        },
+        xAxis: {
+          type: 'category',
+          data: Array.from({ length: SLOTS }, (_, i) => slotStartLabel(i)),
+          axisLabel: { interval: (i: number) => i % 4 === 0, hideOverlap: true },
+        },
+        yAxis: valueAxis('MW', { min: axisMin, max: axisMax, axisLabel: { formatter: (v: number) => fmtNum(Math.abs(v)) } }),
+        series: [
+          bars(upName, pos, upR, 1, axisMax),
+          bars(downName, neg, downR, -1, -axisMin),
+          styledLine(lineName, t.ink2, theme, upL, false, {
+            step: 'middle',
+            symbol: 'none',
+            z: 4,
+            markLine: {
+              symbol: 'none',
+              silent: true,
+              animation: false,
+              label: { color: t.ink2, fontSize: 11, backgroundColor: t.surface, padding: [1, 3], borderRadius: 3 },
+              data: [
+                { yAxis: 0, lineStyle: { color: t.axis, width: 1, type: 'solid' }, label: { show: false } },
+                { xAxis: state.curveSlot, lineStyle: { color: t.ink2, width: 1, type: [4, 4] }, label: { formatter: '表示中のコマ', position: 'end' } },
+              ],
+            },
+          }),
+          styledLine(lineName, t.ink2, theme, downL.map((v) => -v), false, { step: 'middle', symbol: 'none', z: 4 }),
+        ],
+      },
+      {
+        columns: ['時刻', `${upName}の最小（MW）`, '最大（MW）', '区切りの量（MW）', `${downName}の最小（MW）`, '最大（MW）', '区切りの量（MW）'],
+        rows: Array.from({ length: SLOTS }, (_, i) => [
+          slotStartLabel(i),
+          upR[i]?.[0] ?? '',
+          upR[i] && Number.isFinite(upR[i]![1]) ? upR[i]![1] : '',
+          upL[i],
+          downR[i]?.[0] ?? '',
+          downR[i] && Number.isFinite(downR[i]![1]) ? downR[i]![1] : '',
+          downL[i],
+        ]),
+        digits: [null, 1, 1, 1, 1, 1, 1],
+        filename: `jepx_block_flips_${fileDate(date)}_${mw}.csv`,
+      },
+    );
+
+    // 推定したブロック入札の一覧（入札価格の目安と、直近の日の同じもの）
+    const others = cs
+      .recent(date, COMPARE_DAYS)
+      .filter((d) => d !== date)
+      .map((d) => ({ d, day: cs.getDay(d) }))
+      .filter((x): x is { d: number; day: CurveDay } => !!x.day);
+    const avg = (from: number, to: number, key: SeriesKey) => {
+      let sum = 0;
+      let n = 0;
+      for (let i = from; i < to; i++) {
+        const v = this.host.value(date, i, key);
+        if (Number.isFinite(v)) {
+          sum += v;
+          n++;
+        }
+      }
+      return n > 0 ? sum / n : Number.NaN;
+    };
+    const section = (up: boolean, blocks: FlipBlock[]) => {
+      const pubKey = sensitivityKey(up ? 'buy' : 'sell', mw);
+      const title = up
+        ? `買い +${size}: 約定しなかった売りのブロック入札が約定した（か、約定した買いのブロック入札が約定しなくなった）とみられるもの`
+        : `買い −${size}: 約定した売りのブロック入札が約定しなくなった（か、約定しなかった買いのブロック入札が約定した）とみられるもの`;
+      const same = (b: FlipBlock) =>
+        others
+          .filter(({ day: od }) => {
+            const r = flipRanges(od, k, up);
+            return !!r && flipBlocks(flipPlateaus(r)).some((x) => x.from === b.from && x.to === b.to && Math.abs(x.mw - b.mw) <= Math.max(SAME_FLIP_MW, SAME_FLIP_SHARE * b.mw));
+          })
+          .map(({ d }) => shortDate(d));
+      const items = blocks.map((b) => {
+        const a = avg(b.from, b.to, 'system');
+        const c = avg(b.from, b.to, pubKey);
+        const price = Number.isFinite(a) && Number.isFinite(c) ? `・入札価格の目安 ${fmtPrice(Math.min(a, c))}〜${fmtPrice(Math.max(a, c))} 円` : '';
+        const again = same(b);
+        return h(
+          'li',
+          null,
+          h('button', { type: 'button', class: 'btn btn-sm', title: 'そのブロックの最初のコマを表示', onclick: () => this.host.set({ curveSlot: b.from }) }, `${hhmm(b.from)}–${hhmm(b.to)}`),
+          ` 約 ${fmtNum(b.mw)} MW（${fmtNum(b.to - b.from)} コマ）${price}${again.length > 0 ? `・直近 ${COMPARE_DAYS} 日では ${again.join('、')} にも` : ''}`,
+        );
+      });
+      return h(
+        'div',
+        { class: 'card-note' },
+        h('p', null, title),
+        items.length > 0 ? h('ul', null, items) : h('p', null, `${fmtNum(MIN_FLIP_MW)} MW 以上のものはありません（カーブをずらすだけで公表値が説明できます）。`),
+      );
+    };
+    this.flipList.replaceChildren(section(true, flipBlocks(upP)), section(false, flipBlocks(downP)));
   }
 
   /** JEPX が公表している、そのコマの価格感応度（システムプライス。無ければ null） */
@@ -1038,6 +1248,20 @@ interface PeriodLine {
   color: string;
   dashed: boolean;
   source: Source;
+}
+
+/** 日のファイルの効かなかった量の範囲のうち、SENSITIVITY_SIZES の k 番目の量・向きの分（無ければ null） */
+function flipRanges(day: CurveDay, k: number, up: boolean): ([number, number] | null)[] | null {
+  if (!day.absorbed) return null;
+  const i = 2 * (2 * k + (up ? 0 : 1));
+  const out = day.absorbed.map((a) => (a && Number.isFinite(a[i]) ? ([a[i], a[i + 1]] as [number, number]) : null));
+  return out.some(Boolean) ? out : null;
+}
+
+/** 一覧に並べる短い日付（9/21） */
+function shortDate(day: number): string {
+  const [, m, d] = isoFromDay(day).split('-').map(Number);
+  return `${m}/${d}`;
 }
 
 /** 発散色（負: 青、正: 赤）の両端 */

@@ -1,19 +1,26 @@
 import { describe, expect, it } from 'vitest';
-import { crossing, rowsFromSteps } from '../src/lib/bidCurves';
+import { crossing, rowsFromSteps, SYSTEM_GROUP, type RawCurveDay } from '../src/lib/bidCurves';
+import { SLOTS } from '../src/lib/series';
 import { mulberry32 } from '../src/lib/demo';
 import {
   absorbedAt,
   absorbedMw,
+  absorbedOfDay,
+  absorbedRange,
   adjustSensitivity,
   adjustThreshold,
   blockModels,
   curveSensitivity,
   effectiveShift,
   exceedShift,
+  FLIP_CASES,
+  flipBlocks,
+  flipPlateaus,
   isCompleteShare,
   priceAtShift,
   priceResponse,
   publishedShare,
+  responseOfRows,
   SENS_FIELD_INDEX,
   sensitivityValues,
   shareQuantile,
@@ -171,5 +178,50 @@ describe('ブロック入札の約定の変化の見込み', () => {
     expect(q.up.map((v) => Math.round(v * 100) / 100)).toEqual([0.3, 0.3, 0.3]);
     expect(q.down[2]).toBeNaN();
     expect(shareQuantile([s(0.1)], 0.5, 2).up[0]).toBeNaN();
+  });
+});
+
+describe('ブロック入札の約定の変化の推定', () => {
+  it('間引く前の行からも同じ段を作り、公表値を説明できる効かなかった量の範囲を求める', () => {
+    const rows = rowsFromSteps(CURVE.sell, CURVE.buy);
+    expect(responseOfRows(rows)).toEqual(priceResponse(CURVE));
+    const r = priceResponse(CURVE)!;
+    // 買い +1GW で公表値が 10 円のまま: 10 円の段は −500〜+500MW なので、効かなかった量は 500〜1500MW（段の内側に 0.5MW 入れる）
+    expect(absorbedRange(r, 10, 1000, 0)).toEqual([500.5, 1499.5]);
+    // 1 日分: カーブと公表値のあるコマだけ、FLIP_CASES の順に最小・最大
+    const raw: RawCurveDay = { day: 0, slots: Array.from({ length: SLOTS }, () => new Map()) };
+    raw.slots[0].set(SYSTEM_GROUP, rows);
+    raw.slots[1].set(SYSTEM_GROUP, rows);
+    const pub = { system: 10, up: [10, 10, 30], down: [10, 8, 0.01] };
+    const abs = absorbedOfDay(raw, (s) => (s === 0 ? pub : null));
+    expect(abs[0]).toHaveLength(FLIP_CASES.length * 2);
+    expect(abs[0]!.slice(0, 2)).toEqual([0.5, 999.5]);
+    expect(abs[1]).toBeNull();
+    expect(abs[2]).toBeNull();
+  });
+
+  it('1 日の効かなかった量を少ない区切りで説明し、入れ子のブロックに分ける', () => {
+    // 終日 421〜422MW、10:00〜14:00 だけ 676〜680MW（範囲の広いコマと、範囲の無いコマもある）
+    const ranges: ([number, number] | null)[] = Array.from({ length: SLOTS }, (_, s) => (s >= 20 && s < 28 ? [676, 680] : [421, 422]));
+    ranges[5] = [0, 2000];
+    ranges[40] = null;
+    const plateaus = flipPlateaus(ranges);
+    expect(plateaus.map((p) => [p.from, p.to])).toEqual([
+      [0, 20],
+      [20, 28],
+      [28, 48],
+    ]);
+    expect(plateaus[0].mw).toBe(421);
+    const blocks = flipBlocks(plateaus);
+    expect(blocks.map((b) => [b.from, b.to])).toEqual([
+      [0, 48],
+      [20, 28],
+    ]);
+    expect(blocks[0].mw).toBeCloseTo(421, 0);
+    expect(blocks[1].mw).toBeGreaterThan(250);
+    // 許す幅（コマごとに ±2MW）を足しても重ならなければ区切る。20MW 未満のブロックは挙げない
+    expect(flipPlateaus([[100, 100], [103, 103]]).length).toBe(1);
+    expect(flipPlateaus([[100, 100], [106, 106]]).length).toBe(2);
+    expect(flipBlocks(flipPlateaus([[10, 10], [10, 10]]))).toEqual([]);
   });
 });

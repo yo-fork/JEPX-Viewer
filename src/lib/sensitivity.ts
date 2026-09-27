@@ -6,8 +6,8 @@
  * ブロック入札の約定も判定し直している。ここではカーブをずらすだけなので、ブロック入札の約定
  * （分断エリアのカーブでは、連系線でやりとりする量も）を変えない目安になる。
  */
-import { crossing, rowsFromSteps, type CurveRow, type StepCurve } from './bidCurves';
-import { FLOOR_PRICE, SENSITIVITY_SIZES } from './series';
+import { crossing, rowsFromSteps, SYSTEM_GROUP, type CurveRow, type RawCurveDay, type StepCurve } from './bidCurves';
+import { FLOOR_PRICE, SENSITIVITY_SIZES, sensitivityKey, SLOTS, type SeriesKey } from './series';
 
 /** 高騰の目安にする価格（円/kWh）。期間の図は入札カーブの指標（その価格以下の売り・以上の買い）から求めるので、指標のある価格にする */
 export const SPIKE_PRICES = [20, 50] as const;
@@ -28,7 +28,11 @@ export interface PriceResponse {
 }
 
 export function priceResponse(curve: StepCurve): PriceResponse | null {
-  const rows = rowsFromSteps(curve.sell, curve.buy);
+  return responseOfRows(rowsFromSteps(curve.sell, curve.buy));
+}
+
+/** 価格の昇順の行（間引く前の CSV のカーブも）の、買いの増減に対する約定価格の段 */
+export function responseOfRows(rows: CurveRow[]): PriceResponse | null {
   if (rows.length === 0) return null;
   const steps: { from: number; price: number }[] = [{ from: Number.NEGATIVE_INFINITY, price: rows[0].price }];
   const push = (from: number, price: number) => {
@@ -142,6 +146,13 @@ export interface PublishedSensitivity {
   down: number[];
 }
 
+/** 取引結果の値から、そのコマの公表値を読む（1 つも無ければ null） */
+export function publishedAt(value: (key: SeriesKey) => number): PublishedSensitivity | null {
+  const up = SENSITIVITY_SIZES.map((mw) => value(sensitivityKey('buy', mw)));
+  const down = SENSITIVITY_SIZES.map((mw) => value(sensitivityKey('sell', mw)));
+  return [...up, ...down].some(Number.isFinite) ? { system: value('system'), up, down } : null;
+}
+
 /**
  * 約定価格が price になる買いの増減の範囲（MW）。その価格の段が無ければ、price をまたぐ境目（幅 0）。
  * 売りが尽きても届かなければ [limit, limit]
@@ -163,12 +174,20 @@ export function shiftRangeAt(r: PriceResponse, price: number): [number, number] 
  * 公表値のほうが大きく動いたときは負になる。求められなければ NaN
  */
 export function absorbedMw(r: PriceResponse, base: number, mw: number, move: number): number {
+  const a = absorbedRange(r, base, mw, move)[0];
+  return Number.isFinite(a) ? a : Number.NaN;
+}
+
+/**
+ * 公表値を説明できる、効かなかった量の範囲 [最小, 最大]（MW）。公表値の価格の段が幅を持つと、その幅だけ広がる。
+ * 最大は、段が買いを減らす側に果てしなく続けば Infinity
+ */
+export function absorbedRange(r: PriceResponse, base: number, mw: number, move: number): [number, number] {
   const [lo, hi] = shiftRangeAt(r, base + move);
   // 段の端ちょうどでは隣の段の価格で交わることがあるので、段の内側に少し入れる（量は 0.1MW 単位より細かくはない）
   const inset = Math.min(0.5, (hi - lo) / 2);
   const d = Math.min(Math.max(mw, lo + inset), hi - inset);
-  const a = mw > 0 ? mw - d : d - mw;
-  return Number.isFinite(a) ? a : Number.NaN;
+  return mw > 0 ? [mw - d, mw - (lo + inset)] : [d - mw, hi - inset - mw];
 }
 
 /** 足した量のうち効かなかった割合（SENSITIVITY_SIZES の順。買いを増やすとき・減らすとき。分からなければ NaN） */
@@ -310,4 +329,143 @@ export function blockModels(mid: BlockShare, less: BlockShare = mid, more: Block
     less: { share: less, tail: { up: 0, down: 0 } },
     more: { share: more, tail: rate(tail.more, 1) },
   };
+}
+
+// ---- ブロック入札の約定の変化の推定 ----
+//
+// 公表値の計算で効かなかった量は、約定が変わったブロック入札の量とみなせる。ブロック入札は連続するコマに同じ量で入るので、
+// 1 日のコマの効かなかった量を、できるだけ少ない一定の量の区切りで説明し、その量の増減をブロックらしきもの（時間帯と量）に分ける。
+// 効かなかった量の範囲は、描画用に間引いたカーブでは粗くなりすぎる（数十 MW ずれる）ので、間引く前のカーブから求めて保存しておく。
+
+/** 効かなかった量の範囲を保存する、買いの増減の量と向き（この順に [最小, 最大] を並べる） */
+export const FLIP_CASES = SENSITIVITY_SIZES.flatMap((mw) => [
+  { mw, up: true },
+  { mw, up: false },
+]);
+
+/** 1 コマの、公表値を説明できる効かなかった量の範囲（FLIP_CASES の順に最小・最大。公表値の無いものは NaN） */
+export function absorbedRanges(r: PriceResponse, base: number, pub: PublishedSensitivity): number[] {
+  return FLIP_CASES.flatMap(({ mw, up }) => {
+    const i = SENSITIVITY_SIZES.indexOf(mw as (typeof SENSITIVITY_SIZES)[number]);
+    const p = up ? pub.up[i] : pub.down[i];
+    return Number.isFinite(p) && Number.isFinite(pub.system) ? absorbedRange(r, base, up ? mw : -mw, p - pub.system) : [Number.NaN, Number.NaN];
+  });
+}
+
+/**
+ * 1 日分の、効かなかった量の範囲（入札カーブの日のファイルに入れる形）。
+ * 間引く前のシステムプライスのカーブと、そのコマの公表値から求め、0.1MW に丸める。最小が分からなければ null、最大が無限なら null
+ */
+export function absorbedOfDay(raw: RawCurveDay, pubOf: (slot: number) => PublishedSensitivity | null): ((number | null)[] | null)[] {
+  return Array.from({ length: SLOTS }, (_, s) => {
+    const rows = raw.slots[s]?.get(SYSTEM_GROUP);
+    const pub = rows ? pubOf(s) : null;
+    const r = rows && pub ? responseOfRows(rows) : null;
+    if (!r || !pub) return null;
+    const v = absorbedRanges(r, priceAtShift(r, 0), pub);
+    return v.some(Number.isFinite) ? v.map((x) => (Number.isFinite(x) ? Math.round(x * 10) / 10 : null)) : null;
+  });
+}
+
+/**
+ * 効かなかった量を一定とみなせる区切り（コマ from 以上 to 未満。mw は選んだ量）。
+ * lo〜hi はその区切りのすべてのコマの範囲に入る量（許す幅を足さずに重ならなければ、足した範囲）
+ */
+export interface FlipPlateau {
+  from: number;
+  to: number;
+  lo: number;
+  hi: number;
+  mw: number;
+}
+
+/** 効かなかった量の範囲を丸めた誤差などとして許す幅（MW） */
+export const FLIP_TOLERANCE = 2;
+
+/**
+ * コマごとの効かなかった量の範囲を、できるだけ少ない一定の量の区切りで説明する（許す幅 tol まで範囲の外でもよい）。
+ * 区切りの量は、すべてのコマの範囲に入る量のうち、前の区切りの量にできるだけ近いもの（最初は 0 に近いもの。量が変わる区切りを増やさない）。
+ * 範囲の無いコマはどの量でもよい
+ */
+export function flipPlateaus(ranges: readonly ([number, number] | null)[], tol = FLIP_TOLERANCE): FlipPlateau[] {
+  const n = ranges.length;
+  const lo = (i: number) => (ranges[i] && Number.isFinite(ranges[i]![0]) ? ranges[i]![0] - tol : Number.NEGATIVE_INFINITY);
+  const hi = (i: number) => (ranges[i] && Number.isFinite(ranges[i]![0]) ? ranges[i]![1] + tol : Number.POSITIVE_INFINITY);
+  const count = new Array<number>(n + 1).fill(Number.POSITIVE_INFINITY);
+  const start = new Array<number>(n + 1).fill(-1);
+  count[0] = 0;
+  for (let j = 1; j <= n; j++) {
+    let a = Number.NEGATIVE_INFINITY;
+    let b = Number.POSITIVE_INFINITY;
+    for (let i = j - 1; i >= 0; i--) {
+      a = Math.max(a, lo(i));
+      b = Math.min(b, hi(i));
+      if (a > b) break;
+      if (count[i] + 1 < count[j]) {
+        count[j] = count[i] + 1;
+        start[j] = i;
+      }
+    }
+  }
+  const cuts: [number, number][] = [];
+  for (let j = n; j > 0; j = start[j]) cuts.unshift([start[j], j]);
+  let prev = 0;
+  return cuts.map(([from, to]) => {
+    // 許す幅を足さない範囲が重なれば、その中から選ぶ
+    let a = Number.NEGATIVE_INFINITY;
+    let b = Number.POSITIVE_INFINITY;
+    for (let i = from; i < to; i++) {
+      a = Math.max(a, lo(i) + tol);
+      b = Math.min(b, hi(i) - tol);
+    }
+    if (a > b) {
+      a -= tol;
+      b += tol;
+    }
+    const mw = Math.min(Math.max(prev, a), b);
+    prev = mw;
+    return { from, to, lo: a, hi: b, mw };
+  });
+}
+
+/** 約定が変わったとみられるブロック入札（コマ from 以上 to 未満に mw） */
+export interface FlipBlock {
+  from: number;
+  to: number;
+  mw: number;
+}
+
+/** ブロックらしきものとして挙げる最小の量（MW。これより小さい増減は、丸めた誤差などとみなす） */
+export const MIN_FLIP_MW = 20;
+
+/**
+ * 区切りの量（0 未満は 0 とみなす）の増減を、入れ子のブロックに分ける。量が増えたら新しいブロックを始め、減ったら新しく始めたものから終える。
+ * 分け方は 1 つに決まらないが、ブロックの数ができるだけ少なくなる分け方の 1 つ（量が増えた回数だけ）
+ */
+export function flipBlocks(plateaus: readonly FlipPlateau[], minMw = MIN_FLIP_MW): FlipBlock[] {
+  const out: FlipBlock[] = [];
+  const open: { from: number; mw: number }[] = [];
+  let level = 0;
+  const close = (to: number, drop: number) => {
+    while (drop > 0.05 && open.length > 0) {
+      const top = open[open.length - 1];
+      if (top.mw <= drop + 0.05) {
+        out.push({ from: top.from, to, mw: top.mw });
+        drop -= top.mw;
+        open.pop();
+      } else {
+        out.push({ from: top.from, to, mw: drop });
+        top.mw -= drop;
+        drop = 0;
+      }
+    }
+  };
+  for (const p of plateaus) {
+    const v = Math.max(0, p.mw);
+    if (v > level) open.push({ from: p.from, mw: v - level });
+    else if (v < level) close(p.from, level - v);
+    level = v;
+  }
+  close(plateaus.length > 0 ? plateaus[plateaus.length - 1].to : 0, level);
+  return out.filter((b) => b.mw >= minMw).sort((a, b) => a.from - b.from || b.to - a.to);
 }

@@ -47,7 +47,8 @@ import {
 } from '../src/lib/dataFile';
 import { fiscalYearOfDay, isoFromDay, parseDateString, todayJst } from '../src/lib/dates';
 import { decodeCsvBytes } from '../src/lib/encoding';
-import { parseSpotCsv, type DayMap } from '../src/lib/jepxCsv';
+import { parseSpotCsv, type DayMap, type DayValues } from '../src/lib/jepxCsv';
+import { absorbedOfDay, publishedAt } from '../src/lib/sensitivity';
 import { SENSITIVITY_KEYS, SERIES_COUNT, SERIES_INDEX, SLOTS, type SeriesKey } from '../src/lib/series';
 
 export const JEPX_SPOT_PAGE = 'https://www.jepx.jp/electricpower/market-data/spot/';
@@ -301,16 +302,41 @@ async function writeFyFile(out: string, fy: number, days: DayMap): Promise<FyFil
   return file;
 }
 
-/** 入札カーブの 1 日分を保存し、ファイルの大きさ（バイト）を返す */
 /** システムプライスの入札カーブが 1 コマも無い CSV の案内（分断エリア連番の読み違いなど） */
 const NO_SYSTEM_CURVE = 'システムプライスの入札カーブが 1 コマも無いため保存しません（分断エリア連番が空か -1 の行をシステムプライスとして読みます）';
+
+/**
+ * その日の取引結果に価格感応度の公表値があれば、ブロック入札の約定の変化の推定に使う「効かなかった量の範囲」を入れる
+ * （間引く前のカーブが要るので、カーブを取得・変換するときに求める）
+ */
+function withAbsorbed(file: CurveDayFile, raw: RawCurveDay, spot: DayValues | undefined): CurveDayFile {
+  if (!spot) return file;
+  const absorbed = absorbedOfDay(raw, (s) => publishedAt((k) => spot[SERIES_INDEX[k] * SLOTS + s]));
+  return absorbed.some(Boolean) ? { ...file, absorbed } : file;
+}
+
+/** 出力先の年度ファイルから、取引結果の日の値を読む（年度ごとに 1 回だけ読む） */
+function spotReader(out: string): (day: number) => Promise<DayValues | undefined> {
+  const cache = new Map<number, Promise<DayMap | null>>();
+  return async (day) => {
+    const fy = fiscalYearOfDay(day);
+    let p = cache.get(fy);
+    if (!p) cache.set(fy, (p = readFyDays(out, fy)));
+    return (await p)?.get(day);
+  };
+}
 
 /**
  * 入札カーブの 1 日分を保存し、ファイルの大きさ（バイト）と保存したコマ数を返す。
  * システムプライスのカーブが 1 コマも無ければ、中身の無いファイルは作らない（slots 0 を返す）
  */
-async function writeCurveDayFile(out: string, raw: RawCurveDay, groups: AreaGroup[][] | undefined): Promise<{ bytes: number; slots: number }> {
-  const file = encodeCurveDay(raw, groups);
+async function writeCurveDayFile(
+  out: string,
+  raw: RawCurveDay,
+  groups: AreaGroup[][] | undefined,
+  spot: DayValues | undefined,
+): Promise<{ bytes: number; slots: number }> {
+  const file = withAbsorbed(encodeCurveDay(raw, groups), raw, spot);
   const slots = file.slots.filter(Boolean).length;
   if (slots === 0) return { bytes: 0, slots };
   const p = path.join(out, curveDayFile(raw.day));
@@ -485,7 +511,8 @@ async function convertDir(o: FetchOptions): Promise<Set<number>> {
     o.log(`→ ${fyPath(o.out, fy)}（${fyDays.size} 日${note}）`);
   }
 
-  // 2 周目: 入札カーブ
+  // 2 周目: 入札カーブ（取引結果の年度ファイルは 1 周目で書いたので、そこから公表値を読む）
+  const spotOf = spotReader(o.out);
   const touched = new Set<number>();
   const written = new Set<number>();
   let outside = 0;
@@ -504,7 +531,7 @@ async function convertDir(o: FetchOptions): Promise<Set<number>> {
         continue;
       }
       const g = groups.get(day);
-      const { bytes, slots } = await writeCurveDayFile(o.out, raw, g);
+      const { bytes, slots } = await writeCurveDayFile(o.out, raw, g, await spotOf(day));
       if (slots === 0) {
         fail(f.label, new Error(`${isoFromDay(day)}: ${NO_SYSTEM_CURVE}`));
         continue;
@@ -611,13 +638,22 @@ function curveUrl(o: FetchOptions, dir: string, day: number): string {
 async function fetchCurves(o: FetchOptions, dispatcher: EnvHttpProxyAgent, pace: () => Promise<void>): Promise<Set<number>> {
   const touched = new Set<number>();
   const total = o.curvesTo - o.curvesFrom + 1;
+  const spotOf = spotReader(o.out);
   let saved = 0;
   let skipped = 0;
   let missing = 0;
+  let refetched = 0;
   for (let day = o.curvesFrom; day <= o.curvesTo; day++) {
     const label = `[${day - o.curvesFrom + 1}/${total}] 入札カーブ ${isoFromDay(day)}`;
+    const file = path.join(o.out, curveDayFile(day));
+    const spot = await spotOf(day);
     // 受渡日の入札カーブは約定後に変わらないので、取得済みの日は取り直さない
-    if (!o.force && existsSync(path.join(o.out, curveDayFile(day)))) {
+    if (!o.force && existsSync(file)) {
+      // ただし、ブロック入札の約定の変化の推定に使う値が無く、いまは公表値があれば、間引く前のカーブが要るので取り直して足す
+      if (await needsAbsorbed(file, spot)) {
+        const added = await addAbsorbed(o, dispatcher, pace, day, file, spot!, label);
+        if (added) refetched++;
+      }
       skipped++;
       continue;
     }
@@ -653,7 +689,7 @@ async function fetchCurves(o: FetchOptions, dispatcher: EnvHttpProxyAgent, pace:
     } catch (err) {
       o.log(`${label}: 分断エリアの名前を取得できませんでした（${(err as Error).message}）`);
     }
-    const { bytes, slots } = await writeCurveDayFile(o.out, raw, groups);
+    const { bytes, slots } = await writeCurveDayFile(o.out, raw, groups, spot);
     if (slots === 0) {
       missing++;
       o.log(`${label}: ${NO_SYSTEM_CURVE}`);
@@ -663,8 +699,45 @@ async function fetchCurves(o: FetchOptions, dispatcher: EnvHttpProxyAgent, pace:
     saved++;
     o.log(`${label}: ${slots} コマを保存（${Math.round(bytes / 1024)} KB）`);
   }
-  o.log(`入札カーブ: ${saved} 日を保存、取得済み ${skipped} 日、データなし ${missing} 日`);
+  o.log(
+    `入札カーブ: ${saved} 日を保存、取得済み ${skipped} 日、データなし ${missing} 日` +
+      (refetched > 0 ? `（取得済みのうち ${refetched} 日は、ブロック入札の約定の変化の推定のために取り直しました）` : ''),
+  );
   return touched;
+}
+
+/** 取得済みの日のファイルに、効かなかった量の範囲が無く、いまは公表値がある */
+async function needsAbsorbed(file: string, spot: DayValues | undefined): Promise<boolean> {
+  const hasPublished = (vals: DayValues) => Array.from({ length: SLOTS }, (_, s) => s).some((s) => publishedAt((k) => vals[SERIES_INDEX[k] * SLOTS + s]) !== null);
+  if (!spot || !hasPublished(spot)) return false;
+  const text = await readFile(file, 'utf8');
+  return !text.includes('"absorbed"');
+}
+
+/** 取得済みの日の入札カーブを取り直し、効かなかった量の範囲だけを足す（ほかは変えない）。足せたら true */
+async function addAbsorbed(
+  o: FetchOptions,
+  dispatcher: EnvHttpProxyAgent,
+  pace: () => Promise<void>,
+  day: number,
+  file: string,
+  spot: DayValues,
+  label: string,
+): Promise<boolean> {
+  await pace();
+  try {
+    const bytes = await download(curveUrl(o, 'spot_bid_curves', day), dispatcher);
+    const raw = bytes && bytes.length > 0 ? parseBidCurveCsv(decodeCsvBytes(bytes).text).get(day) : undefined;
+    if (!raw) return false;
+    const json = withAbsorbed(JSON.parse(await readFile(file, 'utf8')) as CurveDayFile, raw, spot);
+    if (!json.absorbed) return false;
+    await writeFile(file, JSON.stringify(json));
+    o.log(`${label}: ブロック入札の約定の変化の推定に使う値を足しました（間引く前のカーブを取り直しました）`);
+    return true;
+  } catch (err) {
+    o.log(`${label}: ブロック入札の約定の変化の推定に使う値を足せませんでした（${(err as Error).message}）`);
+    return false;
+  }
 }
 
 export async function run(o: FetchOptions): Promise<Manifest> {

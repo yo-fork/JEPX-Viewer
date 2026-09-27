@@ -353,3 +353,15 @@ describe('合成の入札カーブ（デモ用）', () => {
     expect([...raw.slots[0].keys()].sort()).toEqual([SYSTEM_GROUP, 1, 2].sort());
   });
 });
+
+describe('ブロック入札の推定に使う値', () => {
+  it('日のファイルの効かなかった量の範囲を読む（最小が分からない組は NaN、最大の null は無限）', () => {
+    const { raw, groups } = syntheticCurveDay(dayFromYmd(2025, 5, 3), [{ system: 10, volume: 30000 }]);
+    const file = { ...encodeCurveDay(raw, groups), absorbed: [[1.5, null, null, null, 2, 3, 0, 0, 0, 0, 0, 0], ...Array.from({ length: SLOTS - 1 }, () => null)] };
+    const day = decodeCurveDay(JSON.parse(JSON.stringify(file)));
+    expect(Array.from(day.absorbed![0]!.slice(0, 6))).toEqual([1.5, Number.POSITIVE_INFINITY, Number.NaN, Number.NaN, 2, 3]);
+    expect(day.absorbed![1]).toBeNull();
+    // 前の版のファイルには無い
+    expect(decodeCurveDay(JSON.parse(JSON.stringify(encodeCurveDay(raw, groups)))).absorbed).toBeUndefined();
+  });
+});

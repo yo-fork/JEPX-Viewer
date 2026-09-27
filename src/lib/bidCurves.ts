@@ -477,6 +477,12 @@ export interface CurveDayFile {
   slots: ({ groups: AreaGroup[]; sell: number[][]; buy: number[][]; residual?: { offset: number; sell: number[]; buy: number[] } } | null)[];
   /** システムプライスのカーブの指標（CURVE_METRICS の順、各 48 コマ、欠損は null） */
   metrics: Record<CurveMetricKey, (number | null)[]>;
+  /**
+   * ブロック入札の約定の変化の推定に使う、公表値の計算で効かなかった量の範囲（sensitivity.ts の absorbedOfDay）。
+   * 48 コマ、各コマ FLIP_CASES の順に [最小, 最大]（MW。最小が分からなければ null、最大が無限なら null）。
+   * 間引く前のカーブと公表値から求めるので、取得したときに公表値が無かった日と、前の版のファイルには無い
+   */
+  absorbed?: ((number | null)[] | null)[];
 }
 
 /** 指標の年度ファイル（curves/fyYYYY.json）。series は「日数 × 48 コマ」 */
@@ -500,6 +506,8 @@ export interface CurveDay {
   slots: (CurveGroup[] | null)[];
   /** 48 コマの「システムプライス − 分断エリアの合計」（間引く前のカーブから。市場分断していないコマと、前の版のファイルでは null） */
   residuals?: (StepResidual | null)[];
+  /** 48 コマの、公表値の計算で効かなかった量の範囲（CurveDayFile.absorbed。分からない最小は NaN、無限の最大は Infinity） */
+  absorbed?: (Float64Array | null)[];
 }
 
 export const SYSTEM_LABEL = 'システムプライス';
@@ -607,6 +615,16 @@ export function decodeCurveDay(json: unknown): CurveDay {
       const r = file.slots[s]?.residual;
       return r ? { offset: r.offset, sell: decodeSteps(r.sell, false), buy: decodeSteps(r.buy, true) } : null;
     }),
+    ...(file.absorbed
+      ? {
+          absorbed: Array.from({ length: SLOTS }, (_, s) => {
+            const a = file.absorbed![s];
+            if (!a) return null;
+            // 最小が分からない組は最大も分からない。最小が分かって最大が null なら無限
+            return Float64Array.from(a, (v, i) => (v !== null ? v : i % 2 === 1 && a[i - 1] !== null ? Number.POSITIVE_INFINITY : Number.NaN));
+          }),
+        }
+      : {}),
   };
 }
 

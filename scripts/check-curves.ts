@@ -10,6 +10,7 @@
  * 市場分断したときの入札カーブの作り（分断エリアのカーブに連系線でやりとりする量が入っているか、システムプライスのカーブに
  * 単エリアの入札が入っているか）と、単エリアのカーブの推定が約定価格で交わるかを、手元のデータで確かめる（src/lib/curveCheck.ts）。
  * 取引結果に JEPX の価格感応度の公表値があれば、システムプライスのカーブをずらして計算した目安（src/lib/sensitivity.ts）と比べる。
+ * 1 日分では、公表値の計算で効かなかった量から推定した、約定が変わったブロック入札（時間帯と量）も出す。
  */
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -42,7 +43,17 @@ import { decodeFyFile, MANIFEST_FORMAT, type Manifest } from '../src/lib/dataFil
 import { formatDay, isoFromDay, parseDateString, slotRangeLabel } from '../src/lib/dates';
 import { fmtNum, fmtPct, fmtPrice, fmtSigned } from '../src/lib/format';
 import type { DayMap } from '../src/lib/jepxCsv';
-import { curveSensitivity, publishedShare, shareQuantile, SPIKE_PRICES, type Sensitivity } from '../src/lib/sensitivity';
+import {
+  curveSensitivity,
+  FLIP_CASES,
+  flipBlocks,
+  flipPlateaus,
+  MIN_FLIP_MW,
+  publishedShare,
+  shareQuantile,
+  SPIKE_PRICES,
+  type Sensitivity,
+} from '../src/lib/sensitivity';
 import { AREA_KEYS, kwhToMw, SENSITIVITY_SIZES, sensitivityKey, SERIES_INDEX, SERIES_LABEL, SLOTS, type PriceKey, type SeriesKey } from '../src/lib/series';
 
 export interface CheckOptions {
@@ -362,6 +373,36 @@ function sensitivityDetail(sc: SensitivityChecked): string[] {
   ];
 }
 
+/** 1 日分: 公表値の計算で効かなかった量から推定した、約定が変わったブロック入札（時間帯と量、入札価格の目安） */
+function flipSection(l: Loaded, day: CurveDay): string[] {
+  const out = [
+    '',
+    '■ ブロック入札の約定の変化（公表値の計算で効かなかった量を、1 日の少ない一定の量の区切りで説明して分けたもの）',
+    '  入札価格の目安は、その時間帯の、約定計算をやり直す前と後のシステムプライスの平均の間',
+  ];
+  if (!day.absorbed) {
+    out.push('  この日の入札カーブのファイルには推定に使う値がありません（npm run fetch で、公表値のある日の入札カーブを取り直して求めます）');
+    return out;
+  }
+  const vals = l.spot.get(day.day);
+  const avg = (from: number, to: number, key: SeriesKey) => {
+    const v = Array.from({ length: to - from }, (_, i) => (vals ? vals[SERIES_INDEX[key] * SLOTS + from + i] : Number.NaN)).filter(Number.isFinite);
+    return v.length > 0 ? mean(v) : Number.NaN;
+  };
+  const hhmm = (slot: number) => (slot >= SLOTS ? '24:00' : slotRangeLabel(slot).slice(0, 5));
+  FLIP_CASES.forEach(({ mw, up }, c) => {
+    const ranges = day.absorbed!.map((a) => (a && Number.isFinite(a[2 * c]) ? ([a[2 * c], a[2 * c + 1]] as [number, number]) : null));
+    if (!ranges.some(Boolean)) return;
+    const key = sensitivityKey(up ? 'buy' : 'sell', mw);
+    const blocks = flipBlocks(flipPlateaus(ranges)).map((b) => {
+      const [a, p] = [avg(b.from, b.to, 'system'), avg(b.from, b.to, key)];
+      return `${hhmm(b.from)}–${hhmm(b.to)} ${fmtNum(b.mw, 1)} MW（${fmtPrice(Math.min(a, p))}〜${fmtPrice(Math.max(a, p))} 円）`;
+    });
+    out.push(`  買い ${up ? '+' : '−'}${sizeText(mw)}: ${blocks.length > 0 ? blocks.join('、') : `${MIN_FLIP_MW} MW 以上の約定の変化なし`}`);
+  });
+  return out;
+}
+
 /** 1 日分のコマごとの一覧 */
 function slotList(list: Checked[]): string[] {
   return [
@@ -483,6 +524,7 @@ export async function checkCurves(o: CheckOptions): Promise<string[]> {
   const sens: SensitivityChecked[] = [];
   let unread = 0;
   let detailLines: string[] = [];
+  let lastDay: CurveDay | null = null;
   for (const dayNum of l.days) {
     let day: CurveDay;
     try {
@@ -491,6 +533,7 @@ export async function checkCurves(o: CheckOptions): Promise<string[]> {
       unread++;
       continue;
     }
+    lastDay = day;
     day.slots.forEach((groups, slot) => {
       if (!groups) return;
       const c = checkSlot(slotInput(l, day, slot));
@@ -511,7 +554,7 @@ export async function checkCurves(o: CheckOptions): Promise<string[]> {
   }
   out.push(...summary(list));
   out.push(...sensitivitySummary(sens));
-  if (first === last) out.push(...slotList(list));
+  if (first === last) out.push(...slotList(list), ...(lastDay ? flipSection(l, lastDay) : []));
   return out;
 }
 
