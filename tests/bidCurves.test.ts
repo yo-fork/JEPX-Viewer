@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  ABSORBED_WIDTH,
   applyGroupNames,
   buyAtOrAbove,
   buyPriceAt,
@@ -8,9 +9,11 @@ import {
   crossing,
   CURVE_METRIC_INDEX,
   CURVE_METRIC_KEYS,
+  CURVE_METRICS_REV,
   curveCsvKind,
   curveDayFile,
   curveMetrics,
+  decodeCurveAbsorbed,
   decodeCurveDay,
   decodeCurveMetrics,
   encodeCurveDay,
@@ -363,5 +366,29 @@ describe('ブロック入札の推定に使う値', () => {
     expect(day.absorbed![1]).toBeNull();
     // 前の版のファイルには無い
     expect(decodeCurveDay(JSON.parse(JSON.stringify(encodeCurveDay(raw, groups)))).absorbed).toBeUndefined();
+  });
+
+  it('指標の年度ファイルにも並べて入れ、日ごとに読み戻せる（無い日は入れない）', () => {
+    const d1 = dayFromYmd(2025, 5, 3);
+    const d2 = d1 + 2;
+    const { raw } = syntheticCurveDay(d1, [{ system: 10, volume: 30000 }]);
+    const metrics = metricsOfDayFile(encodeCurveDay(raw));
+    const days = new Map([
+      [d1, metrics],
+      [d2, metrics],
+    ]);
+    const a1 = [[1.5, null, null, null, 2, 3, 0, 0, 0, 0, 0, 0], ...Array.from({ length: SLOTS - 1 }, () => null)];
+    const file = JSON.parse(JSON.stringify(encodeCurveMetrics(2025, days, new Map([[d1, a1]]))));
+    expect(file.rev).toBe(CURVE_METRICS_REV);
+    expect(file.absorbed).toHaveLength(ABSORBED_WIDTH);
+    expect(file.absorbed[0]).toHaveLength(3 * SLOTS);
+    const back = decodeCurveAbsorbed(file);
+    expect([...back.keys()]).toEqual([d1]);
+    expect(Array.from(back.get(d1)![0]!.slice(0, 6))).toEqual([1.5, Number.POSITIVE_INFINITY, Number.NaN, Number.NaN, 2, 3]);
+    expect(back.get(d1)![1]).toBeNull();
+    // どの日にも無ければ持たない（前の版のファイルと同じく、読むと空）
+    const none = JSON.parse(JSON.stringify(encodeCurveMetrics(2025, days)));
+    expect(none.absorbed).toBeUndefined();
+    expect(decodeCurveAbsorbed(none).size).toBe(0);
   });
 });

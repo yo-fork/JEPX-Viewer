@@ -26,21 +26,25 @@ import {
   rowsFromSteps,
   sellVolumeAt,
   sellVolumesAt,
+  SENSITIVITY_MW,
   SIMPLIFY_RATIO,
   stepPath,
   stepPrices,
+  CURVE_HEAT_EXTRAS,
   type CurveDay,
+  type CurveHeatExtraKey,
+  type CurveHeatKey,
   type CurveMetricKey,
 } from '../lib/bidCurves';
 import { COMPARE_DAYS, type CurveStore } from '../lib/curveStore';
 import { DOW_LABEL, dowOfDay, formatDay, isoFromDay, parseDateString, slotRangeLabel, slotStartLabel, ymdFromDay } from '../lib/dates';
 import { fmtNum, fmtPrice, fmtSigned, stepDigits } from '../lib/format';
-import { AREAS, kwhToMw, SERIES_INDEX, SLOTS, type AreaKey, type SeriesKey } from '../lib/series';
+import { AREAS, kwhToMw, sensitivityKey, SERIES_INDEX, SLOTS, type AreaKey, type SensitivitySize, type SeriesKey } from '../lib/series';
 import { reselect, type Selection } from '../lib/select';
 import { stepGrid, type StepCell, type StepOccurrence } from '../lib/stepGrid';
 import type { Dataset } from '../lib/store';
 import { niceStep } from '../lib/stats';
-import { MAX_CURVE_PICKS, normalizePicks, type CurveCompare, type CurvePick, type CurveRange, type CurveSide } from '../state';
+import { MAX_CURVE_PICKS, normalizePicks, type CurveCompare, type CurvePick, type CurveRange, type CurveSide, type TrendGran } from '../state';
 import type { ChartCard, TableData } from '../ui/card';
 import { segmented, selectField, toolbar, type Segmented, type SelectField } from '../ui/controls';
 import { h, uniqueId } from '../ui/dom';
@@ -61,6 +65,8 @@ import {
   valueAxis,
 } from './common';
 import {
+  CURVE_GRAN_OPTIONS,
+  curveGranularity,
   curveNote,
   fileDate,
   fmtGw,
@@ -70,6 +76,7 @@ import {
   legendTextWidth,
   namedTooltip,
   PLOT_TOP,
+  slotZoom,
   targetLabel,
   targetText,
   wrappedLegend,
@@ -77,7 +84,7 @@ import {
 } from './curveCommon';
 import { SensitivitySection } from './curveSensitivity';
 import { buildGrid, colorRange, gridTable, heatmapHeight, heatmapOption, type Grid } from './heatmap';
-import { autoGranularity, breakGaps, buildSeriesPoints, periodLabel, TIME_AXIS_LABEL } from './timeseries';
+import { breakGaps, buildSeriesPoints, periodLabel, TIME_AXIS_LABEL } from './timeseries';
 
 const NO_CURVES =
   '入札カーブのデータがありません。npm run fetch でデータを取得すると、取引結果と一緒に入札カーブ（既定で直近 90 日分）も取得します。';
@@ -159,7 +166,8 @@ export class CurvesView extends View {
   /** 追加する日・時間帯の入力を、今の日・時間帯で初期化したか */
   private pickerReady = false;
   private depthSide!: Segmented<CurveSide>;
-  private metric!: SelectField<CurveMetricKey>;
+  private metric!: SelectField<CurveHeatKey>;
+  private depthGran!: Segmented<TrendGran>;
   private curve!: ChartCard;
   private comparison!: ChartCard;
   private sellSteps!: ChartCard;
@@ -257,7 +265,7 @@ export class CurvesView extends View {
     this.depthSide = segmented('入札', sides, s.curveDepth, (v) => this.set({ curveDepth: v }));
     this.metric = selectField(
       '指標',
-      CURVE_METRICS.map((m) => ({ value: m.key, label: m.label })),
+      [...CURVE_METRICS.map((m) => ({ value: m.key as CurveHeatKey, label: m.label })), ...CURVE_HEAT_EXTRAS.map((m) => ({ value: m.key as CurveHeatKey, label: m.label }))],
       s.curveMetric,
       (v) => this.set({ curveMetric: v }),
     );
@@ -352,7 +360,8 @@ export class CurvesView extends View {
     const g2 = h('div', { class: 'card-grid' });
     this.content.append(g2);
     this.depth = this.card(g2, { title: '価格帯ごとの入札量の推移', height: 340, wide: true });
-    this.depth.addControls(this.depthSide.el);
+    this.depthGran = segmented('粒度', CURVE_GRAN_OPTIONS, s.curveGran, (v) => this.set({ curveGran: v }));
+    this.depth.addControls(this.depthSide.el, this.depthGran.el);
     this.heat = this.card(g2, { title: '指標のヒートマップ', height: 480, wide: true });
     this.heat.addControls(this.metric.el);
     for (const card of [this.curve, this.comparison]) {
@@ -1217,7 +1226,9 @@ export class CurvesView extends View {
     const side = state.curveDepth;
     const defs = DEPTH[side];
     const colors = ordinalColors(defs.length, theme, side === 'buy');
-    const gran = autoGranularity(sel);
+    this.depthGran.set(state.curveGran);
+    const gran = curveGranularity(sel, state.curveGran);
+    const zoom = slotZoom(gran);
     const raw = buildSeriesPoints(sel, defs.map((d) => ({ a: cs.metricArray(ds, d.key) })), gran, 'mean');
     const data = raw.map((r) => r.points.map(([x, v]) => [x, v / 1000] as [number, number]));
     const names = defs.map((d) => d.name);
@@ -1229,8 +1240,9 @@ export class CurvesView extends View {
     const legend = wrappedLegend(names, this.depth.chart.getWidth());
     this.depth.setOption(
       {
-        grid: grid({ top: legend.top + 8, right: labelRoom(defs.length) }),
+        grid: grid({ top: legend.top + 8, right: labelRoom(defs.length), bottom: zoom.bottom }),
         legend: legend.legend,
+        ...(zoom.dataZoom ? { dataZoom: zoom.dataZoom } : {}),
         tooltip: {
           trigger: 'axis',
           formatter: namedTooltip(
@@ -1256,6 +1268,11 @@ export class CurvesView extends View {
   }
 
   private renderHeat(cs: CurveStore, sel: Selection): void {
+    const extra = CURVE_HEAT_EXTRAS.find((x) => x.key === this.ctx.state.curveMetric);
+    if (extra) {
+      this.renderHeatExtra(cs, sel, extra.key, extra.label);
+      return;
+    }
     const { ds, state, theme } = this.ctx;
     const t = TOKENS[theme];
     const m = CURVE_METRICS.find((x) => x.key === state.curveMetric) ?? CURVE_METRICS[0];
@@ -1274,6 +1291,48 @@ export class CurvesView extends View {
     this.heat.setOption(
       heatmapOption(g, { theme, min, max, colors: t.seq, precision: isVolume ? 0 : 1, fmt, valueLabel: m.label }),
       gridTable(g, `jepx_bidcurve_heatmap_${m.key}_${rangeTag(sel)}.csv`),
+    );
+  }
+
+  /**
+   * 指標と取引結果から求めて見るもの: 0.01 円・高騰までの買いの増減（GW。負は買いが減ると、正は買いが増えるまで。0 を中心の発散色）と、
+   * 価格感応度の公表値の上昇幅・下落幅（円/kWh）
+   */
+  private renderHeatExtra(cs: CurveStore, sel: Selection, key: CurveHeatExtraKey, label: string): void {
+    const { ds, state, theme } = this.ctx;
+    const t = TOKENS[theme];
+    const m = (k: CurveMetricKey) => cs.metricArray(ds, k);
+    const col = (k: SeriesKey) => ds.values[SERIES_INDEX[k]];
+    const gw = (a: Float64Array, b: Float64Array) => Float64Array.from(a, (v, i) => (v - b[i]) / 1000);
+    const shifts: Partial<Record<CurveHeatExtraKey, () => Float64Array>> = {
+      floorShift: () => gw(m('sell001'), m('buyTotal')),
+      spike20Shift: () => gw(m('sell20'), m('buy20')),
+      spike50Shift: () => gw(m('sell50'), m('buy50')),
+    };
+    const shift = shifts[key];
+    const pub = /^pub(Up|Down)(\d+)$/.exec(key);
+    const mw = (pub ? Number(pub[2]) : SENSITIVITY_MW) as SensitivitySize;
+    const g = shift
+      ? buildGrid(sel, { a: shift() }, 'dateSlot')
+      : pub![1] === 'Up'
+        ? buildGrid(sel, { a: col(sensitivityKey('buy', mw)), b: col('system') }, 'dateSlot')
+        : buildGrid(sel, { a: col('system'), b: col(sensitivityKey('sell', mw)) }, 'dateSlot');
+    if (g.cells.length === 0) {
+      this.heat.setEmpty(shift ? 'この指標の値がありません。' : '選択した期間に、価格感応度の公表値がありません（npm run fetch で取得します）。');
+      return;
+    }
+    const unit = shift ? 'GW' : PRICE_UNIT;
+    this.heat.setSubtitle(
+      `${describeSelection(sel, state)}・${label}（${unit}）` +
+        (shift ? '・青: 買いがその量だけ減ると、赤: その量だけ増えると（0 が実際の買い）' : '') +
+        (g.note ? `・${g.note}` : ''),
+    );
+    const [min, max] = shift ? colorRange(g, true) : colorRange(g, false, false);
+    const fmt = shift ? (v: number) => `${fmtSigned(v, 2)} GW` : (v: number) => `${fmtPrice(v)} ${PRICE_UNIT}`;
+    this.heat.setHeight(heatmapHeight(g));
+    this.heat.setOption(
+      heatmapOption(g, { theme, min, max, colors: shift ? t.div : t.seq, precision: shift ? 1 : 2, fmt, valueLabel: label }),
+      gridTable(g, `jepx_bidcurve_heatmap_${key}_${rangeTag(sel)}.csv`),
     );
   }
 }

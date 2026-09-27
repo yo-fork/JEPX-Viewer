@@ -6,6 +6,8 @@
 import {
   CURVE_METRIC_INDEX,
   curveDayFile,
+  decodeAbsorbed,
+  decodeCurveAbsorbed,
   decodeCurveDay,
   decodeCurveMetrics,
   encodeCurveDay,
@@ -44,6 +46,8 @@ export class CurveStore {
   readonly metricDays: number;
   private readonly daySet: Set<number>;
   private readonly metrics = new Map<number, Float64Array>();
+  /** 日ごとの、ブロック入札の約定の変化の推定に使う値（指標の年度ファイルの absorbed。48 コマ） */
+  private readonly absorbedDays = new Map<number, (Float64Array | null)[]>();
   private readonly loadedFy = new Set<number>();
   private readonly pendingFy = new Map<number, Promise<void>>();
   private readonly shapes = new Map<number, CurveDay>();
@@ -204,6 +208,7 @@ export class CurveStore {
             .read(m.file)
             .then((json) => {
               for (const [day, vals] of decodeCurveMetrics(json)) this.metrics.set(day, vals);
+              for (const [day, a] of decodeCurveAbsorbed(json)) this.absorbedDays.set(day, a);
               this.loadedFy.add(m.fy);
               this.version++;
             })
@@ -213,6 +218,16 @@ export class CurveStore {
         return p;
       }),
     ).then(() => undefined);
+  }
+
+  /** その日の、ブロック入札の約定の変化の推定に使う値（読み込んだ指標の年度ファイルから。無ければ undefined） */
+  absorbedOf(day: number): (Float64Array | null)[] | undefined {
+    return this.absorbedDays.get(day);
+  }
+
+  /** ブロック入札の約定の変化の推定に使う値のある日が、読み込んだ指標に 1 日でもある */
+  get hasAbsorbed(): boolean {
+    return this.absorbedDays.size > 0;
   }
 
   /** 指標を Dataset の日の並びにそろえた配列（n × 48、無い値は NaN） */
@@ -251,7 +266,9 @@ export class CurveStore {
   private buildDemoMetrics(ds: Dataset): void {
     for (const day of this.days) {
       const file = this.synth(ds, day);
-      if (file) this.metrics.set(day, metricsOfDayFile(file));
+      if (!file) continue;
+      this.metrics.set(day, metricsOfDayFile(file));
+      if (file.absorbed) this.absorbedDays.set(day, file.absorbed.map((a) => decodeAbsorbed(a)));
     }
     this.demoMetricsBuilt = true;
     this.version++;

@@ -10,7 +10,7 @@
 import type { CustomSeriesRenderItemAPI, CustomSeriesRenderItemReturn } from 'echarts';
 import { areaLabel, CURVE_TARGETS, type AreaCurve, type CurveTarget } from '../lib/areaCurves';
 import { SENSITIVITY_MW, SYSTEM_GROUP, type CurveDay, type CurveMetricKey } from '../lib/bidCurves';
-import type { Source } from '../lib/aggregate';
+import type { Granularity, Source } from '../lib/aggregate';
 import { COMPARE_DAYS, type CurveStore } from '../lib/curveStore';
 import { formatDay, isoFromDay, slotRangeLabel, slotStartLabel } from '../lib/dates';
 import { fmtNum, fmtPrice, fmtSigned } from '../lib/format';
@@ -47,7 +47,7 @@ import {
 import { SENSITIVITY_SIZES, sensitivityKey, SERIES_INDEX, SLOTS, type AreaKey, type SensitivitySize, type SeriesKey } from '../lib/series';
 import { niceStep } from '../lib/stats';
 import type { Dataset } from '../lib/store';
-import type { AppState, CurveRange } from '../state';
+import type { AppState, CurveRange, TrendGran } from '../state';
 import type { CardOptions, ChartCard, TableData } from '../ui/card';
 import { segmented, type Segmented } from '../ui/controls';
 import { h } from '../ui/dom';
@@ -55,9 +55,25 @@ import { renderTiles, type StatTile } from '../ui/kpi';
 import { TOKENS, type ThemeName } from '../ui/theme';
 import { ttHeader, ttNote, ttRow } from '../ui/tooltip';
 import type { ViewContext } from './base';
-import { describeSelection, endLabels, grid, legend, PRICE_UNIT, rangeTag, styledLine, valueAxis, withAlpha } from './common';
-import { curveNote, fileDate, fmtGw, granText, isEstimate, legendTextWidth, namedTooltip, PLOT_TOP, targetLabel, targetText, wrappedLegend, type AxisParam } from './curveCommon';
-import { autoGranularity, breakGaps, buildSeriesPoints, periodLabel, TIME_AXIS_LABEL } from './timeseries';
+import { categoryBarOption, describeSelection, endLabels, grid, legend, PRICE_UNIT, rangeTag, styledLine, valueAxis, withAlpha } from './common';
+import {
+  CURVE_GRAN_OPTIONS,
+  curveGranularity,
+  curveNote,
+  fileDate,
+  fmtGw,
+  granText,
+  isEstimate,
+  legendTextWidth,
+  namedTooltip,
+  PLOT_TOP,
+  slotZoom,
+  targetLabel,
+  targetText,
+  wrappedLegend,
+  type AxisParam,
+} from './curveCommon';
+import { breakGaps, buildSeriesPoints, periodLabel, TIME_AXIS_LABEL } from './timeseries';
 
 /** 価格感応度の図を置くビュー（入札カーブのタブ）から受け取るもの */
 export interface SensitivityHost {
@@ -119,8 +135,28 @@ const FLIP_NOTES = [
     '±5GW では多くのブロックが入れ替わるので、±0.5GW で見るとはっきりします。効かなかった量は、取得するときに間引く前のカーブから求めています。',
 ];
 /** 別の日の、同じブロック入札とみなす量の差（MW と、量に対する割合） */
-const SAME_FLIP_MW = 3;
-const SAME_FLIP_SHARE = 0.015;
+const SAME_FLIP_MW = 5;
+const SAME_FLIP_SHARE = 0.02;
+/** くり返し出てくるブロック入札の図に並べる数 */
+const FLIP_RANK_COUNT = 15;
+
+/** 期間のある日に推定した、約定が変わったとみられるブロック入札（入札価格の目安 lo〜hi 円） */
+interface FlipOccurrence extends FlipBlock {
+  day: number;
+  up: boolean;
+  lo: number;
+  hi: number;
+}
+
+/** 時間帯が同じで量の近い（SAME_FLIP_MW か SAME_FLIP_SHARE 以内）ブロック入札をまとめたもの（日の順） */
+interface FlipGroup {
+  up: boolean;
+  from: number;
+  to: number;
+  items: FlipOccurrence[];
+}
+
+const sameFlipMw = (a: number, b: number) => Math.abs(a - b) <= Math.max(SAME_FLIP_MW, SAME_FLIP_SHARE * Math.max(a, b));
 
 /** エリアの期間の価格感応度（コマごとに SENS_FIELDS の値。集めたときの取引結果が変われば集め直す） */
 interface AreaSensitivity {
@@ -201,6 +237,13 @@ export class SensitivitySection {
   private readonly flips: ChartCard;
   /** 推定したブロック入札の一覧（ブロック入札の約定の変化の図の下） */
   private readonly flipList: HTMLElement;
+  private readonly flipRank: ChartCard;
+  private readonly grans: Segmented<TrendGran>[] = [];
+  /** 選んだ期間のブロック入札のまとまり（1 日の一覧と、くり返し出てくるものの図で使う）と、それを求めた日の数 */
+  private flipGroups: FlipGroup[] = [];
+  private flipDays = 0;
+  /** くり返し出てくるものの図の棒のまとまり（押した棒から日を引く） */
+  private rankGroups: FlipGroup[] = [];
   private readonly trend: ChartCard;
   private readonly margin: ChartCard;
   private readonly sizes: Segmented<`${SensitivitySize}`>[] = [];
@@ -280,15 +323,32 @@ export class SensitivitySection {
     });
     this.trend = host.card(g, { title: '価格感応度の推移', height: 340 });
     this.collectBtn = h('button', { type: 'button', class: 'btn btn-sm', hidden: true, onclick: () => this.onCollect() }, '計算する');
-    this.trend.addControls(sizeControl(), this.collectBtn);
+    const granControl = () => {
+      const c = segmented('粒度', CURVE_GRAN_OPTIONS, s.curveGran, (v) => host.set({ curveGran: v }));
+      this.grans.push(c);
+      return c.el;
+    };
+    this.trend.addControls(sizeControl(), granControl(), this.collectBtn);
     this.margin = host.card(g, { title: '0.01 円・高騰までの買いの増減の推移', height: 340 });
-    this.margin.addControls(spikeControl());
+    this.margin.addControls(spikeControl(), granControl());
+    this.flipRank = host.card(g, { title: 'くり返し出てくるブロック入札', height: 420, wide: true });
+    this.flipRank.addControls(sizeControl());
+    this.flipRank.chart.on('click', (e: unknown) => {
+      const group = this.rankGroups[(e as { dataIndex: number }).dataIndex];
+      const last = group?.items[group.items.length - 1];
+      if (!group || !last) return;
+      // いちばん新しい日の、そのブロックの最初のコマを表示する
+      host.set({ curveDate: last.day, curveSlot: group.from });
+      this.flips.el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
   }
 
   render(cs: CurveStore, date: number): void {
     const { state } = this.host.ctx();
     for (const c of this.sizes) c.set(String(state.sensSize) as `${SensitivitySize}`);
     for (const c of this.spikes) c.set(String(state.spikePrice) as `${SpikePrice}`);
+    for (const c of this.grans) c.set(state.curveGran);
+    this.collectFlips(cs);
     this.note.textContent =
       '買いが増えたり減ったりしたときに約定価格がどう動くかを、入札カーブの交点を買いの量だけずらして求めます。' +
       'ブロック入札の約定と、分断エリアのカーブでは連系線でやりとりする量を変えない目安です。' +
@@ -328,7 +388,7 @@ export class SensitivitySection {
       for (const c of [this.response, this.areaSens, this.areaMargin, this.flips]) c.setEmpty(`${formatDay(date, true)} の入札カーブを読み込めませんでした。`);
       return;
     }
-    this.renderFlips(cs, day);
+    this.renderFlips(day);
     const rows = this.slotRows(day, slot);
     // ブロック入札の約定の変化の見込み: システムプライスのカーブはこのコマの公表値から、ほかは直近の日の公表値から
     const pub = this.published(date, slot);
@@ -411,7 +471,7 @@ export class SensitivitySection {
   }
 
   /** 公表値の計算で効かなかった量の 1 日の並びと、そこから推定した、約定が変わったブロック入札（システムプライス） */
-  private renderFlips(cs: CurveStore, day: CurveDay): void {
+  private renderFlips(day: CurveDay): void {
     const { state, theme } = this.host.ctx();
     const t = TOKENS[theme];
     const [neg, pos] = poles(theme);
@@ -425,8 +485,8 @@ export class SensitivitySection {
       `${formatDay(date, true)}・システムプライス・買いを ${size} 増やしたとき（上）と減らしたとき（下）に、公表値の計算で効かなかった量（MW）` +
         '・縦線は公表値を説明できる範囲、階段の線はそれを少ない区切りで説明した量・押すとそのコマを表示',
     );
-    const upR = flipRanges(day, k, true);
-    const downR = flipRanges(day, k, false);
+    const upR = flipRanges(day.absorbed, k, true);
+    const downR = flipRanges(day.absorbed, k, false);
     if (!upR || !downR) {
       card.setEmpty(day.absorbed ? 'この日は価格感応度の公表値がありません。' : NO_FLIPS);
       return;
@@ -496,7 +556,13 @@ export class SensitivitySection {
           data: Array.from({ length: SLOTS }, (_, i) => slotStartLabel(i)),
           axisLabel: { interval: (i: number) => i % 4 === 0, hideOverlap: true },
         },
-        yAxis: valueAxis('MW', { min: axisMin, max: axisMax, axisLabel: { formatter: (v: number) => fmtNum(Math.abs(v)) } }),
+        // 縦軸の名前は軸の左に出して、左端のコマの「表示中のコマ」と重ならないようにする
+        yAxis: valueAxis('MW', {
+          min: axisMin,
+          max: axisMax,
+          nameTextStyle: { align: 'right', padding: [0, 4, 0, 0] },
+          axisLabel: { formatter: (v: number) => fmtNum(Math.abs(v)) },
+        }),
         series: [
           bars(upName, pos, upR, 1, axisMax),
           bars(downName, neg, downR, -1, -axisMin),
@@ -511,7 +577,12 @@ export class SensitivitySection {
               label: { color: t.ink2, fontSize: 11, backgroundColor: t.surface, padding: [1, 3], borderRadius: 3 },
               data: [
                 { yAxis: 0, lineStyle: { color: t.axis, width: 1, type: 'solid' }, label: { show: false } },
-                { xAxis: state.curveSlot, lineStyle: { color: t.ink2, width: 1, type: [4, 4] }, label: { formatter: '表示中のコマ', position: 'end' } },
+                {
+                  xAxis: state.curveSlot,
+                  lineStyle: { color: t.ink2, width: 1, type: [4, 4] },
+                  // 端のコマでは、文字がグラフの外にはみ出さないように内側へ寄せる
+                  label: { formatter: '表示中のコマ', position: 'end', align: state.curveSlot < 6 ? 'left' : state.curveSlot >= SLOTS - 6 ? 'right' : 'center' },
+                },
               ],
             },
           }),
@@ -534,46 +605,24 @@ export class SensitivitySection {
       },
     );
 
-    // 推定したブロック入札の一覧（入札価格の目安と、直近の日の同じもの）
-    const others = cs
-      .recent(date, COMPARE_DAYS)
-      .filter((d) => d !== date)
-      .map((d) => ({ d, day: cs.getDay(d) }))
-      .filter((x): x is { d: number; day: CurveDay } => !!x.day);
-    const avg = (from: number, to: number, key: SeriesKey) => {
-      let sum = 0;
-      let n = 0;
-      for (let i = from; i < to; i++) {
-        const v = this.host.value(date, i, key);
-        if (Number.isFinite(v)) {
-          sum += v;
-          n++;
-        }
-      }
-      return n > 0 ? sum / n : Number.NaN;
-    };
+    // 推定したブロック入札の一覧（入札価格の目安と、選んだ期間の同じもの）
     const section = (up: boolean, blocks: FlipBlock[]) => {
-      const pubKey = sensitivityKey(up ? 'buy' : 'sell', mw);
       const title = up
         ? `買い +${size}: 約定しなかった売りのブロック入札が約定した（か、約定した買いのブロック入札が約定しなくなった）とみられるもの`
         : `買い −${size}: 約定した売りのブロック入札が約定しなくなった（か、約定しなかった買いのブロック入札が約定した）とみられるもの`;
-      const same = (b: FlipBlock) =>
-        others
-          .filter(({ day: od }) => {
-            const r = flipRanges(od, k, up);
-            return !!r && flipBlocks(flipPlateaus(r)).some((x) => x.from === b.from && x.to === b.to && Math.abs(x.mw - b.mw) <= Math.max(SAME_FLIP_MW, SAME_FLIP_SHARE * b.mw));
-          })
-          .map(({ d }) => shortDate(d));
       const items = blocks.map((b) => {
-        const a = avg(b.from, b.to, 'system');
-        const c = avg(b.from, b.to, pubKey);
-        const price = Number.isFinite(a) && Number.isFinite(c) ? `・入札価格の目安 ${fmtPrice(Math.min(a, c))}〜${fmtPrice(Math.max(a, c))} 円` : '';
-        const again = same(b);
+        const [lo, hi] = flipPrice(date, b, up, mw, (d, slot, key) => this.host.value(d, slot, key));
+        const price = Number.isFinite(lo) && Number.isFinite(hi) ? `・入札価格の目安 ${fmtPrice(lo)}〜${fmtPrice(hi)} 円` : '';
+        // 選んだ期間の、同じ時間帯で量の近いもの（ほかの日）
+        const group = this.flipGroups.find((g) => g.up === up && g.from === b.from && g.to === b.to && g.items.some((x) => x.day === date && sameFlipMw(x.mw, b.mw)));
+        const others = group ? group.items.filter((x) => x.day !== date).map((x) => shortDate(x.day)) : [];
+        const again =
+          others.length > 0 ? `・選んだ期間ではほかに ${fmtNum(others.length)} 日（${others.slice(-3).join('、')}${others.length > 3 ? ' ほか' : ''}）` : '';
         return h(
           'li',
           null,
           h('button', { type: 'button', class: 'btn btn-sm', title: 'そのブロックの最初のコマを表示', onclick: () => this.host.set({ curveSlot: b.from }) }, `${hhmm(b.from)}–${hhmm(b.to)}`),
-          ` 約 ${fmtNum(b.mw)} MW（${fmtNum(b.to - b.from)} コマ）${price}${again.length > 0 ? `・直近 ${COMPARE_DAYS} 日では ${again.join('、')} にも` : ''}`,
+          ` 約 ${fmtNum(b.mw)} MW（${fmtNum(b.to - b.from)} コマ）${price}${again}`,
         );
       });
       return h(
@@ -584,6 +633,126 @@ export class SensitivitySection {
       );
     };
     this.flipList.replaceChildren(section(true, flipBlocks(upP)), section(false, flipBlocks(downP)));
+  }
+
+  /** 期間の図の範囲（選んだ期間のうち、入札カーブの指標のある範囲。無ければ null） */
+  private curveSel(cs: CurveStore): Selection | null {
+    const { sel } = this.host.ctx();
+    const from = Math.max(sel.from, cs.metricsFirst);
+    const to = Math.min(sel.to, cs.metricsLast);
+    const selC = from <= to ? reselect(sel, from, to) : null;
+    return selC && selC.days.length > 0 ? selC : null;
+  }
+
+  /** 選んだ期間の各日の、約定が変わったとみられるブロック入札を、時間帯と量でまとめる（指標の年度ファイルの absorbed から） */
+  private collectFlips(cs: CurveStore): void {
+    const { ds, state } = this.host.ctx();
+    const curves = this.curveSel(cs);
+    const k = SENSITIVITY_SIZES.indexOf(state.sensSize);
+    const occ: FlipOccurrence[] = [];
+    let days = 0;
+    for (const i of curves?.days ?? []) {
+      const day = ds.start + i;
+      const absorbed = cs.absorbedOf(day);
+      if (!absorbed) continue;
+      days++;
+      for (const up of [true, false]) {
+        const ranges = flipRanges(absorbed, k, up);
+        if (!ranges) continue;
+        for (const b of flipBlocks(flipPlateaus(ranges))) {
+          const [lo, hi] = flipPrice(day, b, up, state.sensSize, (d, slot, key) => this.host.value(d, slot, key));
+          occ.push({ ...b, day, up, lo, hi });
+        }
+      }
+    }
+    this.flipGroups = groupFlips(occ);
+    this.flipDays = days;
+  }
+
+  /** 選んだ期間に、同じ時間帯・同じような量のブロック入札が何日出てきたか（出てきた日数の多い順） */
+  private renderFlipRank(cs: CurveStore): void {
+    const { state, theme } = this.host.ctx();
+    const [neg, pos] = poles(theme);
+    const card = this.flipRank;
+    const size = sizeText(state.sensSize);
+    const curves = this.curveSel(cs);
+    this.rankGroups = [];
+    if (!curves) {
+      card.setSubtitle('');
+      card.setEmpty(`選択した期間に入札カーブの指標がありません（${formatDay(cs.metricsFirst)}〜${formatDay(cs.metricsLast)} にあります）。`);
+      return;
+    }
+    const range = `${formatDay(curves.from)}〜${formatDay(curves.to)}${state.dayType === 'weekday' ? '・平日' : state.dayType === 'offday' ? '・土日祝' : ''}`;
+    card.setSubtitle(
+      `${range}・推定に使う値のある ${fmtNum(this.flipDays)} 日（時間帯の条件は使わない）・システムプライス・買いを ±${size} 増減したときに約定が変わったとみられるブロック入札を、` +
+        `時間帯が同じで量の差が ${SAME_FLIP_MW}MW（か ${SAME_FLIP_SHARE * 100}%）以内のものでまとめ、出てきた日数の多い順（赤: 買いを増やしたとき、青: 減らしたとき）・押すといちばん新しい日を表示`,
+    );
+    if (this.flipDays === 0) {
+      card.setEmpty(cs.hasAbsorbed ? '選択した期間に、推定に使う値のある日がありません。' : NO_FLIPS);
+      return;
+    }
+    const groups = this.flipGroups;
+    if (groups.length === 0) {
+      card.setEmpty(`選択した期間に、${fmtNum(MIN_FLIP_MW)} MW 以上の約定の変化は見つかりませんでした。`);
+      return;
+    }
+    const top = groups.slice(0, FLIP_RANK_COUNT);
+    this.rankGroups = top;
+    const hhmm = (slot: number) => (slot >= SLOTS ? '24:00' : slotStartLabel(slot));
+    const label = (g: FlipGroup) => `${g.up ? '+' : '−'} ${hhmm(g.from)}–${hhmm(g.to)} ${fmtNum(median(g.items.map((x) => x.mw)))}MW`;
+    const priceText = (g: FlipGroup) => {
+      const lo = Math.max(...g.items.map((x) => x.lo));
+      const hi = Math.min(...g.items.map((x) => x.hi));
+      if (lo <= hi) return `${fmtPrice(lo)}〜${fmtPrice(hi)} 円（どの日の目安とも重なる）`;
+      return `${fmtPrice(Math.min(...g.items.map((x) => x.lo)))}〜${fmtPrice(Math.max(...g.items.map((x) => x.hi)))} 円（日によって違う）`;
+    };
+    const mwText = (g: FlipGroup) => {
+      const v = g.items.map((x) => x.mw);
+      const [a, b] = [Math.min(...v), Math.max(...v)];
+      return b - a < 0.05 ? `${fmtNum(a, 1)} MW` : `${fmtNum(a, 1)}〜${fmtNum(b, 1)} MW`;
+    };
+    const dates = (g: FlipGroup) => g.items.map((x) => shortDate(x.day));
+    card.setHeight(Math.max(240, top.length * 26 + 90));
+    card.setOption(
+      categoryBarOption(
+        top.map((g) => ({ label: label(g), value: g.items.length, color: g.up ? pos : neg })),
+        {
+          horizontal: true,
+          theme,
+          unit: '日',
+          format: (v) => `${fmtNum(v)} 日`,
+          tooltip: (i) => {
+            const g = top[i];
+            const ds = dates(g);
+            return (
+              ttHeader(`買い ${g.up ? '+' : '−'}${size}・${hhmm(g.from)}–${hhmm(g.to)}（${fmtNum(g.to - g.from)} コマ）`) +
+              ttRow(g.up ? pos : neg, `${fmtNum(g.items.length)} 日`, `推定に使う値のある ${fmtNum(this.flipDays)} 日のうち`, 'rect') +
+              ttNote(`量 ${mwText(g)}・入札価格の目安 ${priceText(g)}`) +
+              ttNote(`${ds.slice(0, 12).join('、')}${ds.length > 12 ? ` ほか ${fmtNum(ds.length - 12)} 日` : ''}`)
+            );
+          },
+          valueAxisExtra: { minInterval: 1 },
+        },
+      ),
+      {
+        columns: ['向き', '時間帯', 'コマ数', '量の中央値（MW）', '量', '日数', '推定に使う値のある日に対する割合（%）', '入札価格の目安', '最初の日', '最後の日', '出てきた日'],
+        rows: groups.map((g) => [
+          `買い ${g.up ? '+' : '−'}${size}`,
+          `${hhmm(g.from)}–${hhmm(g.to)}`,
+          g.to - g.from,
+          median(g.items.map((x) => x.mw)),
+          mwText(g),
+          g.items.length,
+          (g.items.length / this.flipDays) * 100,
+          priceText(g),
+          formatDay(g.items[0].day),
+          formatDay(g.items[g.items.length - 1].day),
+          dates(g).join(' '),
+        ]),
+        digits: [null, null, 0, 1, null, 0, 1, null, null, null, null],
+        filename: `jepx_block_flips_recurring_${state.sensSize}_${rangeTag(curves)}.csv`,
+      },
+    );
   }
 
   /** JEPX が公表している、そのコマの価格感応度（システムプライス。無ければ null） */
@@ -928,10 +1097,8 @@ export class SensitivitySection {
 
   private renderPeriod(cs: CurveStore): void {
     const { sel, state } = this.host.ctx();
-    const from = Math.max(sel.from, cs.metricsFirst);
-    const to = Math.min(sel.to, cs.metricsLast);
-    const selC = from <= to ? reselect(sel, from, to) : null;
-    const curves = selC && selC.days.length > 0 ? selC : null;
+    const curves = this.curveSel(cs);
+    this.renderFlipRank(cs);
     if (state.curveArea === 'system') {
       this.collectBtn.hidden = true;
       this.renderSystemTrend(cs, sel, curves);
@@ -974,7 +1141,7 @@ export class SensitivitySection {
         { name: '下落幅（目安）', short: '下落（目安）', color: neg, dashed: true, source: { a: cs.metricArray(ds, 'downPrice') } },
       );
     }
-    const gran = autoGranularity(use);
+    const gran = curveGranularity(use, state.curveGran);
     const what =
       hasPub && withEst
         ? '実線は JEPX の公表値、破線は入札カーブから計算した目安'
@@ -1003,7 +1170,7 @@ export class SensitivitySection {
     const x = state.spikePrice;
     const [sellX, buyX] = SPIKE_METRICS[x];
     const m = (k: CurveMetricKey) => cs.metricArray(ds, k);
-    const gran = autoGranularity(curves);
+    const gran = curveGranularity(curves, state.curveGran);
     this.drawLines(
       this.margin,
       curves,
@@ -1059,7 +1226,7 @@ export class SensitivitySection {
     const mw = state.sensSize;
     const size = sizeText(mw);
     const x = state.spikePrice;
-    const gran = autoGranularity(curves);
+    const gran = curveGranularity(curves, state.curveGran);
     const range = `カーブのある ${fmtNum(have)} 日${missing.length > 0 ? `（まだ計算していない ${fmtNum(missing.length)} 日を除く）` : ''}${got.failed > 0 ? `・読み込めなかった ${fmtNum(got.failed)} 日を除く` : ''}`;
     const arr = (f: SensField) => this.fieldArray(area, got, f, ds);
     this.drawLines(
@@ -1104,7 +1271,7 @@ export class SensitivitySection {
   private drawLines(
     card: ChartCard,
     sel: Selection,
-    gran: ReturnType<typeof autoGranularity>,
+    gran: Granularity,
     lines: PeriodLine[],
     opts: { subtitle: string; unit: string; scale: number; min?: number; zeroLine?: boolean; format: (v: number) => string; digits: number; filename: string },
   ): void {
@@ -1118,13 +1285,15 @@ export class SensitivitySection {
     }
     const names = lines.map((l) => l.name);
     const legendOf = wrappedLegend(names, card.chart.getWidth(), lines.map((l) => l.dashed));
+    const zoom = slotZoom(gran);
     const ends = endLabels(lines.map((l) => l.short), data.map((d) => d.map((p) => p[1])), theme, 260);
     const room = Math.max(...lines.map((l) => (legendTextWidth(l.short) * 11) / 12)) + 16;
     card.setSubtitle(opts.subtitle);
     card.setOption(
       {
-        grid: grid({ top: legendOf.top + 8, right: Math.max(24, room) }),
+        grid: grid({ top: legendOf.top + 8, right: Math.max(24, room), bottom: zoom.bottom }),
         legend: legendOf.legend,
+        ...(zoom.dataZoom ? { dataZoom: zoom.dataZoom } : {}),
         tooltip: {
           trigger: 'axis',
           formatter: namedTooltip(
@@ -1141,14 +1310,23 @@ export class SensitivitySection {
           styledLine(l.name, l.color, theme, gran === 'slot' ? breakGaps(data[i]) : data[i], l.dashed, {
             sampling: 'lttb',
             ...ends[i],
-            ...(opts.zeroLine && i === 0
+            // 最後に描く系列に付けて、「実際の買い」の文字が線の下に隠れないようにする
+            ...(opts.zeroLine && i === lines.length - 1
               ? {
                   markLine: {
                     symbol: 'none',
                     silent: true,
                     animation: false,
                     lineStyle: { color: t.ink2, width: 1, type: 'solid' },
-                    label: { formatter: '実際の買い', position: 'insideEndTop', color: t.ink2, fontSize: 11 },
+                    label: {
+                      formatter: '実際の買い',
+                      position: 'insideEndTop',
+                      color: t.ink2,
+                      fontSize: 11,
+                      backgroundColor: t.surface,
+                      padding: [1, 3],
+                      borderRadius: 3,
+                    },
                     data: [{ yAxis: 0 }],
                   },
                 }
@@ -1250,12 +1428,49 @@ interface PeriodLine {
   source: Source;
 }
 
-/** 日のファイルの効かなかった量の範囲のうち、SENSITIVITY_SIZES の k 番目の量・向きの分（無ければ null） */
-function flipRanges(day: CurveDay, k: number, up: boolean): ([number, number] | null)[] | null {
-  if (!day.absorbed) return null;
+/** 効かなかった量の範囲（日のファイルか指標の年度ファイルの absorbed）のうち、SENSITIVITY_SIZES の k 番目の量・向きの分（無ければ null） */
+function flipRanges(absorbed: readonly (Float64Array | null)[] | undefined, k: number, up: boolean): ([number, number] | null)[] | null {
+  if (!absorbed) return null;
   const i = 2 * (2 * k + (up ? 0 : 1));
-  const out = day.absorbed.map((a) => (a && Number.isFinite(a[i]) ? ([a[i], a[i + 1]] as [number, number]) : null));
+  const out = absorbed.map((a) => (a && Number.isFinite(a[i]) ? ([a[i], a[i + 1]] as [number, number]) : null));
   return out.some(Boolean) ? out : null;
+}
+
+/** ブロック入札の入札価格の目安: その時間帯の、約定計算をやり直す前と後のシステムプライスの平均の間（円/kWh。[低い方, 高い方]） */
+function flipPrice(day: number, b: FlipBlock, up: boolean, mw: SensitivitySize, value: (day: number, slot: number, key: SeriesKey) => number): [number, number] {
+  const avg = (key: SeriesKey) => {
+    const v = Array.from({ length: b.to - b.from }, (_, i) => value(day, b.from + i, key)).filter(Number.isFinite);
+    return v.length > 0 ? v.reduce((x, y) => x + y, 0) / v.length : Number.NaN;
+  };
+  const [a, c] = [avg('system'), avg(sensitivityKey(up ? 'buy' : 'sell', mw))];
+  return [Math.min(a, c), Math.max(a, c)];
+}
+
+/** 時間帯が同じで量の近いものをまとめ、出てきた日数の多い順（同じなら量の多い順）に並べる */
+function groupFlips(occ: FlipOccurrence[]): FlipGroup[] {
+  const byKey = new Map<string, FlipOccurrence[]>();
+  for (const o of occ) {
+    const key = `${o.up}|${o.from}|${o.to}`;
+    if (!byKey.has(key)) byKey.set(key, []);
+    byKey.get(key)!.push(o);
+  }
+  const groups: FlipGroup[] = [];
+  for (const list of byKey.values()) {
+    list.sort((a, b) => a.mw - b.mw);
+    let cur: FlipGroup | null = null;
+    for (const o of list) {
+      if (cur && sameFlipMw(o.mw, cur.items[0].mw)) cur.items.push(o);
+      else groups.push((cur = { up: o.up, from: o.from, to: o.to, items: [o] }));
+    }
+  }
+  for (const g of groups) g.items.sort((a, b) => a.day - b.day);
+  return groups.sort((a, b) => b.items.length - a.items.length || median(b.items.map((x) => x.mw)) - median(a.items.map((x) => x.mw)));
+}
+
+function median(v: number[]): number {
+  const s = [...v].sort((a, b) => a - b);
+  const m = s.length >> 1;
+  return s.length === 0 ? Number.NaN : s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 }
 
 /** 一覧に並べる短い日付（9/21） */

@@ -8,7 +8,11 @@ import { isoFromDay } from '../lib/dates';
 import { fmtNum } from '../lib/format';
 import { ttHeader, ttRow } from '../ui/tooltip';
 import { lineLegend } from './common';
-import type { autoGranularity } from './timeseries';
+import type { Granularity } from '../lib/aggregate';
+import type { Selection } from '../lib/select';
+import type { TrendGran } from '../state';
+import type { Option } from '../ui/controls';
+import { autoGranularity } from './timeseries';
 
 /** グラフ領域の上端（凡例 1 行と縦軸の名前の分）と、凡例が折り返したときの 1 行の高さ */
 export const PLOT_TOP = 36;
@@ -119,7 +123,30 @@ export function wrappedLegend(
   return { legend, top: PLOT_TOP + (rows - 1) * LEGEND_ROW };
 }
 
-export function granText(gran: ReturnType<typeof autoGranularity>): string {
+/** 入札カーブのタブの、期間の推移の図の粒度の選び方（30 分はコマごとの値） */
+export const CURVE_GRAN_OPTIONS: Option<TrendGran>[] = [
+  { value: 'auto', label: '自動' },
+  { value: 'slot', label: '30分' },
+  { value: 'day', label: '日' },
+  { value: 'week', label: '週' },
+  { value: 'month', label: '月' },
+];
+
+/** 選んだ粒度（自動なら期間の長さで決める） */
+export function curveGranularity(sel: Selection, g: TrendGran): Granularity {
+  return g === 'auto' ? autoGranularity(sel) : g;
+}
+
+/**
+ * 30 分値のときは点が多いので、横軸を拡大できるようにする（ホイール・ドラッグと、下のスライダー）。
+ * 返す bottom は、スライダーの分を空けたグラフ領域の下の余白
+ */
+export function slotZoom(gran: Granularity): { dataZoom?: Record<string, unknown>[]; bottom: number } {
+  if (gran !== 'slot') return { bottom: 8 };
+  return { dataZoom: [{ type: 'inside', xAxisIndex: 0 }, { type: 'slider', xAxisIndex: 0, height: 16, bottom: 6 }], bottom: 40 };
+}
+
+export function granText(gran: Granularity): string {
   return gran === 'slot' ? '30分値' : `${GRANULARITY_LABEL[gran]}ごとの平均`;
 }
 

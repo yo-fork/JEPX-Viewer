@@ -13,7 +13,7 @@
 import { parseCsv, toCsv } from './csv';
 import { isoFromDay, parseDateString } from './dates';
 import { normalizeHeader, parseNumber, parseSlot } from './jepxCsv';
-import { AREAS, SLOTS, type AreaKey } from './series';
+import { AREAS, SENSITIVITY_SIZES, SLOTS, type AreaKey, type SensitivitySize } from './series';
 
 /** システムプライスの入札カーブのグループ番号（CSV では分断エリア連番が空か -1） */
 export const SYSTEM_GROUP = -1;
@@ -175,6 +175,20 @@ export const CURVE_METRICS = [
 ] as const;
 
 export type CurveMetricKey = (typeof CURVE_METRICS)[number]['key'];
+
+/** 入札カーブのヒートマップで、指標と取引結果から求めて見るもの（0.01 円・高騰までの買いの増減と、価格感応度の公表値） */
+export type CurveHeatExtraKey = 'floorShift' | 'spike20Shift' | 'spike50Shift' | `pubUp${SensitivitySize}` | `pubDown${SensitivitySize}`;
+export type CurveHeatKey = CurveMetricKey | CurveHeatExtraKey;
+export const CURVE_HEAT_EXTRAS: { key: CurveHeatExtraKey; label: string }[] = [
+  { key: 'floorShift', label: '0.01 円になる買いの増減（0.01 円以下の売り − 買いの合計）' },
+  { key: 'spike20Shift', label: '20 円を超える買いの増減（20 円以下の売り − 20 円以上の買い）' },
+  { key: 'spike50Shift', label: '50 円を超える買いの増減（50 円以下の売り − 50 円以上の買い）' },
+  ...SENSITIVITY_SIZES.flatMap((mw): { key: CurveHeatExtraKey; label: string }[] => [
+    { key: `pubUp${mw}`, label: `JEPX の公表値: 買い +${mw / 1000}GW の上昇幅` },
+    { key: `pubDown${mw}`, label: `JEPX の公表値: 買い −${mw / 1000}GW の下落幅` },
+  ]),
+];
+export const CURVE_HEAT_KEYS: CurveHeatKey[] = [...CURVE_METRICS.map((m) => m.key), ...CURVE_HEAT_EXTRAS.map((m) => m.key)];
 export const CURVE_METRIC_KEYS: CurveMetricKey[] = CURVE_METRICS.map((m) => m.key);
 export const CURVE_METRIC_COUNT = CURVE_METRICS.length;
 export const CURVE_METRIC_INDEX = Object.fromEntries(CURVE_METRIC_KEYS.map((k, i) => [k, i])) as Record<CurveMetricKey, number>;
@@ -492,7 +506,19 @@ export interface CurveMetricsFile {
   firstDate: string;
   days: number;
   metrics: Record<CurveMetricKey, (number | null)[]>;
+  /** 作った版（CURVE_METRICS_REV。前の版のファイルには無い） */
+  rev?: number;
+  /**
+   * 日のファイルの absorbed（ブロック入札の約定の変化の推定に使う値）を並べたもの。ABSORBED_WIDTH 本、各「日数 × 48 コマ」（無い値は null）。
+   * どの日にも無ければ無い
+   */
+  absorbed?: (number | null)[][];
 }
+
+/** 指標の年度ファイルの版（2: 日のファイルの absorbed も入れる。これより前の版のファイルは作り直す） */
+export const CURVE_METRICS_REV = 2;
+/** 日のファイルの absorbed の、1 コマの値の数（sensitivity.ts の FLIP_CASES の数 × [最小, 最大]） */
+export const ABSORBED_WIDTH = 12;
 
 /** 画面で使う 1 コマ・1 グループのカーブ */
 export interface CurveGroup extends AreaGroup {
@@ -615,17 +641,14 @@ export function decodeCurveDay(json: unknown): CurveDay {
       const r = file.slots[s]?.residual;
       return r ? { offset: r.offset, sell: decodeSteps(r.sell, false), buy: decodeSteps(r.buy, true) } : null;
     }),
-    ...(file.absorbed
-      ? {
-          absorbed: Array.from({ length: SLOTS }, (_, s) => {
-            const a = file.absorbed![s];
-            if (!a) return null;
-            // 最小が分からない組は最大も分からない。最小が分かって最大が null なら無限
-            return Float64Array.from(a, (v, i) => (v !== null ? v : i % 2 === 1 && a[i - 1] !== null ? Number.POSITIVE_INFINITY : Number.NaN));
-          }),
-        }
-      : {}),
+    ...(file.absorbed ? { absorbed: Array.from({ length: SLOTS }, (_, s) => decodeAbsorbed(file.absorbed![s])) } : {}),
   };
+}
+
+/** 1 コマの absorbed の値（最小が分からない組は最大も分からない。最小が分かって最大が null なら無限。すべて無ければ null） */
+export function decodeAbsorbed(a: readonly (number | null)[] | null | undefined): Float64Array | null {
+  if (!a || !a.some((v) => v !== null)) return null;
+  return Float64Array.from(a, (v, i) => (v !== null ? v : i % 2 === 1 && a[i - 1] !== null ? Number.POSITIVE_INFINITY : Number.NaN));
 }
 
 /** 日 → 指標（CURVE_METRIC_COUNT × 48、欠損は NaN） */
@@ -648,7 +671,10 @@ export function metricsOfDayFile(file: CurveDayFile): Float64Array {
   return out;
 }
 
-export function encodeCurveMetrics(fy: number, days: CurveMetricDays): CurveMetricsFile {
+/**
+ * @param absorbed 日のファイルの absorbed（無い日は入れない）
+ */
+export function encodeCurveMetrics(fy: number, days: CurveMetricDays, absorbed?: ReadonlyMap<number, CurveDayFile['absorbed']>): CurveMetricsFile {
   const keys = [...days.keys()].sort((a, b) => a - b);
   const first = keys[0];
   const n = keys[keys.length - 1] - first + 1;
@@ -659,7 +685,33 @@ export function encodeCurveMetrics(fy: number, days: CurveMetricDays): CurveMetr
       for (let s = 0; s < SLOTS; s++) metrics[k][off + s] = toNullable(vals[m * SLOTS + s]);
     });
   }
-  return { format: CURVE_METRICS_FORMAT, fy, firstDate: isoFromDay(first), days: n, metrics };
+  const file: CurveMetricsFile = { format: CURVE_METRICS_FORMAT, fy, firstDate: isoFromDay(first), days: n, metrics, rev: CURVE_METRICS_REV };
+  const withAbsorbed = [...(absorbed?.entries() ?? [])].filter(
+    (e): e is [number, NonNullable<CurveDayFile['absorbed']>] => !!e[1] && e[0] >= first && e[0] < first + n,
+  );
+  if (withAbsorbed.length > 0) {
+    const out = Array.from({ length: ABSORBED_WIDTH }, () => new Array<number | null>(n * SLOTS).fill(null));
+    for (const [day, a] of withAbsorbed) {
+      a.forEach((vals, s) => {
+        if (vals) vals.forEach((v, j) => (out[j][(day - first) * SLOTS + s] = v));
+      });
+    }
+    file.absorbed = out;
+  }
+  return file;
+}
+
+/** 指標の年度ファイルの absorbed を、日ごと（48 コマ、各コマ ABSORBED_WIDTH 個か null）に読む。無い日は入れない */
+export function decodeCurveAbsorbed(json: unknown): Map<number, (Float64Array | null)[]> {
+  const file = json as CurveMetricsFile;
+  const out = new Map<number, (Float64Array | null)[]>();
+  const first = parseDateString(file?.firstDate ?? '');
+  if (!file?.absorbed || first === null) return out;
+  for (let i = 0; i < file.days; i++) {
+    const slots = Array.from({ length: SLOTS }, (_, s) => decodeAbsorbed(file.absorbed!.map((arr) => arr[i * SLOTS + s] ?? null)));
+    if (slots.some(Boolean)) out.set(first + i, slots);
+  }
+  return out;
 }
 
 export function decodeCurveMetrics(json: unknown): CurveMetricDays {

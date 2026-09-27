@@ -7,7 +7,9 @@ import path from 'node:path';
 import iconv from 'iconv-lite';
 import { defaultOptions, parseArgs, run } from '../scripts/fetch-jepx';
 import {
+  CURVE_METRICS_REV,
   curveDayFile,
+  decodeCurveAbsorbed,
   decodeCurveDay,
   decodeCurveMetrics,
   encodeCurveDay,
@@ -237,17 +239,34 @@ describe('データ取得スクリプト', () => {
     // 市場分断したコマには、間引く前のカーブから求めた「システムプライス − 分断エリアの合計」も入れる
     expect(day.residuals![split]).not.toBeNull();
     expect(day.residuals![expected.groups.findIndex((g) => g.length === 0)]).toBeNull();
-    const metrics = decodeCurveMetrics(JSON.parse(await readFile(path.join(out, 'curves', 'fy2024.json'), 'utf8')));
+    const fyPath = path.join(out, 'curves', 'fy2024.json');
+    const fyJson = JSON.parse(await readFile(fyPath, 'utf8'));
+    const metrics = decodeCurveMetrics(fyJson);
     expect(metrics.size).toBe(3);
     // 取引結果に価格感応度の公表値があるので、ブロック入札の約定の変化の推定に使う値（間引く前のカーブから）も入れる
     expect(day.absorbed).toHaveLength(SLOTS);
     expect(day.absorbed!.some((a) => a !== null && Number.isFinite(a[0]))).toBe(true);
+    // 指標の年度ファイルにも入れる（期間の一覧で使う）
+    expect(fyJson.rev).toBe(CURVE_METRICS_REV);
+    expect(decodeCurveAbsorbed(fyJson).size).toBe(3);
 
     // 2 回目は取得済みの日を取り直さない
     const before = requests.length;
     const again = await run({ ...opts, from: 2025, to: 2025 });
     expect(requests.slice(before).filter((r) => r.includes('spot_bid_curves'))).toEqual([expect.stringContaining('20240331')]);
     expect(again.curves!.dates).toHaveLength(3);
+
+    // 前の版の指標の年度ファイル（版の番号と absorbed が無い）は、取り直さずに日のファイルから作り直す
+    const old = JSON.parse(await readFile(fyPath, 'utf8'));
+    delete old.rev;
+    delete old.absorbed;
+    await writeFile(fyPath, JSON.stringify(old));
+    const third = requests.length;
+    await run({ ...opts, from: 2025, to: 2025 });
+    expect(requests.slice(third).filter((r) => r.includes('spot_bid_curves'))).toEqual([expect.stringContaining('20240331')]);
+    const rebuilt = JSON.parse(await readFile(fyPath, 'utf8'));
+    expect(rebuilt.rev).toBe(CURVE_METRICS_REV);
+    expect(decodeCurveAbsorbed(rebuilt).size).toBe(3);
   });
 
   it('公表値を取得する前に保存した入札カーブには、あとで入札カーブだけを取り直して、ブロック入札の推定に使う値を足す', async () => {
@@ -266,6 +285,8 @@ describe('データ取得スクリプト', () => {
     expect(again.some((r) => r.includes('spot_splitting_areas'))).toBe(false);
     expect(logs.some((l) => l.includes('ブロック入札の約定の変化の推定のために取り直しました'))).toBe(true);
     expect(decodeCurveDay(JSON.parse(await readFile(file, 'utf8'))).absorbed!.some(Boolean)).toBe(true);
+    // 指標の年度ファイルも作り直して入れる
+    expect(decodeCurveAbsorbed(JSON.parse(await readFile(path.join(out, 'curves', 'fy2024.json'), 'utf8'))).size).toBe(1);
 
     // 足した後は取り直さない
     const third = requests.length;

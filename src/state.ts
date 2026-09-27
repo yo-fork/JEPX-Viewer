@@ -6,7 +6,7 @@ import { fiscalYearEnd, fiscalYearOfDay, fiscalYearStart, isoFromDay, parseDateS
 import type { Granularity } from './lib/aggregate';
 import type { DayType } from './lib/select';
 import { CURVE_TARGETS, type CurveTarget } from './lib/areaCurves';
-import { CURVE_METRIC_KEYS, type CurveMetricKey } from './lib/bidCurves';
+import { CURVE_HEAT_KEYS, type CurveHeatKey } from './lib/bidCurves';
 import { SPIKE_PRICES, type SpikePrice } from './lib/sensitivity';
 import { AREA_KEYS, PRICE_KEYS, SENSITIVITY_SIZES, type AreaKey, type PriceKey, type SensitivitySize } from './lib/series';
 
@@ -123,7 +123,9 @@ export interface AppState {
   /** 高騰の目安にする価格（円/kWh） */
   spikePrice: SpikePrice;
   /** 入札カーブのヒートマップの指標 */
-  curveMetric: CurveMetricKey;
+  curveMetric: CurveHeatKey;
+  /** 入札カーブのタブの、期間の推移の図の粒度（30 分値はコマごと） */
+  curveGran: TrendGran;
   yearMetric: YearMetric;
   tableUnit: TableUnit;
   tableKind: TableKind;
@@ -168,6 +170,7 @@ export const DEFAULT_STATE: AppState = {
   sensSize: 1000,
   spikePrice: 20,
   curveMetric: 'sell001',
+  curveGran: 'auto',
   yearMetric: 'mean',
   tableUnit: 'month',
   tableKind: 'areas',
@@ -277,7 +280,8 @@ const SCHEMA: { [K in keyof AppState]: [string, Codec<AppState[K]>] } = {
   stepSide: ['ssd', oneOf<CurveSide>(['sell', 'buy'])],
   sensSize: ['vps', numOf(SENSITIVITY_SIZES)],
   spikePrice: ['spk', numOf(SPIKE_PRICES)],
-  curveMetric: ['cm2', oneOf<CurveMetricKey>(CURVE_METRIC_KEYS)],
+  curveMetric: ['cm2', oneOf<CurveHeatKey>(CURVE_HEAT_KEYS)],
+  curveGran: ['cgr', oneOf<TrendGran>(['auto', 'slot', 'day', 'week', 'month'])],
   yearMetric: ['ym', oneOf<YearMetric>(['mean', 'max', 'min', 'floor'])],
   tableUnit: ['tu', oneOf<TableUnit>(['day', 'week', 'month', 'fy', 'year', 'dow', 'slot', 'all'])],
   tableKind: ['tk', oneOf<TableKind>(['areas', 'stats'])],

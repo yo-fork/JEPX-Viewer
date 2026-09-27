@@ -88,6 +88,15 @@ describe('入札カーブの URL', () => {
     expect(stateFromHash('#ca=nowhere').curveArea).toBe('system');
     expect(stateToHash(stateFromHash('#tab=curves'))).toBe('#tab=curves');
   });
+
+  it('期間の図の粒度（30 分値も）と、ヒートマップで見るもの（高騰までの買いの増減・公表値も）を保存・復元できる', () => {
+    const s = stateFromHash('#tab=curves&cgr=slot&cm2=spike20Shift');
+    expect([s.curveGran, s.curveMetric]).toEqual(['slot', 'spike20Shift']);
+    expect(stateFromHash(stateToHash(s))).toEqual(s);
+    expect(stateFromHash('#cm2=pubDown5000').curveMetric).toBe('pubDown5000');
+    const bad = stateFromHash('#cgr=hour&cm2=pubUp700');
+    expect([bad.curveGran, bad.curveMetric]).toEqual(['auto', 'sell001']);
+  });
 });
 
 describe('全エリア共通の色・縦軸の範囲', () => {

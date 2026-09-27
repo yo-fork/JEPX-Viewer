@@ -22,6 +22,7 @@ import {
   applyGroupNames,
   curveCsvKind,
   curveDayFile,
+  CURVE_METRICS_REV,
   curveMetricsFile,
   decodeCurveMetrics,
   encodeCurveDay,
@@ -32,6 +33,7 @@ import {
   type AreaGroup,
   type CurveDayFile,
   type CurveMetricDays,
+  type CurveMetricsFile,
   type RawCurveDay,
 } from '../src/lib/bidCurves';
 import {
@@ -376,16 +378,23 @@ export async function writeCurveIndex(out: string, touched: Set<number> = new Se
     let fresh = !touched.has(fy) && existsSync(p);
     if (fresh) {
       try {
-        const have = [...decodeCurveMetrics(JSON.parse(await readFile(p, 'utf8'))).keys()];
-        fresh = have.length === list.length && have.every((d, i) => d === list[i]);
+        const json = JSON.parse(await readFile(p, 'utf8')) as CurveMetricsFile;
+        const have = [...decodeCurveMetrics(json).keys()];
+        // 前の版のファイル（日のファイルの absorbed を入れていない）は作り直す
+        fresh = (json.rev ?? 1) >= CURVE_METRICS_REV && have.length === list.length && have.every((d, i) => d === list[i]);
       } catch {
         fresh = false;
       }
     }
     if (!fresh) {
       const map: CurveMetricDays = new Map();
-      for (const d of list) map.set(d, metricsOfDayFile(JSON.parse(await readFile(path.join(out, curveDayFile(d)), 'utf8')) as CurveDayFile));
-      await writeFile(p, JSON.stringify(encodeCurveMetrics(fy, map)));
+      const absorbed = new Map<number, CurveDayFile['absorbed']>();
+      for (const d of list) {
+        const day = JSON.parse(await readFile(path.join(out, curveDayFile(d)), 'utf8')) as CurveDayFile;
+        map.set(d, metricsOfDayFile(day));
+        if (day.absorbed) absorbed.set(d, day.absorbed);
+      }
+      await writeFile(p, JSON.stringify(encodeCurveMetrics(fy, map, absorbed)));
     }
     metrics.push({ fy, file, firstDate: isoFromDay(list[0]), lastDate: isoFromDay(list[list.length - 1]), days: list.length });
   }
@@ -652,7 +661,11 @@ async function fetchCurves(o: FetchOptions, dispatcher: EnvHttpProxyAgent, pace:
       // ただし、ブロック入札の約定の変化の推定に使う値が無く、いまは公表値があれば、間引く前のカーブが要るので取り直して足す
       if (await needsAbsorbed(file, spot)) {
         const added = await addAbsorbed(o, dispatcher, pace, day, file, spot!, label);
-        if (added) refetched++;
+        if (added) {
+          refetched++;
+          // 指標の年度ファイルにも入れる
+          touched.add(fiscalYearOfDay(day));
+        }
       }
       skipped++;
       continue;
