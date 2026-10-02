@@ -82,6 +82,7 @@ import {
   wrappedLegend,
   type AxisParam,
 } from './curveCommon';
+import { flowOfDay, flowText, renderFlowPeriod } from './curveFlows';
 import { SensitivitySection } from './curveSensitivity';
 import { buildGrid, colorRange, gridTable, heatmapHeight, heatmapOption, type Grid } from './heatmap';
 import { breakGaps, buildSeriesPoints, periodLabel, TIME_AXIS_LABEL } from './timeseries';
@@ -147,6 +148,9 @@ export class CurvesView extends View {
   private shapesNote!: HTMLElement;
   private periodNote!: HTMLElement;
   private methodNote!: HTMLElement;
+  /** 市場分断したコマの、分断エリアの間を連系線でやりとりした量 */
+  private flowNote!: HTMLElement;
+  private flows!: ChartCard;
   private checkNote!: HTMLElement;
   private aloneRow!: HTMLElement;
   private dateInput!: HTMLInputElement;
@@ -304,10 +308,12 @@ export class CurvesView extends View {
     this.methodNote = h('p', { class: 'card-note', hidden: true });
     this.checkNote = h('p', { class: 'card-note', hidden: true });
     this.aloneRow = h('div', { class: 'card-note alone', hidden: true });
+    this.flowNote = h('p', { class: 'card-note', hidden: true });
     this.curve.footer.append(
       this.methodNote,
       this.checkNote,
       this.aloneRow,
+      this.flowNote,
       h(
         'p',
         { class: 'card-note' },
@@ -362,6 +368,7 @@ export class CurvesView extends View {
     this.depth = this.card(g2, { title: '価格帯ごとの入札量の推移', height: 340, wide: true });
     this.depthGran = segmented('粒度', CURVE_GRAN_OPTIONS, s.curveGran, (v) => this.set({ curveGran: v }));
     this.depth.addControls(this.depthSide.el, this.depthGran.el);
+    this.flows = this.card(g2, { title: '市場分断の境をまたいだ量（連系線）', height: 380, wide: true });
     this.heat = this.card(g2, { title: '指標のヒートマップ', height: 480, wide: true });
     this.heat.addControls(this.metric.el);
     for (const card of [this.curve, this.comparison]) {
@@ -576,11 +583,15 @@ export class CurvesView extends View {
     this.methodNote.hidden = true;
     this.checkNote.hidden = true;
     this.aloneRow.hidden = true;
+    this.flowNote.hidden = true;
     const day = cs.getDay(date);
     if (!day) {
       this.curve.setEmpty(`${formatDay(date, true)} の入札カーブを読み込めませんでした。`);
       return;
     }
+    const flow = flowText(flowOfDay(this.ctx.ds, day, slot, cs.isDemo));
+    this.flowNote.textContent = flow;
+    this.flowNote.hidden = flow === '';
     const ac = this.resolveCurve(cs, date, slot);
     if (!ac) {
       this.curve.setEmpty(`${when} の入札カーブがありません。`);
@@ -1210,7 +1221,7 @@ export class CurvesView extends View {
     this.periodNote.textContent =
       `入札カーブの指標は ${formatDay(cs.metricsFirst)}〜${formatDay(cs.metricsLast)}（${fmtNum(cs.metricDays)} 日分）にあります。` +
       '上の絞り込み条件（期間・曜日・時間帯）のうち、この範囲に入る分を、システムプライスのカーブから計算した指標で集計します。';
-    const cards = [this.depth, this.heat];
+    const cards = [this.depth, this.flows, this.heat];
     const selC = from <= to ? reselect(sel, from, to) : null;
     if (!selC || selC.days.length === 0) {
       const msg = `選択した条件（${formatDay(sel.from)}〜${formatDay(sel.to)}）に入札カーブのデータがありません。期間を ${formatDay(cs.metricsFirst)}〜${formatDay(cs.metricsLast)} に含めてください。`;
@@ -1218,6 +1229,7 @@ export class CurvesView extends View {
       return;
     }
     this.renderDepth(cs, selC);
+    renderFlowPeriod(this.flows, this.ctx, cs, selC);
     this.renderHeat(cs, selC);
   }
 

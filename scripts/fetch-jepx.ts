@@ -19,14 +19,17 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { EnvHttpProxyAgent, fetch } from 'undici';
 import {
+  addGroupTotals,
   applyGroupNames,
   curveCsvKind,
   curveDayFile,
   CURVE_METRICS_REV,
   curveMetricsFile,
+  decodeCurveDay,
   decodeCurveMetrics,
   encodeCurveDay,
   encodeCurveMetrics,
+  groupTotalsOfDay,
   metricsOfDayFile,
   parseBidCurveCsv,
   parseSplittingAreasCsv,
@@ -380,7 +383,7 @@ export async function writeCurveIndex(out: string, touched: Set<number> = new Se
       try {
         const json = JSON.parse(await readFile(p, 'utf8')) as CurveMetricsFile;
         const have = [...decodeCurveMetrics(json).keys()];
-        // 前の版のファイル（日のファイルの absorbed を入れていない）は作り直す
+        // 前の版のファイル（日のファイルの absorbed・分断エリアのカーブの入札量の合計を入れていない）は作り直す
         fresh = (json.rev ?? 1) >= CURVE_METRICS_REV && have.length === list.length && have.every((d, i) => d === list[i]);
       } catch {
         fresh = false;
@@ -389,12 +392,14 @@ export async function writeCurveIndex(out: string, touched: Set<number> = new Se
     if (!fresh) {
       const map: CurveMetricDays = new Map();
       const absorbed = new Map<number, CurveDayFile['absorbed']>();
+      const groups = new Map<number, Float64Array>();
       for (const d of list) {
         const day = JSON.parse(await readFile(path.join(out, curveDayFile(d)), 'utf8')) as CurveDayFile;
         map.set(d, metricsOfDayFile(day));
         if (day.absorbed) absorbed.set(d, day.absorbed);
+        groups.set(d, groupTotalsOfDay(decodeCurveDay(day)));
       }
-      await writeFile(p, JSON.stringify(encodeCurveMetrics(fy, map, absorbed)));
+      await writeFile(p, JSON.stringify(encodeCurveMetrics(fy, map, absorbed, groups)));
     }
     metrics.push({ fy, file, firstDate: isoFromDay(list[0]), lastDate: isoFromDay(list[list.length - 1]), days: list.length });
   }
@@ -744,6 +749,8 @@ async function addAbsorbed(
     if (!raw) return false;
     const json = withAbsorbed(JSON.parse(await readFile(file, 'utf8')) as CurveDayFile, raw, spot);
     if (!json.absorbed) return false;
+    // 取り直したカーブから、分断エリアのカーブの入札量の合計（前の版のファイルには無い）も足す
+    addGroupTotals(json, raw);
     await writeFile(file, JSON.stringify(json));
     o.log(`${label}: ブロック入札の約定の変化の推定に使う値を足しました（間引く前のカーブを取り直しました）`);
     return true;

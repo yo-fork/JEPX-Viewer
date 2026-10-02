@@ -9,8 +9,10 @@ import {
   decodeAbsorbed,
   decodeCurveAbsorbed,
   decodeCurveDay,
+  decodeCurveGroups,
   decodeCurveMetrics,
   encodeCurveDay,
+  groupTotalsOfDay,
   metricsOfDayFile,
   type CurveDay,
   type CurveDayFile,
@@ -48,6 +50,8 @@ export class CurveStore {
   private readonly metrics = new Map<number, Float64Array>();
   /** 日ごとの、ブロック入札の約定の変化の推定に使う値（指標の年度ファイルの absorbed。48 コマ） */
   private readonly absorbedDays = new Map<number, (Float64Array | null)[]>();
+  /** 日ごとの、分断エリアのカーブの入札量の合計と数（指標の年度ファイルの groups。GROUP_TOTALS_WIDTH × 48） */
+  private readonly groupDays = new Map<number, Float64Array>();
   private readonly loadedFy = new Set<number>();
   private readonly pendingFy = new Map<number, Promise<void>>();
   private readonly shapes = new Map<number, CurveDay>();
@@ -209,6 +213,7 @@ export class CurveStore {
             .then((json) => {
               for (const [day, vals] of decodeCurveMetrics(json)) this.metrics.set(day, vals);
               for (const [day, a] of decodeCurveAbsorbed(json)) this.absorbedDays.set(day, a);
+              for (const [day, g] of decodeCurveGroups(json)) this.groupDays.set(day, g);
               this.loadedFy.add(m.fy);
               this.version++;
             })
@@ -230,14 +235,31 @@ export class CurveStore {
     return this.absorbedDays.size > 0;
   }
 
+  /** 分断エリアのカーブの入札量の合計のある日が、読み込んだ指標に 1 日でもある（前の版の指標の年度ファイルには無い） */
+  get hasGroups(): boolean {
+    return this.groupDays.size > 0;
+  }
+
   /** 指標を Dataset の日の並びにそろえた配列（n × 48、無い値は NaN） */
   metricArray(ds: Dataset, key: CurveMetricKey): Float64Array {
+    return this.alignedOf(ds, key, this.metrics, CURVE_METRIC_INDEX[key]);
+  }
+
+  /**
+   * 分断エリアのカーブの入札量の合計（0: 売り、1: 買い。MW）と分断エリアの数（2）を、Dataset の日の並びにそろえた配列
+   * （n × 48、市場分断していないコマと値の無い日は NaN）
+   */
+  groupArray(ds: Dataset, k: 0 | 1 | 2): Float64Array {
+    return this.alignedOf(ds, `groups${k}`, this.groupDays, k);
+  }
+
+  /** 日ごとの値（m 番目の 48 コマ）を Dataset の日の並びにそろえる（キャッシュする） */
+  private alignedOf(ds: Dataset, key: string, source: Map<number, Float64Array>, m: number): Float64Array {
     const cacheKey = `${key}|${ds.start}|${ds.n}|${this.version}`;
     let out = this.aligned.get(cacheKey);
     if (out) return out;
     out = new Float64Array(ds.n * SLOTS).fill(Number.NaN);
-    const m = CURVE_METRIC_INDEX[key];
-    for (const [day, vals] of this.metrics) {
+    for (const [day, vals] of source) {
       const i = day - ds.start;
       if (i < 0 || i >= ds.n) continue;
       out.set(vals.subarray(m * SLOTS, (m + 1) * SLOTS), i * SLOTS);
@@ -269,6 +291,8 @@ export class CurveStore {
       if (!file) continue;
       this.metrics.set(day, metricsOfDayFile(file));
       if (file.absorbed) this.absorbedDays.set(day, file.absorbed.map((a) => decodeAbsorbed(a)));
+      const groups = groupTotalsOfDay(decodeCurveDay(file));
+      if (groups.some(Number.isFinite)) this.groupDays.set(day, groups);
     }
     this.demoMetricsBuilt = true;
     this.version++;

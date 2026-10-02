@@ -11,6 +11,7 @@ import {
   curveDayFile,
   decodeCurveAbsorbed,
   decodeCurveDay,
+  decodeCurveGroups,
   decodeCurveMetrics,
   encodeCurveDay,
   formatBidCurveCsv,
@@ -238,6 +239,9 @@ describe('データ取得スクリプト', () => {
     expect(day.slots[split]!.map((g) => g.label)).toEqual(['システムプライス', ...expected.groups[split].map((g) => g.label)]);
     // 市場分断したコマには、間引く前のカーブから求めた「システムプライス − 分断エリアの合計」も入れる
     expect(day.residuals![split]).not.toBeNull();
+    // 分断エリアのカーブの入札量の合計（連系線の量を求めるのに使う）も、間引く前のカーブから入れる
+    expect(day.groupTotals![split]).not.toBeNull();
+    expect(day.groupTotals![expected.groups.findIndex((g) => g.length === 0)]).toBeNull();
     expect(day.residuals![expected.groups.findIndex((g) => g.length === 0)]).toBeNull();
     const fyPath = path.join(out, 'curves', 'fy2024.json');
     const fyJson = JSON.parse(await readFile(fyPath, 'utf8'));
@@ -249,6 +253,7 @@ describe('データ取得スクリプト', () => {
     // 指標の年度ファイルにも入れる（期間の一覧で使う）
     expect(fyJson.rev).toBe(CURVE_METRICS_REV);
     expect(decodeCurveAbsorbed(fyJson).size).toBe(3);
+    expect(decodeCurveGroups(fyJson).size).toBeGreaterThan(0);
 
     // 2 回目は取得済みの日を取り直さない
     const before = requests.length;

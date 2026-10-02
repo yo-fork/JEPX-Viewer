@@ -486,9 +486,10 @@ export interface CurveDayFile {
   date: string;
   /**
    * 48 コマ（データの無いコマは null）。groups の先頭はシステムプライス。
-   * residual は市場分断したコマの「システムプライス − 分断エリアの合計」（StepResidual。前の版のファイルには無い）
+   * residual は市場分断したコマの「システムプライス − 分断エリアの合計」（StepResidual。前の版のファイルには無い）。
+   * totals は市場分断したコマの、公表されている分断エリアのカーブの入札量の合計 [売り, 買い]（MW。間引く前のカーブから。前の版のファイルには無い）
    */
-  slots: ({ groups: AreaGroup[]; sell: number[][]; buy: number[][]; residual?: { offset: number; sell: number[]; buy: number[] } } | null)[];
+  slots: ({ groups: AreaGroup[]; sell: number[][]; buy: number[][]; residual?: { offset: number; sell: number[]; buy: number[] }; totals?: [number, number] } | null)[];
   /** システムプライスのカーブの指標（CURVE_METRICS の順、各 48 コマ、欠損は null） */
   metrics: Record<CurveMetricKey, (number | null)[]>;
   /**
@@ -513,10 +514,18 @@ export interface CurveMetricsFile {
    * どの日にも無ければ無い
    */
   absorbed?: (number | null)[][];
+  /**
+   * 市場分断したコマの、公表されている分断エリアのカーブの入札量の合計と数（groupTotalsOfDay）。GROUP_TOTALS_WIDTH 本、各「日数 × 48 コマ」
+   * （分断していないコマは null）。どの日にも無ければ無い
+   */
+  groups?: (number | null)[][];
 }
 
-/** 指標の年度ファイルの版（2: 日のファイルの absorbed も入れる。これより前の版のファイルは作り直す） */
-export const CURVE_METRICS_REV = 2;
+/**
+ * 指標の年度ファイルの版（2: 日のファイルの absorbed も入れる。3: 分断エリアのカーブの入札量の合計 groups も入れる）。
+ * これより前の版のファイルは作り直す
+ */
+export const CURVE_METRICS_REV = 3;
 /** 日のファイルの absorbed の、1 コマの値の数（sensitivity.ts の FLIP_CASES の数 × [最小, 最大]） */
 export const ABSORBED_WIDTH = 12;
 
@@ -534,6 +543,8 @@ export interface CurveDay {
   residuals?: (StepResidual | null)[];
   /** 48 コマの、公表値の計算で効かなかった量の範囲（CurveDayFile.absorbed。分からない最小は NaN、無限の最大は Infinity） */
   absorbed?: (Float64Array | null)[];
+  /** 48 コマの、分断エリアのカーブの入札量の合計 [売り, 買い]（CurveDayFile の totals。分断していないコマと、前の版のファイルでは null） */
+  groupTotals?: ([number, number] | null)[];
 }
 
 export const SYSTEM_LABEL = 'システムプライス';
@@ -600,10 +611,35 @@ export function encodeCurveDay(raw: RawCurveDay, groups?: AreaGroup[][], tol?: n
     if (ids.length > 0) {
       const r = residualSteps(system, ids.map((id) => m.get(id)!));
       slot.residual = { offset: r.offset, sell: encodeSteps(r.sell, false), buy: encodeSteps(r.buy, true) };
+      slot.totals = rawGroupTotals(ids.map((id) => m.get(id)!));
     }
     return slot;
   });
   return { format: CURVE_DAY_FORMAT, date: isoFromDay(raw.day), slots, metrics };
+}
+
+/** 間引く前の分断エリアのカーブの入札量の合計 [売り, 買い]（0.1 MW 単位） */
+function rawGroupTotals(parts: CurveRow[][]): [number, number] {
+  const total = (rows: CurveRow[], k: 'sell' | 'buy') => rows.reduce((m, r) => Math.max(m, r[k]), 0);
+  const sum = (k: 'sell' | 'buy') => Math.round(parts.reduce((v, rows) => v + total(rows, k), 0) * 10) / 10;
+  return [sum('sell'), sum('buy')];
+}
+
+/**
+ * 変換済みの 1 日分のファイルの、市場分断したコマに、間引く前のカーブから求めた分断エリアのカーブの入札量の合計（totals）を足す
+ * （前の版で保存したファイルの入札カーブを取り直したとき）。足したコマがあれば true
+ */
+export function addGroupTotals(file: CurveDayFile, raw: RawCurveDay): boolean {
+  let changed = false;
+  file.slots.forEach((slot, s) => {
+    if (!slot || slot.totals) return;
+    const m = raw.slots[s];
+    const ids = [...m.keys()].filter((id) => id !== SYSTEM_GROUP);
+    if (ids.length === 0 || !slot.groups.some((g) => g.id !== SYSTEM_GROUP)) return;
+    slot.totals = rawGroupTotals(ids.map((id) => m.get(id)!));
+    changed = true;
+  });
+  return changed;
 }
 
 /**
@@ -642,7 +678,43 @@ export function decodeCurveDay(json: unknown): CurveDay {
       return r ? { offset: r.offset, sell: decodeSteps(r.sell, false), buy: decodeSteps(r.buy, true) } : null;
     }),
     ...(file.absorbed ? { absorbed: Array.from({ length: SLOTS }, (_, s) => decodeAbsorbed(file.absorbed![s])) } : {}),
+    groupTotals: Array.from({ length: SLOTS }, (_, s) => file.slots[s]?.totals ?? null),
   };
+}
+
+/** groupTotalsOfDay の 1 コマの値の数（売り, 買い, 分断エリアの数） */
+export const GROUP_TOTALS_WIDTH = 3;
+
+/** 公表されている分断エリアのカーブの入札量の合計（MW）と、分断エリアの数 */
+export interface GroupTotals {
+  sell: number;
+  buy: number;
+  count: number;
+  /** 間引く前のカーブから求めた値か（前の版のファイルでは、1 MW 単位に丸めた描画用のカーブの合計） */
+  exact: boolean;
+}
+
+/** そのコマの、公表されている分断エリアのカーブの入札量の合計と数（市場分断していなければ null） */
+export function groupTotalsOf(day: CurveDay, slot: number): GroupTotals | null {
+  const parts = (day.slots[slot] ?? []).filter((g) => g.id !== SYSTEM_GROUP);
+  if (parts.length === 0) return null;
+  const exact = day.groupTotals?.[slot];
+  if (exact) return { sell: exact[0], buy: exact[1], count: parts.length, exact: true };
+  const last = (a: Float64Array) => (a.length >= 2 ? a[a.length - 1] : 0);
+  return { sell: parts.reduce((v, g) => v + last(g.sell), 0), buy: parts.reduce((v, g) => v + last(g.buy), 0), count: parts.length, exact: false };
+}
+
+/** 1 日分の groupTotalsOf（GROUP_TOTALS_WIDTH × 48 の並び。市場分断していないコマは NaN） */
+export function groupTotalsOfDay(day: CurveDay): Float64Array {
+  const out = new Float64Array(GROUP_TOTALS_WIDTH * SLOTS).fill(Number.NaN);
+  for (let s = 0; s < SLOTS; s++) {
+    const g = groupTotalsOf(day, s);
+    if (!g) continue;
+    out[s] = g.sell;
+    out[SLOTS + s] = g.buy;
+    out[2 * SLOTS + s] = g.count;
+  }
+  return out;
 }
 
 /** 1 コマの absorbed の値（最小が分からない組は最大も分からない。最小が分かって最大が null なら無限。すべて無ければ null） */
@@ -673,8 +745,14 @@ export function metricsOfDayFile(file: CurveDayFile): Float64Array {
 
 /**
  * @param absorbed 日のファイルの absorbed（無い日は入れない）
+ * @param groups 日ごとの groupTotalsOfDay（無い日は入れない）
  */
-export function encodeCurveMetrics(fy: number, days: CurveMetricDays, absorbed?: ReadonlyMap<number, CurveDayFile['absorbed']>): CurveMetricsFile {
+export function encodeCurveMetrics(
+  fy: number,
+  days: CurveMetricDays,
+  absorbed?: ReadonlyMap<number, CurveDayFile['absorbed']>,
+  groups?: ReadonlyMap<number, Float64Array>,
+): CurveMetricsFile {
   const keys = [...days.keys()].sort((a, b) => a - b);
   const first = keys[0];
   const n = keys[keys.length - 1] - first + 1;
@@ -698,7 +776,40 @@ export function encodeCurveMetrics(fy: number, days: CurveMetricDays, absorbed?:
     }
     file.absorbed = out;
   }
+  const withGroups = [...(groups?.entries() ?? [])].filter(([day, g]) => day >= first && day < first + n && g.some(Number.isFinite));
+  if (withGroups.length > 0) {
+    const out = Array.from({ length: GROUP_TOTALS_WIDTH }, () => new Array<number | null>(n * SLOTS).fill(null));
+    for (const [day, g] of withGroups) {
+      for (let j = 0; j < GROUP_TOTALS_WIDTH; j++) {
+        for (let s = 0; s < SLOTS; s++) out[j][(day - first) * SLOTS + s] = toNullable(g[j * SLOTS + s]);
+      }
+    }
+    file.groups = out;
+  }
   return file;
+}
+
+/** 指標の年度ファイルの groups を、日ごと（GROUP_TOTALS_WIDTH × 48、分断していないコマは NaN）に読む。無い日は入れない */
+export function decodeCurveGroups(json: unknown): Map<number, Float64Array> {
+  const file = json as CurveMetricsFile;
+  const out = new Map<number, Float64Array>();
+  const first = parseDateString(file?.firstDate ?? '');
+  if (!file?.groups || first === null) return out;
+  for (let i = 0; i < file.days; i++) {
+    const g = new Float64Array(GROUP_TOTALS_WIDTH * SLOTS).fill(Number.NaN);
+    let any = false;
+    for (let j = 0; j < GROUP_TOTALS_WIDTH; j++) {
+      for (let s = 0; s < SLOTS; s++) {
+        const v = file.groups[j]?.[i * SLOTS + s];
+        if (typeof v === 'number') {
+          g[j * SLOTS + s] = v;
+          any = true;
+        }
+      }
+    }
+    if (any) out.set(first + i, g);
+  }
+  return out;
 }
 
 /** 指標の年度ファイルの absorbed を、日ごと（48 コマ、各コマ ABSORBED_WIDTH 個か null）に読む。無い日は入れない */
