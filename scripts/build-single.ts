@@ -8,6 +8,7 @@
  *
  * 入札カーブ（npm run fetch で取得したもの）は、指標をすべてと、1 コマの図に使うカーブを直近 7 日分入れる
  * （1 日分が数百 KB あるため。--curve-days で変えられる）。--split では取得済みのカーブをすべて data フォルダに書き出す。
+ * 連系線（広域機関の公表値）は、埋め込む年度の年度ファイルを入れる（--no-interties で入れない）。
  *
  * ファイルから直接開いたページでは、ブラウザは別ファイルのモジュールスクリプト・CSS を読み込まず、fetch も使えない。
  * そこで vite build の出力（dist/index.html と assets/ の JS・CSS）を 1 つの HTML にまとめ、
@@ -21,9 +22,10 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { CURVE_DAY_FORMAT, CURVE_METRICS_FORMAT, curveDayFile } from '../src/lib/bidCurves';
-import { FY_FILE_FORMAT, MANIFEST_FORMAT, type CurveIndex, type Manifest } from '../src/lib/dataFile';
+import { FY_FILE_FORMAT, MANIFEST_FORMAT, type CurveIndex, type IntertieIndex, type Manifest } from '../src/lib/dataFile';
 import { fiscalYearOfDay, parseDateString } from '../src/lib/dates';
 import { dataScriptPath, EMBED_ATTR, LOCAL_MANIFEST, REGISTER_FN, SCRIPTS_META } from '../src/lib/localData';
+import { INTERTIE_FY_FORMAT } from '../src/lib/occto';
 
 /** 1 ファイル版に入れる、1 コマの図に使う入札カーブの日数（入札カーブのタブの「直近 7 日」の比較に足りる分） */
 export const INLINE_CURVE_DAYS = 7;
@@ -44,6 +46,8 @@ export interface SingleOptions {
   curveDays?: number;
   /** 入札カーブを入れない */
   noCurves: boolean;
+  /** 連系線（広域機関の公表値）を入れない */
+  noInterties: boolean;
   log: (msg: string) => void;
 }
 
@@ -55,6 +59,7 @@ export function defaultOptions(): SingleOptions {
     noData: false,
     split: false,
     noCurves: false,
+    noInterties: false,
     log: (msg) => console.log(msg),
   };
 }
@@ -66,6 +71,7 @@ const HELP = `使い方: npm run build:single -- [オプション]
   --split                データを HTML と同じ場所の data フォルダに分けて出力する（共有フォルダ向け）
   --curve-days <日数>    1 コマの図に使う入札カーブを直近何日分入れるか（既定: 7 日。--split では取得済みのすべて）
   --no-curves            入札カーブを入れない
+  --no-interties         連系線（広域機関の公表値）を入れない
   --out <ファイル>       出力先（既定: dist-single/jepx-viewer.html）
   --data <ディレクトリ>  取得済みデータの場所（既定: public/data）
   --dist <ディレクトリ>  vite build の出力先（既定: dist）`;
@@ -105,6 +111,9 @@ export function parseArgs(argv: string[], base = defaultOptions()): SingleOption
       }
       case '--no-curves':
         o.noCurves = true;
+        break;
+      case '--no-interties':
+        o.noInterties = true;
         break;
       case '--out':
         o.out = next();
@@ -187,8 +196,9 @@ function checkName(name: string, pattern: RegExp, what: string): string {
  * 名前と中身がそろっていることを確かめてから返す
  */
 function dataFiles(data: EmbeddedData): [string, unknown][] {
-  const { files, curves } = data.manifest;
+  const { files, curves, interties } = data.manifest;
   const names = files.map((f) => checkName(f.file, /^spot\/fy\d{4}\.json$/, '年度ファイル'));
+  if (interties) names.push(...interties.files.map((f) => checkName(f.file, /^interties\/fy\d{4}\.json$/, '連系線の年度ファイル')));
   if (curves) {
     names.push(...curves.metrics.map((m) => checkName(m.file, /^curves\/fy\d{4}\.json$/, '入札カーブの指標のファイル')));
     names.push(...curves.dates.map((d) => curveDayFile(parseDateString(checkName(d, /^\d{8}$/, '入札カーブの日付'))!)));
@@ -302,7 +312,16 @@ async function loadCurves(o: SingleOptions, index: CurveIndex | undefined, files
   return { firstDate: metrics[0].firstDate, lastDate: metrics[metrics.length - 1].lastDate, dates: days.map(([d]) => d), metrics };
 }
 
-/** 取得済みデータから、埋め込む年度の manifest と年度ファイル・入札カーブを読む */
+/** 入れる連系線の年度ファイルを読む（埋め込む年度の範囲だけ） */
+async function loadInterties(o: SingleOptions, index: IntertieIndex | undefined, files: Map<string, unknown>): Promise<IntertieIndex | undefined> {
+  if (o.noInterties || !index) return undefined;
+  const list = index.files.filter((f) => (o.from === undefined || f.fy >= o.from) && (o.to === undefined || f.fy <= o.to)).sort((a, b) => a.fy - b.fy);
+  if (list.length === 0) return undefined;
+  for (const f of list) files.set(f.file, await readJson(o, f.file, INTERTIE_FY_FORMAT));
+  return { firstDate: list[0].firstDate, lastDate: list[list.length - 1].lastDate, files: list };
+}
+
+/** 取得済みデータから、埋め込む年度の manifest と年度ファイル・入札カーブ・連系線を読む */
 async function loadData(o: SingleOptions): Promise<EmbeddedData> {
   let manifest: Manifest;
   try {
@@ -316,10 +335,11 @@ async function loadData(o: SingleOptions): Promise<EmbeddedData> {
   const files = new Map<string, unknown>();
   for (const f of entries) files.set(f.file, await readJson(o, f.file, FY_FILE_FORMAT));
   const curves = await loadCurves(o, manifest.curves, files);
+  const interties = await loadInterties(o, manifest.interties, files);
   // 手元の CSV から作ったデータの取得元（local:フォルダのパス）には作った人の PC のフォルダ名が入るので、配るファイルには入れない
   const source = manifest.source?.startsWith('local:') ? 'local' : manifest.source;
-  const { curves: _all, ...rest } = manifest;
-  return { manifest: { ...rest, source, files: entries, ...(curves ? { curves } : {}) }, files };
+  const { curves: _all, interties: _ties, ...rest } = manifest;
+  return { manifest: { ...rest, source, files: entries, ...(curves ? { curves } : {}), ...(interties ? { interties } : {}) }, files };
 }
 
 export async function buildSingle(o: SingleOptions): Promise<{ bytes: number; dataBytes: number; data: EmbeddedData | null }> {
@@ -345,9 +365,11 @@ export async function buildSingle(o: SingleOptions): Promise<{ bytes: number; da
     ? `${files[0].fy}〜${files[files.length - 1].fy} 年度（${files[0].firstDate}〜${files[files.length - 1].lastDate}）`
     : 'データなし';
   const curves = data?.manifest.curves;
-  const curveText = curves
-    ? `・入札カーブ ${curves.dates.length} 日分（${curves.dates[0].replace(/^(\d{4})(\d{2})(\d{2})$/, '$1-$2-$3')}〜、指標は ${curves.firstDate}〜${curves.lastDate}）`
-    : '';
+  const ties = data?.manifest.interties;
+  const curveText =
+    (curves
+      ? `・入札カーブ ${curves.dates.length} 日分（${curves.dates[0].replace(/^(\d{4})(\d{2})(\d{2})$/, '$1-$2-$3')}〜、指標は ${curves.firstDate}〜${curves.lastDate}）`
+      : '') + (ties ? `・連系線 ${ties.firstDate}〜${ties.lastDate}` : '');
   const mb = (n: number) => `${(n / 1024 / 1024).toFixed(1)} MB`;
   o.log(
     o.split

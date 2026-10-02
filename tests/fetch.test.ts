@@ -1,11 +1,11 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { createServer, type Server } from 'node:http';
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { existsSync } from 'node:fs';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import iconv from 'iconv-lite';
-import { defaultOptions, parseArgs, run } from '../scripts/fetch-jepx';
+import { dayRuns, defaultOptions, parseArgs, run } from '../scripts/fetch-jepx';
 import {
   CURVE_METRICS_REV,
   curveDayFile,
@@ -25,6 +25,7 @@ import { dayFromYmd, formatDay } from '../src/lib/dates';
 import { generateDemoDays } from '../src/lib/demo';
 import { syntheticCurveDay } from '../src/lib/demoCurves';
 import { formatSpotCsv, newDayValues, type DayMap } from '../src/lib/jepxCsv';
+import { decodeIntertieFy, INTERTIE_FIELD_INDEX, INTERTIE_INDEX, intertieOffset, type IntertieField } from '../src/lib/occto';
 import { SENSITIVITY_KEYS, SENSITIVITY_SIZES, sensitivityKey, SERIES_INDEX, SLOTS, type SeriesKey } from '../src/lib/series';
 
 /** 各年度の先頭 3 日ぶんの合成データ（Shift_JIS の CSV として配信する） */
@@ -95,6 +96,111 @@ function curveFixture(day: number) {
   );
 }
 
+// ---- 広域機関の系統情報サービス（情報ダウンロード画面）のまね ----
+
+/** 公表されている期間（計画潮流（翌日）と潮流実績） */
+const OCCTO_RANGES = { plan: [dayFromYmd(2024, 3, 25), dayFromYmd(2024, 4, 3)], flow: [dayFromYmd(2024, 4, 1), dayFromYmd(2024, 4, 3)] };
+/** 試験用の計画潮流（東北-東京間。日とコマで決まる） */
+const fixturePlan = (day: number, s: number) => 1000 + (day % 7) * 10 + s;
+const slash = (day: number) => formatDay(day).replace(/-/g, '/');
+const hhmm = (min: number) => `${String(Math.floor(min / 60)).padStart(2, '0')}:${String(min % 60).padStart(2, '0')}`;
+
+function occtoPlanCsv(from: number, to: number): string {
+  const rows: (string | number)[][] = [
+    ['対象断面', '策定日', '策定／更新後', '連系線', '年月日', '時刻', '方向', '空容量', '計画潮流', '広域調整枠', 'マージン', '運用容量', '運用容量決定要因', '最新更新年月日時刻'],
+  ];
+  for (let d = from; d <= to; d++) {
+    for (const line of ['相馬双葉幹線', '未知の連系線']) {
+      for (let s = 0; s < SLOTS; s++) {
+        const p = fixturePlan(d, s);
+        rows.push(['翌日', '', '策定', line, slash(d), hhmm((s + 1) * 30), '順方向', 5000 - 100 - p, p, 0, 100, 5000, '熱容量', '']);
+        rows.push(['翌日', '', '策定', line, slash(d), hhmm((s + 1) * 30), '逆方向', -2000 + 50 - p, p, 0, -50, -2000, '熱容量', '']);
+      }
+    }
+  }
+  return toCsv(rows);
+}
+
+function occtoFlowCsv(from: number, to: number): string {
+  const rows: (string | number)[][] = [
+    ['連系線', '対象日付', '対象時刻', '運用容量(順方向)', '運用容量(逆方向)', '広域調整枠(順方向)', '広域調整枠(逆方向)', 'マージン(順方向)', 'マージン(逆方向)', '空容量(順方向)', '空容量(逆方向)', '計画潮流(順方向)', '計画潮流(逆方向)', '潮流実績', '運用容量拡大分(順方向)', '運用容量拡大分(逆方向)'],
+  ];
+  for (let d = from; d <= to; d++) {
+    for (let k = 1; k <= 288; k++) {
+      const plan = fixturePlan(d, Math.floor((k * 5 - 1) / 30)) + 5;
+      // 5 分ごとの値は 30 分の平均が計画潮流と同じになるように揺らす
+      rows.push(['相馬双葉幹線', slash(d), hhmm(k * 5), 5000, -2000, 0, 0, 100, -50, 0, 0, plan, plan, plan + ((k - 1) % 6) - 2.5, 0, 0]);
+    }
+  }
+  return toCsv(rows);
+}
+
+async function occtoMock(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const url = new URL(req.url ?? '', 'http://localhost');
+  const chunks: Buffer[] = [];
+  for await (const c of req) chunks.push(c as Buffer);
+  const body = Buffer.concat(chunks).toString('utf8');
+  const params = new URLSearchParams(body);
+  const sub = params.get('fwExtention.actionSubType') ?? '';
+  const json = (root: Record<string, unknown>) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain;charset=utf-8' });
+    res.end(JSON.stringify({ root: { errMessage: null, ...root } }));
+  };
+  if (url.pathname === '/occto/LOGIN_login') {
+    occtoRequests.push('/occto/login');
+    res.writeHead(200, { 'Set-Cookie': ['JSESSIONID=s1; Path=/', 'HSERVERID=h1; Path=/'], 'Content-Type': 'text/html' });
+    res.end('<html><title>メニュー</title></html>');
+    return;
+  }
+  if (url.pathname !== '/occto/CF01S010C') {
+    res.writeHead(404).end();
+    return;
+  }
+  // セッションが無ければ、本物と同じくタイムアウトの画面
+  if (!(req.headers.cookie ?? '').includes('JSESSIONID=s1')) {
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end('<form id="mainForm"><p>一定時間操作が行われなかったため、タイムアウトが発生しました。</p></form>');
+    return;
+  }
+  if (url.searchParams.get('fwExtention.pathInfo') === 'CF01S010C') {
+    occtoRequests.push('/occto/open');
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end('<html><title>情報ダウンロード</title><form id="mainForm"></form></html>');
+    return;
+  }
+  occtoRequests.push(`/occto/${sub}`);
+  const kind = params.get('rklDataKnd') === '06' ? 'plan' : 'flow';
+  const day = (k: string) => {
+    const m = /^(\d{4})\/(\d{2})\/(\d{2})$/.exec(params.get(k) ?? '');
+    return m ? dayFromYmd(Number(m[1]), Number(m[2]), Number(m[3])) : Number.NaN;
+  };
+  const [from, to] = [day('rklNngpFrom'), day('rklNngpTo')];
+  if (req.headers.sdreqtype === 'AJAX') {
+    if (sub === 'initDisplay') {
+      const r = (k: 'plan' | 'flow') => ({ value: `(${slash(OCCTO_RANGES[k][0])}〜${slash(OCCTO_RANGES[k][1])})` });
+      json({ bizRoot: { header: { akyuryNdKkn: r('plan'), rklFlowRsltKkn: r('flow') } } });
+      return;
+    }
+    if (!(from >= OCCTO_RANGES[kind][0] && to <= OCCTO_RANGES[kind][1])) {
+      json({ errMessage: [{ msgFormat: '検索対象期間外です。検索条件を見直してください。' }] });
+      return;
+    }
+    if (sub === 'print') json({ confirmationMessage: { message: 'CSVを保存します。よろしいですか？' }, bizRoot: { header: { requestToken: { value: 't1' } } } });
+    else if (sub === 'ok' && params.get('requestToken') === 't1') json({ bizRoot: { header: { downloadKey: { value: 'k1' }, requestToken: { value: 't2' } } } });
+    else json({ errMessage: [{ msgFormat: '不正な操作です。' }] });
+    return;
+  }
+  if (sub === 'download' && params.get('downloadKey') === 'k1' && params.get('requestToken') === 't2') {
+    res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Disposition': 'attachment;filename=x.csv' });
+    res.end(iconv.encode(kind === 'plan' ? occtoPlanCsv(from, to) : occtoFlowCsv(from, to), 'Shift_JIS'));
+    return;
+  }
+  res.writeHead(200, { 'Content-Type': 'text/html' }).end('不正なリクエストです。');
+}
+
+/** 広域機関のまねへの通信（送った操作の順） */
+const occtoRequests: string[] = [];
+
 let server: Server;
 let baseUrl = '';
 let workdir = '';
@@ -104,11 +210,16 @@ const urls = () => ({
   urlTemplate: `${baseUrl}/csv_read.php?file=spot_summary_{fy}.csv`,
   curvesUrlTemplate: `${baseUrl}/csv_read.php?dir={dir}&file={file}`,
   sensitivityUrlTemplate: `${baseUrl}/csv_read.php?dir=virtualprice&file=virtualprice_{fy}.csv`,
+  occtoBase: `${baseUrl}/occto/`,
 });
 
 beforeAll(async () => {
   workdir = await mkdtemp(path.join(tmpdir(), 'jepx-viewer-'));
   server = createServer((req, res) => {
+    if ((req.url ?? '').startsWith('/occto/')) {
+      void occtoMock(req, res);
+      return;
+    }
     requests.push(req.url ?? '');
     const summary = /spot_summary_(\d{4})\.csv/.exec(req.url ?? '');
     const sens = /virtualprice_(\d{4})\.csv/.exec(req.url ?? '');
@@ -503,6 +614,77 @@ describe('データ取得スクリプト', () => {
     expect(manifest.curves?.dates).toEqual(['20240402']);
   });
 
+  it('広域機関から連系線の計画潮流（翌日）と潮流実績を取得し、連系線の年度ファイルと一覧を作る（取得済みの日は取り直さない）', async () => {
+    const out = path.join(workdir, 'interties');
+    const logs: string[] = [];
+    const opts = {
+      ...defaultOptions(),
+      ...urls(),
+      from: 2024,
+      to: 2024,
+      out,
+      delayMs: 0,
+      curves: false,
+      sensitivity: false,
+      intertiesFrom: dayFromYmd(2024, 3, 20),
+      intertiesTo: dayFromYmd(2024, 4, 5),
+      log: (m: string) => logs.push(m),
+    };
+    const before = occtoRequests.length;
+    const manifest = await run(opts);
+    const occ = occtoRequests.slice(before);
+    // メニューでセッションを作り、画面を開き、取得できる期間を受け取ってから、確認・準備・ダウンロードの順に送る
+    expect(occ.slice(0, 6)).toEqual(['/occto/login', '/occto/open', '/occto/initDisplay', '/occto/print', '/occto/ok', '/occto/download']);
+    // 取得する範囲は、公表されている期間に縮める（計画潮流は 3/25〜4/3、潮流実績は 4/1〜4/3）
+    expect(manifest.interties!.files.map((f) => [f.fy, f.firstDate, f.lastDate])).toEqual([
+      [2023, '2024-03-25', '2024-03-31'],
+      [2024, '2024-04-01', '2024-04-03'],
+    ]);
+    const d = dayFromYmd(2024, 4, 2);
+    const v = decodeIntertieFy(JSON.parse(await readFile(path.join(out, 'interties', 'fy2024.json'), 'utf8'))).get(d)!;
+    const at = (f: IntertieField, s: number) => v[intertieOffset(INTERTIE_INDEX.tohokuTokyo, INTERTIE_FIELD_INDEX[f], s)];
+    expect([at('plan', 10), at('capFwd', 10), at('capRev', 10)]).toEqual([fixturePlan(d, 10), 5000, -2000]);
+    // 上限は 運用容量 − マージン − 広域調整枠
+    expect([at('limFwd', 10), at('limRev', 10)]).toEqual([4900, -1950]);
+    // 潮流実績は 5 分ごとの値の 30 分の平均
+    expect(at('actual', 10)).toBeCloseTo(fixturePlan(d, 10) + 5, 1);
+    expect(at('planFinal', 10)).toBe(fixturePlan(d, 10) + 5);
+    expect(logs.some((l) => l.includes('知らない連系線は読み飛ばしました: 未知の連系線'))).toBe(true);
+
+    // 2 回目は取得済みの日を取り直さない
+    const second = occtoRequests.length;
+    await run(opts);
+    expect(occtoRequests.slice(second).filter((r) => r === '/occto/download')).toEqual([]);
+  });
+
+  it('--from-dir: 広域機関の連系線の CSV（手元に保存したもの）も列名で見分けて、連系線の年度ファイルに入れる', async () => {
+    const src = path.join(workdir, 'occto-csv');
+    const out = path.join(workdir, 'occto-out');
+    await mkdir(src, { recursive: true });
+    await writeFile(path.join(src, 'renkeisen_akiyouryou.csv'), iconv.encode(occtoPlanCsv(dayFromYmd(2024, 4, 1), dayFromYmd(2024, 4, 2)), 'Shift_JIS'));
+    await writeFile(path.join(src, 'renkeisen_flow.csv'), iconv.encode(occtoFlowCsv(dayFromYmd(2024, 4, 2), dayFromYmd(2024, 4, 2)), 'Shift_JIS'));
+    const logs: string[] = [];
+    const manifest = await run({ ...defaultOptions(), out, fromDirs: [src], log: (m) => logs.push(m) });
+    expect(manifest.interties).toMatchObject({ firstDate: '2024-04-01', lastDate: '2024-04-02' });
+    const v = decodeIntertieFy(JSON.parse(await readFile(path.join(out, 'interties', 'fy2024.json'), 'utf8'))).get(dayFromYmd(2024, 4, 2))!;
+    const at = (f: IntertieField) => v[intertieOffset(INTERTIE_INDEX.tohokuTokyo, INTERTIE_FIELD_INDEX[f], 3)];
+    expect([at('plan'), at('planFinal')]).toEqual([fixturePlan(dayFromYmd(2024, 4, 2), 3), fixturePlan(dayFromYmd(2024, 4, 2), 3) + 5]);
+    expect(logs.some((l) => l.includes('連系線の計画潮流（翌日） 2024-04-01〜2024-04-02'))).toBe(true);
+  });
+
+  it('取得する日を、続いている日ごとに決まった日数以内の範囲にまとめる', () => {
+    expect(dayRuns([5, 1, 2, 3, 7, 8], 31)).toEqual([
+      [1, 3],
+      [5, 5],
+      [7, 8],
+    ]);
+    expect(dayRuns(Array.from({ length: 70 }, (_, i) => 100 + i), 31)).toEqual([
+      [100, 130],
+      [131, 161],
+      [162, 169],
+    ]);
+  });
+
   it('コマンドライン引数を解釈する', () => {
     const o = parseArgs(['--from', '2016', '--to', '2020', '--force', '--keep-csv', '--out', 'x', '--delay', '0']);
     expect(o).toMatchObject({ from: 2016, to: 2020, force: true, keepCsv: true, out: 'x', delayMs: 0, curves: true });
@@ -515,6 +697,14 @@ describe('データ取得スクリプト', () => {
     expect(parseArgs(['--no-sensitivity', '--sensitivity-url-template', 'http://x/{fy}.csv'])).toMatchObject({ sensitivity: false, sensitivityUrlTemplate: 'http://x/{fy}.csv' });
     const d = defaultOptions();
     expect(d.curvesTo - d.curvesFrom + 1).toBe(90);
+    expect([d.interties, d.intertiesTo - d.intertiesFrom + 1]).toEqual([true, 90]);
+    expect(parseArgs(['--no-interties', '--interties-from', '2025-04-01', '--interties-to', '2025-04-30', '--occto-url', 'http://x/'])).toMatchObject({
+      interties: false,
+      intertiesFrom: dayFromYmd(2025, 4, 1),
+      intertiesTo: dayFromYmd(2025, 4, 30),
+      occtoBase: 'http://x/',
+    });
+    expect(() => parseArgs(['--interties-from', '2025-05-01', '--interties-to', '2025-04-01'])).toThrow(/--interties-from/);
     expect(() => parseArgs(['--from', '2020', '--to', '2016'])).toThrow();
     expect(() => parseArgs(['--curves-from', '2025-05-01', '--curves-to', '2025-04-01'])).toThrow(/--curves-from/);
     expect(() => parseArgs(['--curves-from', 'yesterday'])).toThrow(/日付/);

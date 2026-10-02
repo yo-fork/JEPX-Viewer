@@ -5,6 +5,7 @@ import { CalendarView } from './calendar';
 import { CurvesView } from './curves';
 import { DistributionView } from './distribution';
 import { HeatmapView } from './heatmap';
+import { IntertiesView } from './interties';
 import { IntradayView } from './intraday';
 import { OverviewView } from './overview';
 import { TableView } from './table';
@@ -20,6 +21,7 @@ const FACTORIES: Record<TabId, () => View> = {
   calendar: () => new CalendarView(),
   distribution: () => new DistributionView(),
   area: () => new AreaView(),
+  interties: () => new IntertiesView(),
   volume: () => new VolumeView(),
   curves: () => new CurvesView(),
   yearly: () => new YearlyView(),

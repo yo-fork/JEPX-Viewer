@@ -2,6 +2,7 @@
  * ビュー（タブ）の共通基盤。
  */
 import type { CurveStore } from '../lib/curveStore';
+import type { IntertieStore } from '../lib/intertieStore';
 import type { Selection } from '../lib/select';
 import type { Dataset } from '../lib/store';
 import type { AppState, Extent } from '../state';
@@ -23,6 +24,8 @@ export interface ViewContext {
   extent: Extent;
   /** 入札カーブ（取得していなければ null） */
   curves: CurveStore | null;
+  /** 連系線（広域機関の公表値。取得していなければ null） */
+  interties: IntertieStore | null;
 }
 
 export abstract class View {

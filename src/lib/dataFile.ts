@@ -34,6 +34,15 @@ export interface Manifest {
   files: ManifestEntry[];
   /** 入札カーブ（取得していなければ無い） */
   curves?: CurveIndex;
+  /** 連系線（広域機関の公表値。取得していなければ無い） */
+  interties?: IntertieIndex;
+}
+
+/** 取得済みの連系線の年度ファイルの一覧（interties/fyYYYY.json） */
+export interface IntertieIndex {
+  firstDate: string;
+  lastDate: string;
+  files: ManifestEntry[];
 }
 
 /** 取得済みの入札カーブの一覧（curves/ 以下） */

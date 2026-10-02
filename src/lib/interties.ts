@@ -13,7 +13,7 @@ import { AREA_KEYS, SERIES_LABEL, type AreaKey } from './series';
 
 /** 市場分断したコマの、分断エリアの間を連系線でやりとりした量 */
 export interface BoundaryFlow {
-  /** pair: 2 つに分かれた（境をまたいだ量）。many: 3 つ以上に分かれた（すべての境の量の合計） */
+  /** pair: 2 つに分かれた（境をまたいだ量）。many: 3 つ以上に分かれた（分断エリアのカーブに入っている受け入れの量の合計。境ごとには分けられない） */
   kind: 'pair' | 'many';
   /** 約定価格から分けた分断エリア（エリアの並び順） */
   groups: AreaKey[][];

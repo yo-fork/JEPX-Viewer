@@ -6,12 +6,14 @@
  *   npm run fetch -- --curves-from 2025-04-01 入札カーブを 2025/4/1 の受渡分から取得
  *   npm run fetch -- --no-curves              入札カーブを取得しない
  *   npm run fetch -- --no-sensitivity         価格感応度（JEPX の公表値）を取得しない
+ *   npm run fetch -- --no-interties           連系線（広域機関の計画潮流・潮流実績）を取得しない
  *   npm run fetch -- --force                  取得済みの年度・日も取り直す
  *   npm run fetch -- --keep-csv               元の CSV も public/data/raw/ に保存する
  *   npm run fetch -- --from-dir ./csv         手元の CSV（ダウンロード・保存しておいたもの）を変換する（通信なし。複数指定できる）
  *
+ * 連系線は、電力広域的運営推進機関「系統情報サービス」の情報ダウンロード画面から取得する（scripts/occto.ts）。
  * 社内プロキシ環境では HTTPS_PROXY / HTTP_PROXY / NO_PROXY 環境変数がそのまま使われる。
- * JEPX のサイトに負荷をかけないよう、取得は 1 件ずつ間隔（--delay）を空けて行う。
+ * JEPX・広域機関のサイトに負荷をかけないよう、取得は 1 件ずつ間隔（--delay）を空けて行う。
  */
 import { mkdir, open, readdir, readFile, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
@@ -47,13 +49,31 @@ import {
   splitByFiscalYear,
   type CurveIndex,
   type FyFile,
+  type IntertieIndex,
   type Manifest,
   type ManifestEntry,
 } from '../src/lib/dataFile';
 import { fiscalYearOfDay, isoFromDay, parseDateString, todayJst } from '../src/lib/dates';
 import { decodeCsvBytes } from '../src/lib/encoding';
 import { parseSpotCsv, type DayMap, type DayValues } from '../src/lib/jepxCsv';
+import {
+  decodeIntertieFy,
+  encodeIntertieFy,
+  FLOW_FIELDS,
+  hasIntertieFields,
+  INTERTIE_FY_FORMAT,
+  intertieFyFile,
+  mergeIntertieDays,
+  occtoCsvKind,
+  parseOcctoCsv,
+  PLAN_FIELDS,
+  splitIntertieByFy,
+  type IntertieDays,
+  type IntertieFyFile,
+  type OcctoCsvKind,
+} from '../src/lib/occto';
 import { absorbedOfDay, publishedAt } from '../src/lib/sensitivity';
+import { DEFAULT_OCCTO_BASE, OcctoClient, type OcctoRanges } from './occto';
 import { SENSITIVITY_KEYS, SERIES_COUNT, SERIES_INDEX, SLOTS, type SeriesKey } from '../src/lib/series';
 
 export const JEPX_SPOT_PAGE = 'https://www.jepx.jp/electricpower/market-data/spot/';
@@ -90,6 +110,13 @@ export interface FetchOptions {
   /** JEPX が公表している価格感応度を取得して、取引結果の年度ファイルに入れる */
   sensitivity: boolean;
   sensitivityUrlTemplate: string;
+  /** 連系線（広域機関の計画潮流・潮流実績）を取得する */
+  interties: boolean;
+  /** 連系線を取得する受渡日の範囲 */
+  intertiesFrom: number;
+  intertiesTo: number;
+  /** 広域機関の系統情報サービスの場所（画面の URL の共通部分） */
+  occtoBase: string;
 }
 
 export function defaultOptions(): FetchOptions {
@@ -111,6 +138,10 @@ export function defaultOptions(): FetchOptions {
     curvesUrlTemplate: DEFAULT_CURVES_URL_TEMPLATE,
     sensitivity: true,
     sensitivityUrlTemplate: DEFAULT_SENSITIVITY_URL_TEMPLATE,
+    interties: true,
+    intertiesFrom: tomorrow - (DEFAULT_CURVE_DAYS - 1),
+    intertiesTo: tomorrow,
+    occtoBase: DEFAULT_OCCTO_BASE,
     fromDirs: [],
   };
 }
@@ -174,6 +205,18 @@ export function parseArgs(argv: string[], base = defaultOptions()): FetchOptions
       case '--sensitivity-url-template':
         o.sensitivityUrlTemplate = next();
         break;
+      case '--no-interties':
+        o.interties = false;
+        break;
+      case '--interties-from':
+        o.intertiesFrom = date(a, next());
+        break;
+      case '--interties-to':
+        o.intertiesTo = date(a, next());
+        break;
+      case '--occto-url':
+        o.occtoBase = next();
+        break;
       case '-h':
       case '--help':
         console.log(HELP);
@@ -185,6 +228,7 @@ export function parseArgs(argv: string[], base = defaultOptions()): FetchOptions
   }
   if (!Number.isInteger(o.from) || !Number.isInteger(o.to) || o.from > o.to) throw new Error('--from / --to には年度（例: 2024）を指定してください');
   if (o.curvesFrom > o.curvesTo) throw new Error('--curves-from が --curves-to より後になっています');
+  if (o.intertiesFrom > o.intertiesTo) throw new Error('--interties-from が --interties-to より後になっています');
   return o;
 }
 
@@ -195,6 +239,10 @@ const HELP = `使い方: npm run fetch -- [オプション]
   --curves-to <日付>     入札カーブを取得する最後の受渡日（既定: 翌日）
   --no-curves            入札カーブを取得しない
   --no-sensitivity       価格感応度（JEPX の公表値、${FIRST_SENSITIVITY_FY} 年度から）を取得しない
+  --interties-from <日付>  連系線（広域機関の計画潮流・潮流実績）を取得する最初の受渡日（既定: 直近 ${DEFAULT_CURVE_DAYS} 日）
+  --interties-to <日付>  連系線を取得する最後の受渡日（既定: 翌日）
+  --no-interties         連系線を取得しない
+  --occto-url <URL>      広域機関の系統情報サービスの場所（既定: ${DEFAULT_OCCTO_BASE}）
   --out <ディレクトリ>   出力先（既定: public/data）
   --force                取得済みの年度・日も取り直す
   --keep-csv             元の CSV を <出力先>/raw/ に保存する
@@ -419,7 +467,15 @@ export async function writeManifest(out: string, source: string, touchedCurveFys
     entries.push({ fy: json.fy, file: `spot/${f}`, firstDate: isoFromDay(days[0]), lastDate: isoFromDay(days[days.length - 1]), days: days.length });
   }
   const curves = await writeCurveIndex(out, touchedCurveFys);
-  const manifest: Manifest = { format: MANIFEST_FORMAT, generatedAt: new Date().toISOString(), source, files: entries, ...(curves ? { curves } : {}) };
+  const interties = await intertieIndex(out);
+  const manifest: Manifest = {
+    format: MANIFEST_FORMAT,
+    generatedAt: new Date().toISOString(),
+    source,
+    files: entries,
+    ...(curves ? { curves } : {}),
+    ...(interties ? { interties } : {}),
+  };
   await mkdir(out, { recursive: true });
   await writeFile(path.join(out, 'manifest.json'), JSON.stringify(manifest, null, 2));
   return manifest;
@@ -481,9 +537,18 @@ async function convertDir(o: FetchOptions): Promise<Set<number>> {
   const sensDays: DayMap = new Map();
   const groups = new Map<number, AreaGroup[][]>();
   const curveFiles: typeof files = [];
+  const intertie: IntertieDays = new Map();
   for (const f of files) {
     try {
-      const kind = curveCsvKind(await readHead(f.path));
+      const head = await readHead(f.path);
+      const occto = occtoCsvKind(head);
+      if (occto) {
+        const res = parseOcctoCsv(await read(f.path));
+        mergeIntertieDays(intertie, res.days, occto === 'plan' ? PLAN_FIELDS : FLOW_FIELDS);
+        o.log(`${f.label}: 連系線の${occto === 'plan' ? '計画潮流（翌日）' : '潮流実績'} ${isoFromDay(res.firstDay)}〜${isoFromDay(res.lastDay)}${unknownLines(res.unknown)}`);
+        continue;
+      }
+      const kind = curveCsvKind(head);
       if (kind === 'bidCurves') {
         curveFiles.push(f);
         continue;
@@ -575,8 +640,10 @@ async function convertDir(o: FetchOptions): Promise<Set<number>> {
   if (renamed > 0) o.log(`分断エリアの名前を、変換済みの入札カーブ ${renamed} 日に付けました`);
   if (orphan > 0) o.log(`分断エリアの CSV だけがあり、入札カーブが無い日: ${orphan} 日（その日の入札カーブを変換すると名前が付きます）`);
   if (outside > 0) o.log(`入札カーブ: --curves-from / --curves-to の範囲外の ${outside} 日は変換しませんでした`);
+  const savedInterties = intertie.size > 0 ? await saveInterties(o.out, intertie) : 0;
+  if (savedInterties > 0) o.log(`連系線: ${intertie.size} 日分を ${savedInterties} 年度のファイルに入れました`);
   if (failed.length > 0) o.log(`読み込めなかった CSV: ${failed.length} 件（${failed.join(', ')}）`);
-  if (days.size === 0 && savedFy === 0 && touched.size === 0 && renamed === 0) throw new Error(`${where} に変換できる CSV がありません`);
+  if (days.size === 0 && savedFy === 0 && touched.size === 0 && renamed === 0 && savedInterties === 0) throw new Error(`${where} に変換できる CSV がありません`);
   return touched;
 }
 
@@ -771,6 +838,7 @@ export async function run(o: FetchOptions): Promise<Manifest> {
     try {
       await fetchAll(o, dispatcher, pace);
       if (o.curves) touched = await fetchCurves(o, dispatcher, pace);
+      if (o.interties) await fetchInterties(o, dispatcher, pace);
     } finally {
       await dispatcher.close();
     }
@@ -787,7 +855,138 @@ export async function run(o: FetchOptions): Promise<Manifest> {
     o.log('データが 1 件もありません。ネットワーク接続や取得元 URL を確認してください。');
   }
   if (manifest.curves) o.log(`入札カーブ: ${manifest.curves.dates.length} 日（${manifest.curves.firstDate}〜${manifest.curves.lastDate}）`);
+  if (manifest.interties) o.log(`連系線: ${manifest.interties.firstDate}〜${manifest.interties.lastDate}`);
   return manifest;
+}
+
+// ---- 連系線（広域機関） ----
+
+function intertiePath(out: string, fy: number): string {
+  return path.join(out, intertieFyFile(fy));
+}
+
+/** 出力先にある連系線の年度ファイルの日別データ（無いか読めなければ空） */
+async function readIntertieDays(out: string, fy: number): Promise<IntertieDays> {
+  const p = intertiePath(out, fy);
+  if (!existsSync(p)) return new Map();
+  try {
+    return decodeIntertieFy(JSON.parse(await readFile(p, 'utf8')));
+  } catch {
+    return new Map();
+  }
+}
+
+/** 日別データを、出力先の年度ファイルに重ねて保存する。保存した年度の数を返す */
+async function saveInterties(out: string, days: IntertieDays): Promise<number> {
+  let n = 0;
+  for (const [fy, part] of splitIntertieByFy(days)) {
+    const all = await readIntertieDays(out, fy);
+    mergeIntertieDays(all, part);
+    await mkdir(path.dirname(intertiePath(out, fy)), { recursive: true });
+    await writeFile(intertiePath(out, fy), JSON.stringify(encodeIntertieFy(fy, all)));
+    n++;
+  }
+  return n;
+}
+
+const unknownLines = (names: string[]) => (names.length > 0 ? `（知らない連系線は読み飛ばしました: ${names.join('、')}）` : '');
+
+/** 続いている日を、max 日以内の範囲 [from, to] にまとめる */
+export function dayRuns(days: readonly number[], max: number): [number, number][] {
+  const out: [number, number][] = [];
+  for (const d of [...days].sort((a, b) => a - b)) {
+    const last = out[out.length - 1];
+    if (last && d === last[1] + 1 && d - last[0] < max) last[1] = d;
+    else out.push([d, d]);
+  }
+  return out;
+}
+
+/** 1 回に取得する日数（広域機関のサイトに負荷をかけないよう、1 か月ずつ） */
+const OCCTO_CHUNK_DAYS = 31;
+
+/**
+ * 広域機関から連系線の計画潮流（翌日に策定した値）と潮流実績を取得し、連系線の年度ファイルに入れる。
+ * 取得済みの日は取り直さない。潮流実績は、今日と昨日の分（まだ途中のことがある）だけは毎回取り直す
+ */
+async function fetchInterties(o: FetchOptions, dispatcher: EnvHttpProxyAgent, pace: () => Promise<void>): Promise<void> {
+  const client = new OcctoClient(o.occtoBase, dispatcher);
+  let ranges: OcctoRanges;
+  try {
+    await pace();
+    ranges = await client.open();
+  } catch (err) {
+    o.log(`連系線: 広域機関の系統情報サービスを開けませんでした（${(err as Error).message}）`);
+    return;
+  }
+  const today = todayJst();
+  const stored = new Map<number, IntertieDays>();
+  const load = async (fy: number) => {
+    let m = stored.get(fy);
+    if (!m) stored.set(fy, (m = await readIntertieDays(o.out, fy)));
+    return m;
+  };
+  const touched = new Set<number>();
+  const label: Record<OcctoCsvKind, string> = { plan: '計画潮流（翌日）', flow: '潮流実績' };
+  for (const kind of ['plan', 'flow'] as const) {
+    const avail = ranges[kind];
+    const from = Math.max(o.intertiesFrom, avail?.[0] ?? Number.POSITIVE_INFINITY);
+    const to = Math.min(o.intertiesTo, avail?.[1] ?? Number.NEGATIVE_INFINITY);
+    if (from > to) {
+      o.log(`連系線: ${label[kind]}は、取得する範囲に公表されている日がありません${avail ? `（公表されているのは ${isoFromDay(avail[0])}〜${isoFromDay(avail[1])}）` : ''}`);
+      continue;
+    }
+    const fields = kind === 'plan' ? PLAN_FIELDS : FLOW_FIELDS;
+    const need: number[] = [];
+    for (let d = from; d <= to; d++) {
+      const vals = (await load(fiscalYearOfDay(d))).get(d);
+      if (o.force || !hasIntertieFields(vals, fields) || (kind === 'flow' && d >= today - 1)) need.push(d);
+    }
+    let got = 0;
+    for (const [a, b] of dayRuns(need, OCCTO_CHUNK_DAYS)) {
+      await pace();
+      const what = `連系線 ${label[kind]} ${isoFromDay(a)}〜${isoFromDay(b)}`;
+      try {
+        const bytes = await client.download(kind, a, b);
+        if (o.keepCsv) {
+          await mkdir(path.join(o.out, 'raw', 'interties'), { recursive: true });
+          await writeFile(path.join(o.out, 'raw', 'interties', `occto_${kind}_${ymd8(a)}_${ymd8(b)}.csv`), bytes);
+        }
+        const res = parseOcctoCsv(decodeCsvBytes(bytes).text);
+        for (const [fy, part] of splitIntertieByFy(res.days)) {
+          mergeIntertieDays(await load(fy), part, fields);
+          touched.add(fy);
+        }
+        got += res.days.size;
+        o.log(`${what}: ${res.days.size} 日${unknownLines(res.unknown)}`);
+      } catch (err) {
+        o.log(`${what}: 取得できませんでした（${(err as Error).message}）`);
+      }
+    }
+    o.log(`連系線: ${label[kind]} ${got} 日を取得、取得済み ${to - from + 1 - need.length} 日（広域機関）`);
+  }
+  for (const fy of touched) {
+    const days = stored.get(fy)!;
+    if (days.size === 0) continue;
+    await mkdir(path.dirname(intertiePath(o.out, fy)), { recursive: true });
+    await writeFile(intertiePath(o.out, fy), JSON.stringify(encodeIntertieFy(fy, days)));
+  }
+}
+
+/** 出力先にある連系線の年度ファイルの一覧（無ければ undefined） */
+async function intertieIndex(out: string): Promise<IntertieIndex | undefined> {
+  const dir = path.join(out, 'interties');
+  if (!existsSync(dir)) return undefined;
+  const files: ManifestEntry[] = [];
+  for (const f of (await readdir(dir)).filter((x) => /^fy\d{4}\.json$/.test(x)).sort()) {
+    const json = JSON.parse(await readFile(path.join(dir, f), 'utf8')) as IntertieFyFile;
+    if (json.format !== INTERTIE_FY_FORMAT) continue;
+    const days = [...decodeIntertieFy(json).keys()].sort((a, b) => a - b);
+    if (days.length === 0) continue;
+    files.push({ fy: json.fy, file: `interties/${f}`, firstDate: isoFromDay(days[0]), lastDate: isoFromDay(days[days.length - 1]), days: days.length });
+  }
+  if (files.length === 0) return undefined;
+  return { firstDate: files[0].firstDate, lastDate: files[files.length - 1].lastDate, files };
 }
 
 // CLI として実行されたとき

@@ -7,6 +7,7 @@ import type { Granularity } from './lib/aggregate';
 import type { DayType } from './lib/select';
 import { CURVE_TARGETS, type CurveTarget } from './lib/areaCurves';
 import { CURVE_HEAT_KEYS, type CurveHeatKey } from './lib/bidCurves';
+import { INTERTIE_KEYS, type IntertieKey } from './lib/occto';
 import { SPIKE_PRICES, type SpikePrice } from './lib/sensitivity';
 import { AREA_KEYS, PRICE_KEYS, SENSITIVITY_SIZES, type AreaKey, type PriceKey, type SensitivitySize } from './lib/series';
 
@@ -18,6 +19,7 @@ export const TABS = [
   { id: 'calendar', label: 'カレンダー' },
   { id: 'distribution', label: '分布' },
   { id: 'area', label: 'エリア比較' },
+  { id: 'interties', label: '連系線' },
   { id: 'volume', label: '入札・約定量' },
   { id: 'curves', label: '入札カーブ' },
   { id: 'yearly', label: '年度比較' },
@@ -126,6 +128,10 @@ export interface AppState {
   curveMetric: CurveHeatKey;
   /** 入札カーブのタブの、期間の推移の図の粒度（30 分値はコマごと） */
   curveGran: TrendGran;
+  /** 連系線のタブで見る連系線 */
+  intertie: IntertieKey;
+  /** 連系線のタブの推移の図の粒度 */
+  intertieGran: TrendGran;
   yearMetric: YearMetric;
   tableUnit: TableUnit;
   tableKind: TableKind;
@@ -171,6 +177,8 @@ export const DEFAULT_STATE: AppState = {
   spikePrice: 20,
   curveMetric: 'sell001',
   curveGran: 'auto',
+  intertie: 'tohokuTokyo',
+  intertieGran: 'auto',
   yearMetric: 'mean',
   tableUnit: 'month',
   tableKind: 'areas',
@@ -282,6 +290,8 @@ const SCHEMA: { [K in keyof AppState]: [string, Codec<AppState[K]>] } = {
   spikePrice: ['spk', numOf(SPIKE_PRICES)],
   curveMetric: ['cm2', oneOf<CurveHeatKey>(CURVE_HEAT_KEYS)],
   curveGran: ['cgr', oneOf<TrendGran>(['auto', 'slot', 'day', 'week', 'month'])],
+  intertie: ['ic', oneOf<IntertieKey>(INTERTIE_KEYS)],
+  intertieGran: ['igr', oneOf<TrendGran>(['auto', 'slot', 'day', 'week', 'month'])],
   yearMetric: ['ym', oneOf<YearMetric>(['mean', 'max', 'min', 'floor'])],
   tableUnit: ['tu', oneOf<TableUnit>(['day', 'week', 'month', 'fy', 'year', 'dow', 'slot', 'all'])],
   tableKind: ['tk', oneOf<TableKind>(['areas', 'stats'])],

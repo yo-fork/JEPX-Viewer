@@ -8,7 +8,8 @@ import type { CurveStore } from '../lib/curveStore';
 import { formatDay, slotRangeLabel, wallClockMs } from '../lib/dates';
 import { fmtNum } from '../lib/format';
 import { boundaryFlow, boundaryName, FLOW_FAILURE_TEXT, groupName, signedFlow, type BoundaryFlow, type FlowFailure } from '../lib/interties';
-import { kwhToMw, SERIES_INDEX, SLOTS, type AreaKey, type SeriesKey } from '../lib/series';
+import { crossingFlows, INTERTIE_DEFS, INTERTIE_INDEX, type IntertieKey } from '../lib/occto';
+import { kwhToMw, SERIES_INDEX, SERIES_LABEL, SLOTS, type AreaKey, type SeriesKey } from '../lib/series';
 import type { Selection } from '../lib/select';
 import type { Dataset } from '../lib/store';
 import type { ChartCard } from '../ui/card';
@@ -22,7 +23,7 @@ import { TIME_AXIS_LABEL } from './timeseries';
 /** 期間の図に、境ごとの系列として出す数（ほかは「そのほかの境」にまとめる） */
 const TOP_BOUNDARIES = 6;
 const OTHER_NAME = 'そのほかの境';
-const MANY_NAME = '3 つ以上に分かれたコマ（すべての境の合計）';
+const MANY_NAME = '3 つ以上に分かれたコマ（受け入れの合計）';
 
 /** 取引結果の値（入札量は kWh。無ければ NaN） */
 function valueAt(ds: Dataset, day: number, slot: number, key: SeriesKey): number {
@@ -49,25 +50,49 @@ const lastOf = (a: Float64Array) => (a.length >= 2 ? a[a.length - 1] : 0);
  * 1 コマの、分断エリアの間を連系線でやりとりした量（日のファイルから）。
  * デモの合成カーブは取引結果と別に作っているので、システムプライスのカーブとの差から求める
  */
-export function flowOfDay(ds: Dataset, day: CurveDay, slot: number, demo: boolean): BoundaryFlow | FlowFailure | null {
+export function flowOfDay(ds: Dataset, day: CurveDay, slot: number, demo: boolean): { flow: BoundaryFlow | FlowFailure | null; groups: AreaKey[][] | null } {
   const price = (a: AreaKey) => valueAt(ds, day.day, slot, a);
   const system = day.slots[slot]?.find((g) => g.id === SYSTEM_GROUP);
-  return boundaryFlow({
-    groups: priceSplit(price),
+  const groups = priceSplit(price);
+  const flow = boundaryFlow({
+    groups,
     price,
     published: groupTotalsOf(day, slot),
     spot: demo ? null : spotBidsOf(ds, day.day, slot),
     system: system ? { sell: lastOf(system.sell), buy: lastOf(system.buy) } : null,
   });
+  return { flow, groups };
 }
 
-/** 1 コマの図の下の説明（市場分断していなければ空） */
-export function flowText(f: BoundaryFlow | FlowFailure | null): string {
+const names = (areas: readonly AreaKey[]) => areas.map((a) => SERIES_LABEL[a]).join('・');
+
+/**
+ * 1 コマの図の下の説明（市場分断していなければ空）。
+ * plan を渡すと、広域機関が公表している、境をまたぐ連系線ごとの計画潮流（翌日）も並べる（単エリアのあるコマや、3 つ以上に分かれたコマでも境ごとに分かる）
+ */
+export function flowText(
+  x: { flow: BoundaryFlow | FlowFailure | null; groups: AreaKey[][] | null },
+  plan: ((key: IntertieKey) => number) | null = null,
+): string {
+  const f = x.flow;
   if (f === null) return '';
-  if (typeof f === 'string') return `連系線: ${FLOW_FAILURE_TEXT[f]}。`;
   const how = '公表されている分断エリアのカーブと取引結果から求めた量';
-  if (f.kind === 'pair') return `連系線: ${groupName(f.from)} から ${groupName(f.to)} へ ${fmtNum(f.mw)} MW（${how}。境に連系線が複数あれば、その合計）。`;
-  return `連系線: ${f.groups.length} つに分かれたため境ごとには分けられず、すべての境の量の合計は ${fmtNum(f.mw)} MW です（${how}）。`;
+  let text =
+    typeof f === 'string'
+      ? `連系線: ${FLOW_FAILURE_TEXT[f]}。`
+      : f.kind === 'pair'
+        ? `連系線: ${groupName(f.from)} から ${groupName(f.to)} へ ${fmtNum(f.mw)} MW（${how}。境に連系線が複数あれば、その合計）。`
+        : `連系線: ${f.groups.length} つに分かれたため境ごとには分けられず、分断エリアのカーブに入っている受け入れの量の合計は ${fmtNum(f.mw)} MW です（${how}）。`;
+  const cross = plan && x.groups ? crossingFlows(x.groups, plan) : [];
+  if (cross.length > 0) {
+    const items = cross.map((c) => {
+      const d = INTERTIE_DEFS[INTERTIE_INDEX[c.key]];
+      if (c.plan === 0) return `${d.label} 0 MW`;
+      return c.plan > 0 ? `${d.label} ${fmtNum(c.plan)} MW（${names(d.from)} → ${names(d.to)}）` : `${d.label} ${fmtNum(-c.plan)} MW（${names(d.to)} → ${names(d.from)}）`;
+    });
+    text += `広域機関が公表している翌日の計画潮流では、境をまたぐ連系線は ${items.join('、')}です。`;
+  }
+  return text;
 }
 
 interface FlowPoint {
@@ -122,7 +147,7 @@ export function renderFlowPeriod(card: ChartCard, ctx: ViewContext, cs: CurveSto
   const fail = [...failures].map(([k, n]) => `${{ single: '単エリアがある', groups: '分断エリアの数が合わない', blocks: 'ブロック入札の量が無い', mismatch: '売りと買いで合わない' }[k]} ${fmtNum(n)}`);
   card.setSubtitle(
     `${describeSelection(sel, state)}・市場分断したコマで、分断エリアの間を連系線でやりとりした量（MW。公表されている分断エリアのカーブと取引結果から）・` +
-      '2 つに分かれたコマは境をまたいだ量（正は北海道を含む側から、負は逆の向き）、3 つ以上に分かれたコマはすべての境の量の合計（凡例で選ぶと表示）・' +
+      '2 つに分かれたコマは境をまたいだ量（正は北海道を含む側から、負は逆の向き）、3 つ以上に分かれたコマは分断エリアのカーブに入っている受け入れの量の合計（凡例で選ぶと表示）・' +
       `市場分断した ${fmtNum(split)} コマのうち ${fmtNum(points.length)} コマ${fail.length > 0 ? `（求められないコマ: ${fail.join('、')}）` : ''}`,
   );
   if (points.length === 0) {
@@ -156,7 +181,7 @@ export function renderFlowPeriod(card: ChartCard, ctx: ViewContext, cs: CurveSto
           const f = p.flow;
           return (
             ttHeader(`${formatDay(p.day, true)} ${slotRangeLabel(p.slot)}`) +
-            ttRow(colorOf(param.seriesName), `${fmtNum(f.mw)} MW`, f.kind === 'pair' ? direction(f) : `${f.groups.length} つに分断（すべての境の合計）`, 'rect') +
+            ttRow(colorOf(param.seriesName), `${fmtNum(f.mw)} MW`, f.kind === 'pair' ? direction(f) : `${f.groups.length} つに分断（受け入れの合計）`, 'rect') +
             (f.kind === 'many' ? ttNote(direction(f)) : '')
           );
         },

@@ -1,0 +1,352 @@
+/**
+ * 連系線: 電力広域的運営推進機関（広域機関）が公表している、地域間連系線ごとの計画潮流・上限・潮流実績。
+ * 連系線ごとの、計画潮流が上限に達したコマ（市場分断が起きる）の割合、選んだ連系線の推移・時間帯別の様子・ヒートマップ。
+ */
+import { aggregateBySlot } from '../lib/aggregate';
+import { formatDay, slotRangeLabel, slotStartLabel } from '../lib/dates';
+import { fmtNum, fmtPct, fmtSigned } from '../lib/format';
+import type { IntertieStore } from '../lib/intertieStore';
+import { atLimit, INTERTIE_DEFS, INTERTIE_INDEX, OCCTO_SOURCE, type IntertieField, type IntertieKey } from '../lib/occto';
+import { SERIES_LABEL, SLOTS, type AreaKey } from '../lib/series';
+import type { Selection } from '../lib/select';
+import { accMean } from '../lib/stats';
+import type { TrendGran } from '../state';
+import type { ChartCard } from '../ui/card';
+import { segmented, selectField, toolbar, type Segmented, type SelectField } from '../ui/controls';
+import { h } from '../ui/dom';
+import { TOKENS } from '../ui/theme';
+import { ttHeader, ttNote, ttRow } from '../ui/tooltip';
+import { NO_DATA, View } from './base';
+import { describeSelection, endLabels, grid, labelRoom, lineLegend, rangeTag, slotAxis, styledLine, valueAxis } from './common';
+import { CURVE_GRAN_OPTIONS, curveGranularity, granText, namedTooltip, slotZoom } from './curveCommon';
+import { buildGrid, colorRange, gridTable, heatmapHeight, heatmapOption } from './heatmap';
+import { breakGaps, buildSeriesPoints, periodLabel, TIME_AXIS_LABEL } from './timeseries';
+
+const def = (key: IntertieKey) => INTERTIE_DEFS[INTERTIE_INDEX[key]];
+const areaNames = (areas: readonly AreaKey[]) => areas.map((a) => SERIES_LABEL[a]).join('・');
+/** 順方向・逆方向の向きの説明（「東北 → 東京」） */
+const forward = (key: IntertieKey) => `${areaNames(def(key).from)} → ${areaNames(def(key).to)}`;
+const backward = (key: IntertieKey) => `${areaNames(def(key).to)} → ${areaNames(def(key).from)}`;
+
+/** 推移の図の線（値の種類・名前・色の番号・破線か） */
+const TREND_LINES: { field: IntertieField; name: string; color: 'cat0' | 'cat1' | 'cat2' | 'neutral'; dashed: boolean }[] = [
+  { field: 'plan', name: '計画潮流（翌日）', color: 'cat0', dashed: false },
+  { field: 'planFinal', name: '計画潮流（最終）', color: 'cat2', dashed: true },
+  { field: 'actual', name: '潮流実績', color: 'cat1', dashed: false },
+  { field: 'limFwd', name: '上限（順方向）', color: 'neutral', dashed: true },
+  { field: 'limRev', name: '上限（逆方向）', color: 'neutral', dashed: true },
+];
+
+interface LineStat {
+  key: IntertieKey;
+  /** 計画潮流のあるコマの数と、順方向・逆方向の上限に達したコマの数 */
+  n: number;
+  fwd: number;
+  rev: number;
+  /** 計画潮流の平均（MW） */
+  mean: number;
+}
+
+export class IntertiesView extends View {
+  private note!: HTMLElement;
+  private line!: SelectField<IntertieKey>;
+  private gran!: Segmented<TrendGran>;
+  private overview!: ChartCard;
+  private trend!: ChartCard;
+  private profile!: ChartCard;
+  private congestion!: ChartCard;
+  private heat!: ChartCard;
+  /** 概要の図の棒の連系線（押した棒から引く） */
+  private overviewKeys: IntertieKey[] = [];
+
+  protected build(): void {
+    const s = this.ctx.state;
+    this.note = h('p', { class: 'view-note' });
+    this.line = selectField<IntertieKey>('連系線', [], s.intertie, (v) => this.set({ intertie: v }));
+    this.root.append(this.note, toolbar(this.line.el));
+    const g = this.grid();
+    this.overview = this.card(g, { title: '連系線ごとの、計画潮流が上限に達したコマの割合', height: 360, wide: true });
+    this.overview.chart.on('click', (e: unknown) => {
+      const key = this.overviewKeys[(e as { dataIndex: number }).dataIndex];
+      if (key) this.set({ intertie: key });
+    });
+    this.trend = this.card(g, { title: '計画潮流と上限の推移', height: 360, wide: true });
+    this.gran = segmented('粒度', CURVE_GRAN_OPTIONS, s.intertieGran, (v) => this.set({ intertieGran: v }));
+    this.trend.addControls(this.gran.el);
+    this.profile = this.card(g, { title: '時間帯別の平均', height: 320 });
+    this.congestion = this.card(g, { title: '時間帯別の、上限に達したコマの割合', height: 320 });
+    this.heat = this.card(g, { title: '計画潮流（翌日）のヒートマップ', height: 480, wide: true });
+  }
+
+  protected render(): void {
+    const { sel, ds, state } = this.ctx;
+    const st = this.ctx.interties;
+    const cards = [this.overview, this.trend, this.profile, this.congestion, this.heat];
+    this.gran.set(state.intertieGran);
+    if (!st) {
+      this.note.textContent = '連系線のデータがありません。npm run fetch を実行すると、電力広域的運営推進機関（広域機関）から計画潮流と潮流実績を取得します。';
+      this.line.setOptions([], state.intertie);
+      cards.forEach((c) => c.setEmpty('連系線のデータがありません。'));
+      return;
+    }
+    this.note.textContent =
+      `${st.isDemo ? 'デモの値（デモデータのエリア価格から合成したもので、実際の値ではありません）。' : `${OCCTO_SOURCE}。データは ${formatDay(st.first)}〜${formatDay(st.last)} にあります。`}` +
+      '計画潮流（翌日）は前日に策定した値（スポット市場の約定で使った量を含む）、計画潮流（最終）は時間前市場などで変わった後の値、潮流実績は実際に流れた量（5 分ごとの値の 30 分の平均）です。' +
+      '上限は「運用容量 − マージン − 広域調整枠」で、計画潮流が上限に達すると市場分断が起きます。正の値は順方向（連系線の名前の前の側から後ろの側）です。';
+    if (sel.days.length === 0) {
+      cards.forEach((c) => c.setEmpty(NO_DATA));
+      return;
+    }
+    const lines = st.linesWithData(ds, sel.from, sel.to);
+    this.line.setOptions(
+      lines.map((k) => ({ value: k, label: def(k).label })),
+      lines.includes(state.intertie) ? state.intertie : (lines[0] ?? state.intertie),
+    );
+    if (lines.length === 0) {
+      cards.forEach((c) => c.setEmpty(`選択した期間に連系線のデータがありません（${formatDay(st.first)}〜${formatDay(st.last)} にあります）。`));
+      return;
+    }
+    const key = lines.includes(state.intertie) ? state.intertie : lines[0];
+    this.renderOverview(st, sel, lines);
+    this.renderTrend(st, sel, key);
+    this.renderProfile(st, sel, key);
+    this.renderCongestion(st, sel, key);
+    this.renderHeat(st, sel, key);
+  }
+
+  /** 上限に達したかどうか（1: 順方向、−1: 逆方向、0: 達していない、NaN: 値が無い）をコマごとに */
+  private limitState(st: IntertieStore, key: IntertieKey): (k: number) => number {
+    const { ds } = this.ctx;
+    const plan = st.array(ds, key, 'plan');
+    const limF = st.array(ds, key, 'limFwd');
+    const limR = st.array(ds, key, 'limRev');
+    return (k) => atLimit(plan[k], limF[k], limR[k]);
+  }
+
+  private stat(st: IntertieStore, sel: Selection, key: IntertieKey): LineStat {
+    const at = this.limitState(st, key);
+    const plan = st.array(this.ctx.ds, key, 'plan');
+    let n = 0;
+    let fwd = 0;
+    let rev = 0;
+    let sum = 0;
+    for (const i of sel.days) {
+      for (let s = 0; s < SLOTS; s++) {
+        if (!sel.slotMask[s]) continue;
+        const v = at(i * SLOTS + s);
+        if (Number.isNaN(v)) continue;
+        n++;
+        sum += plan[i * SLOTS + s];
+        if (v > 0) fwd++;
+        else if (v < 0) rev++;
+      }
+    }
+    return { key, n, fwd, rev, mean: n > 0 ? sum / n : Number.NaN };
+  }
+
+  private renderOverview(st: IntertieStore, sel: Selection, lines: IntertieKey[]): void {
+    const { state, theme } = this.ctx;
+    const t = TOKENS[theme];
+    const stats = lines.map((k) => this.stat(st, sel, k)).filter((x) => x.n > 0);
+    this.overviewKeys = stats.map((x) => x.key);
+    this.overview.setHeight(Math.max(240, stats.length * 30 + 100));
+    this.overview.setSubtitle(
+      `${describeSelection(sel, state)}・計画潮流（翌日）が順方向・逆方向の上限に達したコマの割合（上限との差が 0.5 MW 以内）・押すとその連系線を選びます`,
+    );
+    const pct = (a: number, n: number) => (n > 0 ? (a / n) * 100 : Number.NaN);
+    const names = ['順方向で上限', '逆方向で上限'];
+    const colors = [t.cat[0], t.cat[1]];
+    this.overview.setOption(
+      {
+        grid: grid({ top: 44, right: 24, left: 8 }),
+        legend: lineLegend(names.map((name) => ({ name })), { data: names.map((name) => ({ name, icon: 'rect' })) }),
+        tooltip: {
+          trigger: 'axis',
+          axisPointer: { type: 'shadow' },
+          formatter: (ps: { dataIndex: number }[]) => {
+            const x = stats[ps[0]?.dataIndex ?? -1];
+            if (!x) return '';
+            return (
+              ttHeader(def(x.key).label) +
+              ttRow(colors[0], fmtPct(x.fwd / x.n), `順方向（${forward(x.key)}）で上限（${fmtNum(x.fwd)} コマ）`, 'rect') +
+              ttRow(colors[1], fmtPct(x.rev / x.n), `逆方向（${backward(x.key)}）で上限（${fmtNum(x.rev)} コマ）`, 'rect') +
+              ttNote(`計画潮流の平均 ${fmtSigned(x.mean, 0)} MW・${fmtNum(x.n)} コマ`)
+            );
+          },
+        },
+        yAxis: { type: 'category', inverse: true, data: stats.map((x) => def(x.key).label), axisTick: { show: false } },
+        xAxis: { type: 'value', name: '%', min: 0, axisLabel: { formatter: (v: number) => `${v}` } },
+        series: [
+          { name: names[0], type: 'bar', stack: 'limit', barMaxWidth: 18, itemStyle: { color: colors[0] }, data: stats.map((x) => pct(x.fwd, x.n)) },
+          {
+            name: names[1],
+            type: 'bar',
+            stack: 'limit',
+            barMaxWidth: 18,
+            itemStyle: { color: colors[1], borderRadius: [0, 4, 4, 0] },
+            data: stats.map((x) => pct(x.rev, x.n)),
+          },
+        ],
+      },
+      {
+        columns: ['連系線', '順方向', 'コマ数', '順方向で上限（%）', '逆方向で上限（%）', '順方向で上限（コマ）', '逆方向で上限（コマ）', '計画潮流の平均（MW）'],
+        rows: stats.map((x) => [def(x.key).label, forward(x.key), x.n, pct(x.fwd, x.n), pct(x.rev, x.n), x.fwd, x.rev, x.mean]),
+        digits: [null, null, 0, 1, 1, 0, 0, 0],
+        filename: `jepx_interties_congestion_${rangeTag(sel)}.csv`,
+      },
+    );
+  }
+
+  private renderTrend(st: IntertieStore, sel: Selection, key: IntertieKey): void {
+    const { ds, state, theme } = this.ctx;
+    const t = TOKENS[theme];
+    const color = { cat0: t.cat[0], cat1: t.cat[1], cat2: t.cat[2], neutral: t.neutralSeries };
+    const gran = curveGranularity(sel, state.intertieGran);
+    const zoom = slotZoom(gran);
+    const raw = buildSeriesPoints(sel, TREND_LINES.map((l) => ({ a: st.array(ds, key, l.field) })), gran, 'mean');
+    // 値の無い種類（潮流実績は 2025 年 4 月から）は出さない
+    const shown = TREND_LINES.map((l, i) => ({ ...l, points: raw[i].points })).filter((l) => l.points.some((p) => Number.isFinite(p[1])));
+    this.trend.setTitle(`${def(key).label}の計画潮流と上限の推移`);
+    this.trend.setSubtitle(`${describeSelection(sel, state)}・MW（正は順方向: ${forward(key)}）、${granText(gran)}`);
+    const names = shown.map((l) => l.name);
+    const ends = endLabels(names, shown.map((l) => l.points.map((p) => p[1])), theme, 260);
+    this.trend.setOption(
+      {
+        grid: grid({ right: labelRoom(names.length), bottom: zoom.bottom }),
+        legend: lineLegend(shown.map((l) => ({ name: l.name, dashed: l.dashed }))),
+        ...(zoom.dataZoom ? { dataZoom: zoom.dataZoom } : {}),
+        tooltip: {
+          trigger: 'axis',
+          formatter: namedTooltip(
+            names,
+            shown.map((l) => color[l.color]),
+            (p) => periodLabel(Number((p.value as number[])[0]), gran),
+            (v) => `${fmtSigned(v, 0)} MW`,
+            shown.map((l) => l.dashed),
+          ),
+        },
+        xAxis: { type: 'time', axisLabel: TIME_AXIS_LABEL },
+        yAxis: valueAxis('MW'),
+        series: shown.map((l, i) =>
+          styledLine(l.name, color[l.color], theme, gran === 'slot' ? breakGaps(l.points) : l.points, l.dashed, {
+            sampling: 'lttb',
+            ...(l.field === 'actual' ? { lineStyle: { width: 1.5 } } : {}),
+            ...ends[i],
+          }),
+        ),
+      },
+      {
+        columns: ['期間', ...names.map((n) => `${n}（MW）`)],
+        rows: (shown[0]?.points ?? []).map((p, r) => [periodLabel(p[0], gran), ...shown.map((l) => l.points[r][1])]),
+        digits: [null, ...names.map(() => 1)],
+        filename: `jepx_intertie_${key}_${rangeTag(sel)}.csv`,
+      },
+    );
+  }
+
+  private renderProfile(st: IntertieStore, sel: Selection, key: IntertieKey): void {
+    const { ds, state, theme } = this.ctx;
+    const t = TOKENS[theme];
+    const color = { cat0: t.cat[0], cat1: t.cat[1], cat2: t.cat[2], neutral: t.neutralSeries };
+    const lines = TREND_LINES.filter((l) => l.field !== 'planFinal')
+      .map((l) => {
+        const g = aggregateBySlot(sel, { a: st.array(ds, key, l.field) });
+        return { ...l, values: sel.slots.map((s) => accMean(g.acc[s])) };
+      })
+      .filter((l) => l.values.some(Number.isFinite));
+    this.profile.setSubtitle(`${describeSelection(sel, state)}・各コマの平均（MW、正は ${forward(key)}）`);
+    const names = lines.map((l) => l.name);
+    this.profile.setOption(
+      {
+        grid: grid({ right: 24 }),
+        legend: lineLegend(lines.map((l) => ({ name: l.name, dashed: l.dashed }))),
+        tooltip: {
+          trigger: 'axis',
+          formatter: namedTooltip(
+            names,
+            lines.map((l) => color[l.color]),
+            (p) => `${String(p.axisValue)} 開始のコマの平均`,
+            (v) => `${fmtSigned(v, 0)} MW`,
+            lines.map((l) => l.dashed),
+          ),
+        },
+        xAxis: slotAxis(sel.slots),
+        yAxis: valueAxis('MW'),
+        series: lines.map((l) => styledLine(l.name, color[l.color], theme, l.values, l.dashed)),
+      },
+      {
+        columns: ['時刻', ...names.map((n) => `${n}（MW）`)],
+        rows: sel.slots.map((s, r) => [slotStartLabel(s), ...lines.map((l) => l.values[r])]),
+        digits: [null, ...names.map(() => 1)],
+        filename: `jepx_intertie_${key}_profile_${rangeTag(sel)}.csv`,
+      },
+    );
+  }
+
+  private renderCongestion(st: IntertieStore, sel: Selection, key: IntertieKey): void {
+    const { state, theme } = this.ctx;
+    const t = TOKENS[theme];
+    const at = this.limitState(st, key);
+    const rows = sel.slots.map((s) => {
+      let n = 0;
+      let fwd = 0;
+      let rev = 0;
+      for (const i of sel.days) {
+        const v = at(i * SLOTS + s);
+        if (Number.isNaN(v)) continue;
+        n++;
+        if (v > 0) fwd++;
+        else if (v < 0) rev++;
+      }
+      return { s, n, fwd: n > 0 ? (fwd / n) * 100 : Number.NaN, rev: n > 0 ? (rev / n) * 100 : Number.NaN };
+    });
+    this.congestion.setSubtitle(`${describeSelection(sel, state)}・計画潮流（翌日）が上限に達した日の割合（%）`);
+    const names = [`順方向（${forward(key)}）`, `逆方向（${backward(key)}）`];
+    const colors = [t.cat[0], t.cat[1]];
+    this.congestion.setOption(
+      {
+        grid: grid(),
+        legend: lineLegend(names.map((name) => ({ name })), { data: names.map((name) => ({ name, icon: 'rect' })) }),
+        tooltip: {
+          trigger: 'axis',
+          axisPointer: { type: 'shadow' },
+          formatter: (ps: { dataIndex: number }[]) => {
+            const r = rows[ps[0]?.dataIndex ?? -1];
+            if (!r) return '';
+            return ttHeader(slotRangeLabel(r.s)) + ttRow(colors[0], `${fmtNum(r.fwd, 1)}%`, names[0], 'rect') + ttRow(colors[1], `${fmtNum(r.rev, 1)}%`, names[1], 'rect') + ttNote(`${fmtNum(r.n)} 日`);
+          },
+        },
+        xAxis: slotAxis(sel.slots),
+        yAxis: valueAxis('%', { min: 0 }),
+        series: [
+          { name: names[0], type: 'bar', stack: 'limit', itemStyle: { color: colors[0] }, data: rows.map((r) => r.fwd) },
+          { name: names[1], type: 'bar', stack: 'limit', itemStyle: { color: colors[1], borderRadius: [4, 4, 0, 0] }, data: rows.map((r) => r.rev) },
+        ],
+      },
+      {
+        columns: ['時刻', '日数', `${names[0]}で上限（%）`, `${names[1]}で上限（%）`],
+        rows: rows.map((r) => [slotStartLabel(r.s), r.n, r.fwd, r.rev]),
+        digits: [null, 0, 1, 1],
+        filename: `jepx_intertie_${key}_congestion_${rangeTag(sel)}.csv`,
+      },
+    );
+  }
+
+  private renderHeat(st: IntertieStore, sel: Selection, key: IntertieKey): void {
+    const { ds, state, theme } = this.ctx;
+    const t = TOKENS[theme];
+    const g = buildGrid(sel, { a: st.array(ds, key, 'plan') }, 'dateSlot');
+    this.heat.setTitle(`${def(key).label}の計画潮流（翌日）のヒートマップ`);
+    if (g.cells.length === 0) {
+      this.heat.setEmpty('選択した期間に、この連系線の計画潮流がありません。');
+      return;
+    }
+    this.heat.setSubtitle(`${describeSelection(sel, state)}・MW（赤は順方向: ${forward(key)}、青は逆方向）${g.note ? `・${g.note}` : ''}`);
+    const [min, max] = colorRange(g, true);
+    this.heat.setHeight(heatmapHeight(g));
+    this.heat.setOption(
+      heatmapOption(g, { theme, min, max, colors: t.div, precision: 0, fmt: (v) => `${fmtSigned(v, 0)} MW`, valueLabel: '計画潮流（翌日）' }),
+      gridTable(g, `jepx_intertie_${key}_heatmap_${rangeTag(sel)}.csv`),
+    );
+  }
+}

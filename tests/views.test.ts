@@ -89,6 +89,14 @@ describe('入札カーブの URL', () => {
     expect(stateToHash(stateFromHash('#tab=curves'))).toBe('#tab=curves');
   });
 
+  it('連系線のタブで見る連系線と粒度を保存・復元できる', () => {
+    const s = stateFromHash('#tab=interties&ic=chubuFence&igr=slot');
+    expect([s.tab, s.intertie, s.intertieGran]).toEqual(['interties', 'chubuFence', 'slot']);
+    expect(stateFromHash(stateToHash(s))).toEqual(s);
+    const bad = stateFromHash('#ic=nowhere&igr=hour');
+    expect([bad.intertie, bad.intertieGran]).toEqual(['tohokuTokyo', 'auto']);
+  });
+
   it('期間の図の粒度（30 分値も）と、ヒートマップで見るもの（高騰までの買いの増減・公表値も）を保存・復元できる', () => {
     const s = stateFromHash('#tab=curves&cgr=slot&cm2=spike20Shift');
     expect([s.curveGran, s.curveMetric]).toEqual(['slot', 'spike20Shift']);

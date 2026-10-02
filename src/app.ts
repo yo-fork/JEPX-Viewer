@@ -2,6 +2,7 @@
  * アプリ本体：画面の骨組み、データの読み込み（取得済みデータ・CSV・デモ）、状態管理と描画の制御。
  */
 import { COMPARE_DAYS, CurveStore } from './lib/curveStore';
+import { IntertieStore } from './lib/intertieStore';
 import { decodeFyFile, MANIFEST_FORMAT, type Manifest, type ManifestEntry } from './lib/dataFile';
 import { fiscalYearEnd, fiscalYearOfDay, fiscalYearStart, formatDay, parseDateString, todayJst } from './lib/dates';
 import { addDemoSensitivity, generateDemoDays } from './lib/demo';
@@ -34,6 +35,8 @@ export class App implements AppApi {
   private manifest: Manifest | null = null;
   /** 入札カーブ（取得済みデータか、デモの合成データ） */
   private curves: CurveStore | null = null;
+  /** 連系線（広域機関の公表値か、デモの合成データ） */
+  private interties: IntertieStore | null = null;
   private readonly loaded = new Set<number>();
   /** 読み込みに失敗した年度 → 失敗した時刻 */
   private readonly failed = new Map<number, number>();
@@ -148,7 +151,7 @@ export class App implements AppApi {
       h(
         'p',
         null,
-        '出典: 日本卸電力取引所（JEPX）「スポット市場 取引結果」。本ツールは JEPX とは関係のない非公式のビューアです。',
+        '出典: 日本卸電力取引所（JEPX）「スポット市場 取引結果」。連系線のタブは、電力広域的運営推進機関「系統情報サービス」のデータを加工して作成。本ツールは JEPX や電力広域的運営推進機関とは関係のない非公式のビューアです。',
         '読み込んだ CSV はブラウザ内でのみ処理され、外部には送信されません。',
       ),
     );
@@ -214,10 +217,22 @@ export class App implements AppApi {
     const curvesTab = this.state.tab === 'curves' && this.curves !== null;
     const curvesPending = curvesTab ? this.prepareCurves(range) : null;
     const curveSpot = curvesTab ? this.ensureLoaded(this.curves!.first, this.curves!.last) : null;
-    if (pending || curvesPending || curveSpot) {
+    // 連系線のタブは選んだ期間の、入札カーブのタブは 1 コマの図と比べるためにカーブのある期間の連系線を読み込む
+    const intertiesPending =
+      this.interties && this.state.tab === 'interties'
+        ? this.interties.ensure(range.from, range.to)
+        : this.interties && curvesTab
+          ? this.interties.ensure(this.curves!.first, this.curves!.last)
+          : null;
+    if (pending || curvesPending || curveSpot || intertiesPending) {
       this.viewHost.classList.add('is-loading');
       this.filterBar.setStatus('データを読み込み中…');
-      await Promise.all([pending, curvesPending, curveSpot]);
+      await Promise.all([
+        pending,
+        curvesPending,
+        curveSpot,
+        intertiesPending?.catch((err: Error) => this.toast(`連系線のデータを読み込めませんでした（${err.message}）`, 'error')),
+      ]);
       if (seq !== this.renderSeq) return;
     }
     // 追い越された古い render が読み込み表示を残していても、ここで必ず解除する
@@ -237,7 +252,7 @@ export class App implements AppApi {
       slotStart: this.state.slotStart,
       slotEnd: this.state.slotEnd,
     });
-    const ctx: ViewContext = { app: this, state: this.state, ds, sel, theme: this.theme, extent, curves: this.curves };
+    const ctx: ViewContext = { app: this, state: this.state, ds, sel, theme: this.theme, extent, curves: this.curves, interties: this.interties };
     const key = `${this.state.tab}|${this.theme}`;
     try {
       if (!this.view || this.viewKey !== key) {
@@ -357,6 +372,7 @@ export class App implements AppApi {
       if (json?.format !== MANIFEST_FORMAT || !Array.isArray(json.files) || json.files.length === 0) return;
       this.manifest = json;
       if (json.curves) this.curves = CurveStore.fromIndex(json.curves, (file) => this.readData(file));
+      if (json.interties) this.interties = IntertieStore.fromIndex(json.interties, (file) => this.readData(file));
     } catch {
       // 取得済みデータが無い（npm run fetch 未実行）場合はここに来る
       if (LOCAL_DATA === 'scripts') {
@@ -453,6 +469,7 @@ export class App implements AppApi {
         if (this.store.isDemo) {
           this.store.clear();
           this.curves = null;
+          this.interties = null;
         }
         this.store.addDays(res.days, 'upload');
         first = Math.min(first, res.firstDay);
@@ -485,6 +502,7 @@ export class App implements AppApi {
     this.store.addDays(demo, 'demo');
     const ds = this.store.dataset();
     this.curves = ds ? CurveStore.demo(ds) : null;
+    this.interties = ds ? IntertieStore.demo(ds) : null;
     this.syncUrl();
     this.requestRender();
   }
@@ -492,6 +510,7 @@ export class App implements AppApi {
   private exitDemo(): void {
     this.store.clear();
     this.curves = null;
+    this.interties = null;
     this.state = { ...DEFAULT_STATE, tab: this.state.tab };
     this.syncUrl();
     this.requestRender();

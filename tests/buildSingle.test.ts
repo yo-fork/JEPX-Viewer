@@ -19,6 +19,7 @@ import { decodeFyFile, encodeFyFile, MANIFEST_FORMAT, type Manifest } from '../s
 import { dayFromYmd, isoFromDay } from '../src/lib/dates';
 import { generateDemoDays } from '../src/lib/demo';
 import { syntheticCurveDay } from '../src/lib/demoCurves';
+import { encodeIntertieFy, INTERTIE_FIELD_INDEX, INTERTIE_INDEX, intertieOffset, newIntertieDay } from '../src/lib/occto';
 import { SLOTS } from '../src/lib/series';
 import { dataScriptPath, isDataFile, loadDataScript, localDataMode, readEmbedded, REGISTER_FN } from '../src/lib/localData';
 
@@ -287,6 +288,21 @@ describe('buildSingle（入札カーブ）', () => {
       await mkdir(path.dirname(file), { recursive: true });
       await writeFile(file, JSON.stringify(encodeCurveDay(raw, groups)));
     }
+    // 連系線（2023 年度と 2024 年度）
+    await mkdir(path.join(data, 'interties'), { recursive: true });
+    for (const [fy, days] of [
+      [2023, [dayFromYmd(2024, 3, 31)]],
+      [2024, [dayFromYmd(2024, 4, 1), dayFromYmd(2024, 4, 2)]],
+    ] as const) {
+      const map = new Map(
+        days.map((d) => {
+          const v = newIntertieDay();
+          v[intertieOffset(INTERTIE_INDEX.tohokuTokyo, INTERTIE_FIELD_INDEX.plan, 0)] = 1000;
+          return [d, v] as [number, Float64Array];
+        }),
+      );
+      await writeFile(path.join(data, 'interties', `fy${fy}.json`), JSON.stringify(encodeIntertieFy(fy, map)));
+    }
     await writeManifest(data, 'test');
   });
   afterAll(async () => {
@@ -324,6 +340,18 @@ describe('buildSingle（入札カーブ）', () => {
     const none = await embedded({ noCurves: true });
     expect(none.manifest.curves).toBeUndefined();
     expect([...none.files.keys()].some((f) => f.startsWith('curves/'))).toBe(false);
+  });
+
+  it('連系線の年度ファイルも、埋め込む年度の分だけ入れ、--no-interties では入れない', async () => {
+    const all = await embedded({});
+    expect(all.manifest.interties!.files.map((f) => f.file)).toEqual(['interties/fy2023.json', 'interties/fy2024.json']);
+    expect([...all.files.keys()].filter((f) => f.startsWith('interties/'))).toEqual(['interties/fy2023.json', 'interties/fy2024.json']);
+    const from = await embedded({ from: 2024 });
+    expect(from.manifest.interties).toMatchObject({ firstDate: '2024-04-01', lastDate: '2024-04-02' });
+    const none = await embedded({ noInterties: true });
+    expect(none.manifest.interties).toBeUndefined();
+    expect([...none.files.keys()].some((f) => f.startsWith('interties/'))).toBe(false);
+    expect(isDataFile('interties/fy2024.json')).toBe(true);
   });
 
   it('--split では取得済みのカーブをすべて data フォルダに書き出す', async () => {

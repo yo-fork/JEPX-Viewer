@@ -589,7 +589,8 @@ export class CurvesView extends View {
       this.curve.setEmpty(`${formatDay(date, true)} の入札カーブを読み込めませんでした。`);
       return;
     }
-    const flow = flowText(flowOfDay(this.ctx.ds, day, slot, cs.isDemo));
+    const ties = this.ctx.interties;
+    const flow = flowText(flowOfDay(this.ctx.ds, day, slot, cs.isDemo), ties ? (k) => ties.valueAt(this.ctx.ds, date, slot, k, 'plan') : null);
     this.flowNote.textContent = flow;
     this.flowNote.hidden = flow === '';
     const ac = this.resolveCurve(cs, date, slot);
