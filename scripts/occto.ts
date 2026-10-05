@@ -9,6 +9,7 @@
  */
 import { type EnvHttpProxyAgent, fetch } from 'undici';
 import { isoFromDay, parseDateString } from '../src/lib/dates';
+import { decodeCsvBytes } from '../src/lib/encoding';
 import type { OcctoCsvKind } from '../src/lib/occto';
 
 export const DEFAULT_OCCTO_BASE = 'https://occtonet3.occto.or.jp/public/dfw/RP11/OCCTO/SD/';
@@ -37,6 +38,14 @@ export function parseRange(text: string | undefined): [number, number] | null {
     .map((m) => parseDateString(`${m[1]}-${m[2]}-${m[3]}`))
     .filter((d): d is number => d !== null);
   return dates.length >= 2 ? [dates[0], dates[dates.length - 1]] : null;
+}
+
+/** CSV の代わりに返ってきた画面などの要点（題名か、タグを除いた先頭の 80 文字） */
+export function describeResponse(text: string): string {
+  const title = /<title[^>]*>([^<]*)<\/title>/i.exec(text)?.[1]?.replace(/\s+/g, ' ').trim();
+  if (title) return `題名「${title}」`;
+  const body = text.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+  return body ? `先頭「${body.slice(0, 80)}${body.length > 80 ? '…' : ''}」` : '中身が空';
 }
 
 export class OcctoClient {
@@ -123,10 +132,13 @@ export class OcctoClient {
     const check = await this.ajax('print', kind, from, to);
     const token = check.bizRoot?.header?.requestToken?.value ?? '';
     const ready = await this.ajax('ok', kind, from, to, { requestToken: token });
-    const h = ready.bizRoot?.header ?? {};
+    const h = ready?.bizRoot?.header ?? {};
     const downloadKey = h.downloadKey?.value;
-    if (!downloadKey) throw new Error('広域機関の画面から、ダウンロードの準備の応答がありませんでした');
+    if (!downloadKey) throw new Error(`広域機関の画面から、ダウンロードの準備の応答がありませんでした（応答: ${JSON.stringify(ready ?? null).slice(0, 120)}）`);
     const res = await this.send(`${this.base}${SCREEN}`, this.fields('download', kind, from, to, { downloadKey, requestToken: h.requestToken?.value ?? '' }));
-    return new Uint8Array(await res.arrayBuffer());
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    // 途中のネットワークでダウンロードが止められたときなどは、CSV ではなく画面が返ってくる
+    if ((res.headers.get('content-type') ?? '').includes('text/html')) throw new Error(`CSV ではなく画面が返ってきました（${describeResponse(decodeCsvBytes(bytes).text)}）`);
+    return bytes;
   }
 }

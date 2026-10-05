@@ -73,7 +73,7 @@ import {
   type OcctoCsvKind,
 } from '../src/lib/occto';
 import { absorbedOfDay, publishedAt } from '../src/lib/sensitivity';
-import { DEFAULT_OCCTO_BASE, OcctoClient, type OcctoRanges } from './occto';
+import { DEFAULT_OCCTO_BASE, describeResponse, OcctoClient, type OcctoRanges } from './occto';
 import { SENSITIVITY_KEYS, SERIES_COUNT, SERIES_INDEX, SLOTS, type SeriesKey } from '../src/lib/series';
 
 export const JEPX_SPOT_PAGE = 'https://www.jepx.jp/electricpower/market-data/spot/';
@@ -904,10 +904,25 @@ export function dayRuns(days: readonly number[], max: number): [number, number][
 
 /** 1 回に取得する日数（広域機関のサイトに負荷をかけないよう、1 か月ずつ） */
 const OCCTO_CHUNK_DAYS = 31;
+/** 1 日分ずつにしても続けて取得できなかったら、その種類の取得をやめる回数 */
+const OCCTO_MAX_FAILURES = 3;
+/** 取得した分を年度ファイルに書き出す間隔（途中で止めても、それまでの分が残るように） */
+const OCCTO_SAVE_INTERVAL_MS = 60_000;
+
+/** 連系線の CSV を読む。CSV でなければ、返ってきた中身の要点をエラーに付ける */
+function parseOcctoResponse(text: string) {
+  try {
+    return parseOcctoCsv(text);
+  } catch (err) {
+    throw new Error(`${(err as Error).message}（${describeResponse(text)}）`);
+  }
+}
 
 /**
  * 広域機関から連系線の計画潮流（翌日に策定した値）と潮流実績を取得し、連系線の年度ファイルに入れる。
- * 取得済みの日は取り直さない。潮流実績は、今日と昨日の分（まだ途中のことがある）だけは毎回取り直す
+ * 取得済みの日は取り直さない。潮流実績は、今日と昨日の分（まだ途中のことがある）だけは毎回取り直す。
+ * 取得できなかったときは、セッションを開き直し、1 回に取得する日数を半分にして取り直す
+ * （途中のネットワークで大きなダウンロードが止められ、そのあとの取得もできなくなる環境があったため）
  */
 async function fetchInterties(o: FetchOptions, dispatcher: EnvHttpProxyAgent, pace: () => Promise<void>): Promise<void> {
   const client = new OcctoClient(o.occtoBase, dispatcher);
@@ -926,9 +941,33 @@ async function fetchInterties(o: FetchOptions, dispatcher: EnvHttpProxyAgent, pa
     if (!m) stored.set(fy, (m = await readIntertieDays(o.out, fy)));
     return m;
   };
-  const touched = new Set<number>();
+  // まだ書き出していない年度
+  const unsaved = new Set<number>();
+  let savedAt = Date.now();
+  const save = async () => {
+    for (const fy of unsaved) {
+      const days = stored.get(fy)!;
+      if (days.size === 0) continue;
+      await mkdir(path.dirname(intertiePath(o.out, fy)), { recursive: true });
+      await writeFile(intertiePath(o.out, fy), JSON.stringify(encodeIntertieFy(fy, days)));
+    }
+    unsaved.clear();
+    savedAt = Date.now();
+  };
+  const reopen = async () => {
+    try {
+      await pace();
+      await client.open();
+      return true;
+    } catch (err) {
+      o.log(`連系線: 広域機関の系統情報サービスを開き直せなかったので、取得をやめます（${(err as Error).message}）`);
+      return false;
+    }
+  };
   const label: Record<OcctoCsvKind, string> = { plan: '計画潮流（翌日）', flow: '潮流実績' };
+  let alive = true;
   for (const kind of ['plan', 'flow'] as const) {
+    if (!alive) break;
     const avail = ranges[kind];
     const from = Math.max(o.intertiesFrom, avail?.[0] ?? Number.POSITIVE_INFINITY);
     const to = Math.min(o.intertiesTo, avail?.[1] ?? Number.NEGATIVE_INFINITY);
@@ -943,34 +982,50 @@ async function fetchInterties(o: FetchOptions, dispatcher: EnvHttpProxyAgent, pa
       if (o.force || !hasIntertieFields(vals, fields) || (kind === 'flow' && d >= today - 1)) need.push(d);
     }
     let got = 0;
-    for (const [a, b] of dayRuns(need, OCCTO_CHUNK_DAYS)) {
-      await pace();
-      const what = `連系線 ${label[kind]} ${isoFromDay(a)}〜${isoFromDay(b)}`;
-      try {
-        const bytes = await client.download(kind, a, b);
-        if (o.keepCsv) {
-          await mkdir(path.join(o.out, 'raw', 'interties'), { recursive: true });
-          await writeFile(path.join(o.out, 'raw', 'interties', `occto_${kind}_${ymd8(a)}_${ymd8(b)}.csv`), bytes);
+    // 1 回に取得する日数。取得できなければ半分にし、そのあともその日数で続ける
+    let size = OCCTO_CHUNK_DAYS;
+    let failures = 0;
+    runs: for (const [first, last] of dayRuns(need, OCCTO_CHUNK_DAYS)) {
+      for (let a = first; a <= last; ) {
+        const b = Math.min(last, a + size - 1);
+        await pace();
+        const what = `連系線 ${label[kind]} ${isoFromDay(a)}〜${isoFromDay(b)}`;
+        try {
+          const bytes = await client.download(kind, a, b);
+          if (o.keepCsv) {
+            await mkdir(path.join(o.out, 'raw', 'interties'), { recursive: true });
+            await writeFile(path.join(o.out, 'raw', 'interties', `occto_${kind}_${ymd8(a)}_${ymd8(b)}.csv`), bytes);
+          }
+          const res = parseOcctoResponse(decodeCsvBytes(bytes).text);
+          for (const [fy, part] of splitIntertieByFy(res.days)) {
+            mergeIntertieDays(await load(fy), part, fields);
+            unsaved.add(fy);
+          }
+          got += res.days.size;
+          failures = 0;
+          o.log(`${what}: ${res.days.size} 日${unknownLines(res.unknown)}`);
+          if (Date.now() - savedAt >= OCCTO_SAVE_INTERVAL_MS) await save();
+          a = b + 1;
+        } catch (err) {
+          const why = (err as Error).message;
+          if (b > a) {
+            size = Math.max(1, Math.floor((b - a + 1) / 2));
+            o.log(`${what}: 取得できませんでした（${why}）。セッションを開き直し、${size} 日ずつに分けて取り直します`);
+          } else {
+            o.log(`${what}: 取得できませんでした（${why}）`);
+            a = b + 1;
+            if (++failures >= OCCTO_MAX_FAILURES) {
+              o.log(`連系線: ${label[kind]}は、1 日分ずつでも ${failures} 回続けて取得できなかったので、取得をやめます`);
+              break runs;
+            }
+          }
+          if (!(alive = await reopen())) break runs;
         }
-        const res = parseOcctoCsv(decodeCsvBytes(bytes).text);
-        for (const [fy, part] of splitIntertieByFy(res.days)) {
-          mergeIntertieDays(await load(fy), part, fields);
-          touched.add(fy);
-        }
-        got += res.days.size;
-        o.log(`${what}: ${res.days.size} 日${unknownLines(res.unknown)}`);
-      } catch (err) {
-        o.log(`${what}: 取得できませんでした（${(err as Error).message}）`);
       }
     }
     o.log(`連系線: ${label[kind]} ${got} 日を取得、取得済み ${to - from + 1 - need.length} 日（広域機関）`);
   }
-  for (const fy of touched) {
-    const days = stored.get(fy)!;
-    if (days.size === 0) continue;
-    await mkdir(path.dirname(intertiePath(o.out, fy)), { recursive: true });
-    await writeFile(intertiePath(o.out, fy), JSON.stringify(encodeIntertieFy(fy, days)));
-  }
+  await save();
 }
 
 /** 出力先にある連系線の年度ファイルの一覧（無ければ undefined） */

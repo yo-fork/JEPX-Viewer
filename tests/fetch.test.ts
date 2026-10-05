@@ -148,6 +148,7 @@ async function occtoMock(req: IncomingMessage, res: ServerResponse): Promise<voi
   };
   if (url.pathname === '/occto/LOGIN_login') {
     occtoRequests.push('/occto/login');
+    occtoStuck = false;
     res.writeHead(200, { 'Set-Cookie': ['JSESSIONID=s1; Path=/', 'HSERVERID=h1; Path=/'], 'Content-Type': 'text/html' });
     res.end('<html><title>メニュー</title></html>');
     return;
@@ -186,11 +187,19 @@ async function occtoMock(req: IncomingMessage, res: ServerResponse): Promise<voi
       return;
     }
     if (sub === 'print') json({ confirmationMessage: { message: 'CSVを保存します。よろしいですか？' }, bizRoot: { header: { requestToken: { value: 't1' } } } });
-    else if (sub === 'ok' && params.get('requestToken') === 't1') json({ bizRoot: { header: { downloadKey: { value: 'k1' }, requestToken: { value: 't2' } } } });
+    else if (sub === 'ok' && params.get('requestToken') === 't1')
+      json(occtoStuck ? { bizRoot: { header: {} } } : { bizRoot: { header: { downloadKey: { value: 'k1' }, requestToken: { value: 't2' } } } });
     else json({ errMessage: [{ msgFormat: '不正な操作です。' }] });
     return;
   }
   if (sub === 'download' && params.get('downloadKey') === 'k1' && params.get('requestToken') === 't2') {
+    // 途中のネットワークに止められたことにして、画面を返す（そのあとはセッションを作り直すまで準備に応答しない）
+    if (occtoBlockOverDays !== null && to - from + 1 > occtoBlockOverDays) {
+      occtoStuck = true;
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end('<html><head><title>このダウンロードは止められました</title></head><body><p>管理者にお問い合わせください。</p></body></html>');
+      return;
+    }
     res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Disposition': 'attachment;filename=x.csv' });
     res.end(iconv.encode(kind === 'plan' ? occtoPlanCsv(from, to) : occtoFlowCsv(from, to), 'Shift_JIS'));
     return;
@@ -200,6 +209,10 @@ async function occtoMock(req: IncomingMessage, res: ServerResponse): Promise<voi
 
 /** 広域機関のまねへの通信（送った操作の順） */
 const occtoRequests: string[] = [];
+/** 広域機関のまね: この日数より長いダウンロードは、途中のネットワークに止められたことにする（null なら止めない） */
+let occtoBlockOverDays: number | null = null;
+/** 広域機関のまね: ダウンロードを止められたあとは、セッションを作り直すまで準備に応答しない */
+let occtoStuck = false;
 
 let server: Server;
 let baseUrl = '';
@@ -655,6 +668,58 @@ describe('データ取得スクリプト', () => {
     const second = occtoRequests.length;
     await run(opts);
     expect(occtoRequests.slice(second).filter((r) => r === '/occto/download')).toEqual([]);
+  });
+
+  /** 連系線だけを、2024-03-20〜04-05 の受渡分で取得する（公表されているのは、計画潮流が 3/25〜4/3、潮流実績が 4/1〜4/3） */
+  const intertiesOnly = (out: string, logs: string[]) => ({
+    ...defaultOptions(),
+    ...urls(),
+    from: 2024,
+    to: 2024,
+    out,
+    delayMs: 0,
+    curves: false,
+    sensitivity: false,
+    intertiesFrom: dayFromYmd(2024, 3, 20),
+    intertiesTo: dayFromYmd(2024, 4, 5),
+    log: (m: string) => logs.push(m),
+  });
+
+  it('連系線: 大きなダウンロードが止められる環境では、セッションを開き直し、1 回に取得する日数を減らして取り直す', async () => {
+    const out = path.join(workdir, 'interties-blocked');
+    const logs: string[] = [];
+    occtoBlockOverDays = 3;
+    try {
+      const manifest = await run(intertiesOnly(out, logs));
+      // 計画潮流は 10 日、5 日と止められ、2 日ずつにしてすべての日を取得する（潮流実績は 3 日なので、そのまま取得できる）
+      expect(logs.some((l) => l.includes('CSV ではなく画面が返ってきました（題名「このダウンロードは止められました」）'))).toBe(true);
+      expect(logs.filter((l) => l.includes('日ずつに分けて取り直します')).map((l) => /(\d+) 日ずつ/.exec(l)?.[1])).toEqual(['5', '2']);
+      expect(logs.some((l) => l.startsWith('連系線 計画潮流（翌日） 2024-04-02〜2024-04-03: 2 日'))).toBe(true);
+      expect(manifest.interties).toMatchObject({ firstDate: '2024-03-25', lastDate: '2024-04-03' });
+      const read = async (fy: number) => decodeIntertieFy(JSON.parse(await readFile(path.join(out, 'interties', `fy${fy}.json`), 'utf8')));
+      const days = new Map([...(await read(2023)), ...(await read(2024))]);
+      expect(days.size).toBe(10);
+      const d = dayFromYmd(2024, 4, 3);
+      const at = (f: IntertieField) => days.get(d)![intertieOffset(INTERTIE_INDEX.tohokuTokyo, INTERTIE_FIELD_INDEX[f], 5)];
+      expect([at('plan'), at('planFinal')]).toEqual([fixturePlan(d, 5), fixturePlan(d, 5) + 5]);
+    } finally {
+      occtoBlockOverDays = null;
+    }
+  });
+
+  it('連系線: 1 日分ずつでも続けて取得できなければ、その種類の取得をやめる', async () => {
+    const out = path.join(workdir, 'interties-down');
+    const logs: string[] = [];
+    occtoBlockOverDays = 0;
+    try {
+      const manifest = await run(intertiesOnly(out, logs));
+      expect(logs.filter((l) => l.includes('1 日分ずつでも 3 回続けて取得できなかったので、取得をやめます'))).toHaveLength(2);
+      // 計画潮流は 10 日、5 日、2 日のあとに 1 日分を 3 回、潮流実績は 3 日のあとに 1 日分を 3 回
+      expect(logs.filter((l) => l.includes('取得できませんでした'))).toHaveLength(10);
+      expect(manifest.interties).toBeUndefined();
+    } finally {
+      occtoBlockOverDays = null;
+    }
   });
 
   it('--from-dir: 広域機関の連系線の CSV（手元に保存したもの）も列名で見分けて、連系線の年度ファイルに入れる', async () => {
