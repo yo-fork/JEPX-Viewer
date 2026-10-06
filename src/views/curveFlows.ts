@@ -8,7 +8,7 @@ import type { CurveStore } from '../lib/curveStore';
 import { formatDay, slotRangeLabel, wallClockMs } from '../lib/dates';
 import { fmtNum } from '../lib/format';
 import { boundaryFlow, boundaryName, FLOW_FAILURE_TEXT, groupName, signedFlow, type BoundaryFlow, type FlowFailure } from '../lib/interties';
-import { crossingFlows, INTERTIE_DEFS, INTERTIE_INDEX, type IntertieKey } from '../lib/occto';
+import { crossingFlows, INTERTIE_DEFS, INTERTIE_INDEX, intertieTitle, type IntertieKey } from '../lib/occto';
 import { kwhToMw, SERIES_INDEX, SERIES_LABEL, SLOTS, type AreaKey, type SeriesKey } from '../lib/series';
 import type { Selection } from '../lib/select';
 import type { Dataset } from '../lib/store';
@@ -87,8 +87,9 @@ export function flowText(
   if (cross.length > 0) {
     const items = cross.map((c) => {
       const d = INTERTIE_DEFS[INTERTIE_INDEX[c.key]];
-      if (c.plan === 0) return `${d.label} 0 MW`;
-      return c.plan > 0 ? `${d.label} ${fmtNum(c.plan)} MW（${names(d.from)} → ${names(d.to)}）` : `${d.label} ${fmtNum(-c.plan)} MW（${names(d.to)} → ${names(d.from)}）`;
+      const name = intertieTitle(c.key);
+      if (c.plan === 0) return `${name} 0 MW`;
+      return c.plan > 0 ? `${name} ${fmtNum(c.plan)} MW（${names(d.from)} → ${names(d.to)}）` : `${name} ${fmtNum(-c.plan)} MW（${names(d.to)} → ${names(d.from)}）`;
     });
     text += `広域機関が公表している翌日の計画潮流では、境をまたぐ連系線は ${items.join('、')}です。`;
   }

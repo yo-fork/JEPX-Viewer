@@ -23,35 +23,39 @@ export interface IntertieDef {
   label: string;
   /** 広域機関の CSV の連系線（設備）の名前 */
   name: string;
+  /** name が設備の名前か（画面では区間の名前のあとに並べる。フェンスと関西-中国間の内訳は、区間の名前と同じなので並べない） */
+  facility?: boolean;
   /** 順方向に送る側と受ける側のエリア */
   from: readonly AreaKey[];
   to: readonly AreaKey[];
 }
 
 /**
- * 地域間連系線。中地域（中部・北陸・関西）は 2026 年 3 月 13 日から、個別の連系線ではなくフェンス（中部・北陸・関西フェンス）で
- * 運用容量などを管理する（それより前の計画潮流は個別の連系線にある）。関西-中国（東・西）は関西-中国間の内訳
+ * 地域間連系線。中地域（中部・北陸・関西）は 2026 年 3 月 14 日受渡分から、個別の連系線（中部-関西間、中部-北陸間、北陸-関西間）ではなく
+ * フェンスで運用容量などを管理する。中部フェンスと関西フェンスは 3 月 13 日受渡分から（この日だけ個別の連系線と両方ある）、
+ * 北陸フェンスはそれより前からある。関西-中国（東・西）は関西-中国間の内訳
  */
 export const INTERTIE_DEFS = [
-  { key: 'hokkaidoHonshu', label: '北海道-本州間', name: '北海道・本州間電力連系設備', from: ['hokkaido'], to: ['tohoku'] },
-  { key: 'tohokuTokyo', label: '東北-東京間', name: '相馬双葉幹線', from: ['tohoku'], to: ['tokyo'] },
-  { key: 'tokyoChubu', label: '東京-中部間', name: '周波数変換設備', from: ['tokyo'], to: ['chubu'] },
+  { key: 'hokkaidoHonshu', label: '北海道-本州間', name: '北海道・本州間電力連系設備', facility: true, from: ['hokkaido'], to: ['tohoku'] },
+  { key: 'tohokuTokyo', label: '東北-東京間', name: '相馬双葉幹線', facility: true, from: ['tohoku'], to: ['tokyo'] },
+  { key: 'tokyoChubu', label: '東京-中部間', name: '周波数変換設備', facility: true, from: ['tokyo'], to: ['chubu'] },
   { key: 'chubuFence', label: '中部-北陸・関西間（中部フェンス）', name: '中部フェンス', from: ['chubu'], to: ['hokuriku', 'kansai'] },
   { key: 'hokurikuFence', label: '中部・関西-北陸間（北陸フェンス）', name: '北陸フェンス', from: ['chubu', 'kansai'], to: ['hokuriku'] },
   { key: 'kansaiFence', label: '中部・北陸-関西間（関西フェンス）', name: '関西フェンス', from: ['chubu', 'hokuriku'], to: ['kansai'] },
-  { key: 'chubuKansai', label: '中部-関西間', name: '三重東近江線', from: ['chubu'], to: ['kansai'] },
-  { key: 'chubuHokuriku', label: '中部-北陸間', name: '南福光連系所・南福光変電所の連系設備', from: ['chubu'], to: ['hokuriku'] },
-  { key: 'hokurikuKansai', label: '北陸-関西間', name: '越前嶺南線', from: ['hokuriku'], to: ['kansai'] },
-  { key: 'kansaiChugoku', label: '関西-中国間', name: '西播東岡山線・山崎智頭線', from: ['kansai'], to: ['chugoku'] },
+  { key: 'chubuKansai', label: '中部-関西間', name: '三重東近江線', facility: true, from: ['chubu'], to: ['kansai'] },
+  { key: 'chubuHokuriku', label: '中部-北陸間', name: '南福光連系所・南福光変電所の連系設備', facility: true, from: ['chubu'], to: ['hokuriku'] },
+  { key: 'hokurikuKansai', label: '北陸-関西間', name: '越前嶺南線', facility: true, from: ['hokuriku'], to: ['kansai'] },
+  { key: 'kansaiChugoku', label: '関西-中国間', name: '西播東岡山線・山崎智頭線', facility: true, from: ['kansai'], to: ['chugoku'] },
   { key: 'kansaiChugokuEast', label: '関西-中国間（東）', name: '関西-中国（東）', from: ['kansai'], to: ['chugoku'] },
   { key: 'kansaiChugokuWest', label: '関西-中国間（西）', name: '関西-中国（西）', from: ['kansai'], to: ['chugoku'] },
-  { key: 'kansaiShikoku', label: '関西-四国間', name: '阿南紀北直流幹線', from: ['kansai'], to: ['shikoku'] },
-  { key: 'chugokuShikoku', label: '中国-四国間', name: '本四連系線', from: ['chugoku'], to: ['shikoku'] },
-  { key: 'chugokuKyushu', label: '中国-九州間', name: '関門連系線', from: ['chugoku'], to: ['kyushu'] },
+  { key: 'kansaiShikoku', label: '関西-四国間', name: '阿南紀北直流幹線', facility: true, from: ['kansai'], to: ['shikoku'] },
+  { key: 'chugokuShikoku', label: '中国-四国間', name: '本四連系線', facility: true, from: ['chugoku'], to: ['shikoku'] },
+  { key: 'chugokuKyushu', label: '中国-九州間', name: '関門連系線', facility: true, from: ['chugoku'], to: ['kyushu'] },
 ] as const satisfies readonly {
   key: string;
   label: string;
   name: string;
+  facility?: boolean;
   from: readonly AreaKey[];
   to: readonly AreaKey[];
 }[];
@@ -59,6 +63,12 @@ export const INTERTIE_DEFS = [
 export type IntertieKey = (typeof INTERTIE_DEFS)[number]['key'];
 export const INTERTIE_KEYS: IntertieKey[] = INTERTIE_DEFS.map((d) => d.key);
 export const INTERTIE_INDEX = Object.fromEntries(INTERTIE_KEYS.map((k, i) => [k, i])) as Record<IntertieKey, number>;
+
+/** 画面に出す連系線の名前（区間の名前のあとに設備の名前。例: 関西-四国間（阿南紀北直流幹線）） */
+export function intertieTitle(key: IntertieKey): string {
+  const d: IntertieDef = INTERTIE_DEFS[INTERTIE_INDEX[key]];
+  return d.facility ? `${d.label}（${d.name}）` : d.label;
+}
 const BY_NAME = new Map<string, number>(INTERTIE_DEFS.map((d, i) => [d.name, i]));
 
 /** 連系線ごとに持つ値（MW。逆方向の上限・運用容量は負） */

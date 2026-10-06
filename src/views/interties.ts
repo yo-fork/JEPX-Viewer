@@ -6,7 +6,7 @@ import { aggregateBySlot } from '../lib/aggregate';
 import { formatDay, slotRangeLabel, slotStartLabel } from '../lib/dates';
 import { fmtNum, fmtPct, fmtSigned } from '../lib/format';
 import type { IntertieStore } from '../lib/intertieStore';
-import { atLimit, INTERTIE_DEFS, INTERTIE_INDEX, OCCTO_SOURCE, type IntertieField, type IntertieKey } from '../lib/occto';
+import { atLimit, INTERTIE_DEFS, INTERTIE_INDEX, intertieTitle, OCCTO_SOURCE, type IntertieDef, type IntertieField, type IntertieKey } from '../lib/occto';
 import { SERIES_LABEL, SLOTS, type AreaKey } from '../lib/series';
 import type { Selection } from '../lib/select';
 import { accMean } from '../lib/stats';
@@ -22,7 +22,9 @@ import { CURVE_GRAN_OPTIONS, curveGranularity, granText, namedTooltip, slotZoom 
 import { buildGrid, colorRange, gridTable, heatmapHeight, heatmapOption } from './heatmap';
 import { breakGaps, buildSeriesPoints, periodLabel, TIME_AXIS_LABEL } from './timeseries';
 
-const def = (key: IntertieKey) => INTERTIE_DEFS[INTERTIE_INDEX[key]];
+const def = (key: IntertieKey): IntertieDef => INTERTIE_DEFS[INTERTIE_INDEX[key]];
+/** 概要の図の縦軸の名前（設備の名前は 2 行目に小さく） */
+const axisName = (key: IntertieKey) => (def(key).facility ? `${def(key).label}\n{f|${def(key).name}}` : def(key).label);
 const areaNames = (areas: readonly AreaKey[]) => areas.map((a) => SERIES_LABEL[a]).join('・');
 /** 順方向・逆方向の向きの説明（「東北 → 東京」） */
 const forward = (key: IntertieKey) => `${areaNames(def(key).from)} → ${areaNames(def(key).to)}`;
@@ -99,7 +101,7 @@ export class IntertiesView extends View {
     }
     const lines = st.linesWithData(ds, sel.from, sel.to);
     this.line.setOptions(
-      lines.map((k) => ({ value: k, label: def(k).label })),
+      lines.map((k) => ({ value: k, label: intertieTitle(k) })),
       lines.includes(state.intertie) ? state.intertie : (lines[0] ?? state.intertie),
     );
     if (lines.length === 0) {
@@ -149,7 +151,7 @@ export class IntertiesView extends View {
     const t = TOKENS[theme];
     const stats = lines.map((k) => this.stat(st, sel, k)).filter((x) => x.n > 0);
     this.overviewKeys = stats.map((x) => x.key);
-    this.overview.setHeight(Math.max(240, stats.length * 30 + 100));
+    this.overview.setHeight(Math.max(240, stats.length * 38 + 100));
     this.overview.setSubtitle(
       `${describeSelection(sel, state)}・計画潮流（翌日）が順方向・逆方向の上限に達したコマの割合（上限との差が 0.5 MW 以内）・押すとその連系線を選びます`,
     );
@@ -167,14 +169,20 @@ export class IntertiesView extends View {
             const x = stats[ps[0]?.dataIndex ?? -1];
             if (!x) return '';
             return (
-              ttHeader(def(x.key).label) +
+              ttHeader(intertieTitle(x.key)) +
               ttRow(colors[0], fmtPct(x.fwd / x.n), `順方向（${forward(x.key)}）で上限（${fmtNum(x.fwd)} コマ）`, 'rect') +
               ttRow(colors[1], fmtPct(x.rev / x.n), `逆方向（${backward(x.key)}）で上限（${fmtNum(x.rev)} コマ）`, 'rect') +
               ttNote(`計画潮流の平均 ${fmtSigned(x.mean, 0)} MW・${fmtNum(x.n)} コマ`)
             );
           },
         },
-        yAxis: { type: 'category', inverse: true, data: stats.map((x) => def(x.key).label), axisTick: { show: false } },
+        yAxis: {
+          type: 'category',
+          inverse: true,
+          data: stats.map((x) => x.key),
+          axisTick: { show: false },
+          axisLabel: { interval: 0, lineHeight: 16, formatter: (key: IntertieKey) => axisName(key), rich: { f: { fontSize: 11, lineHeight: 14, color: t.muted } } },
+        },
         xAxis: { type: 'value', name: '%', min: 0, axisLabel: { formatter: (v: number) => `${v}` } },
         series: [
           { name: names[0], type: 'bar', stack: 'limit', barMaxWidth: 18, itemStyle: { color: colors[0] }, data: stats.map((x) => pct(x.fwd, x.n)) },
@@ -190,7 +198,7 @@ export class IntertiesView extends View {
       },
       {
         columns: ['連系線', '順方向', 'コマ数', '順方向で上限（%）', '逆方向で上限（%）', '順方向で上限（コマ）', '逆方向で上限（コマ）', '計画潮流の平均（MW）'],
-        rows: stats.map((x) => [def(x.key).label, forward(x.key), x.n, pct(x.fwd, x.n), pct(x.rev, x.n), x.fwd, x.rev, x.mean]),
+        rows: stats.map((x) => [intertieTitle(x.key), forward(x.key), x.n, pct(x.fwd, x.n), pct(x.rev, x.n), x.fwd, x.rev, x.mean]),
         digits: [null, null, 0, 1, 1, 0, 0, 0],
         filename: `jepx_interties_congestion_${rangeTag(sel)}.csv`,
       },
@@ -206,7 +214,7 @@ export class IntertiesView extends View {
     const raw = buildSeriesPoints(sel, TREND_LINES.map((l) => ({ a: st.array(ds, key, l.field) })), gran, 'mean');
     // 値の無い種類（潮流実績は 2025 年 4 月から）は出さない
     const shown = TREND_LINES.map((l, i) => ({ ...l, points: raw[i].points })).filter((l) => l.points.some((p) => Number.isFinite(p[1])));
-    this.trend.setTitle(`${def(key).label}の計画潮流と上限の推移`);
+    this.trend.setTitle(`${intertieTitle(key)}の計画潮流と上限の推移`);
     this.trend.setSubtitle(`${describeSelection(sel, state)}・MW（正は順方向: ${forward(key)}）、${granText(gran)}`);
     const names = shown.map((l) => l.name);
     const ends = endLabels(names, shown.map((l) => l.points.map((p) => p[1])), theme, 260);
@@ -336,7 +344,7 @@ export class IntertiesView extends View {
     const { ds, state, theme } = this.ctx;
     const t = TOKENS[theme];
     const g = buildGrid(sel, { a: st.array(ds, key, 'plan') }, 'dateSlot');
-    this.heat.setTitle(`${def(key).label}の計画潮流（翌日）のヒートマップ`);
+    this.heat.setTitle(`${intertieTitle(key)}の計画潮流（翌日）のヒートマップ`);
     if (g.cells.length === 0) {
       this.heat.setEmpty('選択した期間に、この連系線の計画潮流がありません。');
       return;

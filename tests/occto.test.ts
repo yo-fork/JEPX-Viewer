@@ -12,6 +12,7 @@ import {
   INTERTIE_FIELD_INDEX,
   INTERTIE_INDEX,
   intertieOffset,
+  intertieTitle,
   mergeIntertieDays,
   newIntertieDay,
   occtoCsvKind,
@@ -93,6 +94,15 @@ describe('広域機関の連系線の CSV', () => {
     expect(atLimit(1000, 5440, -2318)).toBe(0);
     expect(atLimit(0, 280, 0)).toBe(0);
     expect(Number.isNaN(atLimit(Number.NaN, 1, -1))).toBe(true);
+  });
+});
+
+describe('連系線の名前', () => {
+  it('区間の名前のあとに設備の名前を並べる（フェンスと関西-中国間の内訳は区間の名前だけ）', () => {
+    expect(intertieTitle('kansaiShikoku')).toBe('関西-四国間（阿南紀北直流幹線）');
+    expect(intertieTitle('tokyoChubu')).toBe('東京-中部間（周波数変換設備）');
+    expect(intertieTitle('chubuFence')).toBe('中部-北陸・関西間（中部フェンス）');
+    expect(intertieTitle('kansaiChugokuEast')).toBe('関西-中国間（東）');
   });
 });
 
