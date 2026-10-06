@@ -922,7 +922,7 @@ function parseOcctoResponse(text: string) {
  * 広域機関から連系線の計画潮流（翌日に策定した値）と潮流実績を取得し、連系線の年度ファイルに入れる。
  * 取得済みの日は取り直さない。潮流実績は、今日と昨日の分（まだ途中のことがある）だけは毎回取り直す。
  * 取得できなかったときは、セッションを開き直し、1 回に取得する日数を半分にして取り直す
- * （途中のネットワークで大きなダウンロードが止められ、そのあとの取得もできなくなる環境があったため）
+ * （取得を続けると、途中から CSV ではない応答が返り、そのあとの取得もできなくなる環境があったため）
  */
 async function fetchInterties(o: FetchOptions, dispatcher: EnvHttpProxyAgent, pace: () => Promise<void>): Promise<void> {
   const client = new OcctoClient(o.occtoBase, dispatcher);
