@@ -7,14 +7,14 @@ import { formatDay, slotRangeLabel, slotStartLabel } from '../lib/dates';
 import { fmtNum, fmtPct, fmtSigned } from '../lib/format';
 import type { IntertieStore } from '../lib/intertieStore';
 import { atLimit, INTERTIE_DEFS, INTERTIE_INDEX, intertieTitle, OCCTO_SOURCE, type IntertieDef, type IntertieField, type IntertieKey } from '../lib/occto';
-import { SERIES_LABEL, SLOTS, type AreaKey } from '../lib/series';
+import { AREA_KEYS, AREAS, SERIES_LABEL, SLOTS, type AreaKey } from '../lib/series';
 import type { Selection } from '../lib/select';
 import { accMean } from '../lib/stats';
 import type { TrendGran } from '../state';
 import type { ChartCard } from '../ui/card';
 import { segmented, selectField, toolbar, type Segmented, type SelectField } from '../ui/controls';
 import { h } from '../ui/dom';
-import { TOKENS } from '../ui/theme';
+import { seriesColor, seriesDashed, TOKENS } from '../ui/theme';
 import { ttHeader, ttNote, ttRow } from '../ui/tooltip';
 import { NO_DATA, View } from './base';
 import { describeSelection, endLabels, grid, labelRoom, lineLegend, rangeTag, slotAxis, styledLine, valueAxis } from './common';
@@ -58,6 +58,10 @@ export class IntertiesView extends View {
   private profile!: ChartCard;
   private congestion!: ChartCard;
   private heat!: ChartCard;
+  private net!: ChartCard;
+  private netGran!: Segmented<TrendGran>;
+  private netHeat!: ChartCard;
+  private netArea!: SelectField<AreaKey>;
   /** 概要の図の棒の連系線（押した棒から引く） */
   private overviewKeys: IntertieKey[] = [];
 
@@ -78,13 +82,21 @@ export class IntertiesView extends View {
     this.profile = this.card(g, { title: '時間帯別の平均', height: 320 });
     this.congestion = this.card(g, { title: '時間帯別の、上限に達したコマの割合', height: 320 });
     this.heat = this.card(g, { title: '計画潮流（翌日）のヒートマップ', height: 480, wide: true });
+    this.net = this.card(g, { title: 'エリアごとの正味の受け入れ量の推移', height: 360, wide: true });
+    this.netGran = segmented('粒度', CURVE_GRAN_OPTIONS, s.intertieGran, (v) => this.set({ intertieGran: v }));
+    this.net.addControls(this.netGran.el);
+    this.netHeat = this.card(g, { title: 'エリアの正味の受け入れ量のヒートマップ', height: 480, wide: true });
+    this.netArea = selectField<AreaKey>('エリア', AREAS.map((a) => ({ value: a.key, label: a.label })), s.intertieArea, (v) => this.set({ intertieArea: v }));
+    this.netHeat.addControls(this.netArea.el);
   }
 
   protected render(): void {
     const { sel, ds, state } = this.ctx;
     const st = this.ctx.interties;
-    const cards = [this.overview, this.trend, this.profile, this.congestion, this.heat];
+    const cards = [this.overview, this.trend, this.profile, this.congestion, this.heat, this.net, this.netHeat];
     this.gran.set(state.intertieGran);
+    this.netGran.set(state.intertieGran);
+    this.netArea.set(state.intertieArea);
     if (!st) {
       this.note.textContent = '連系線のデータがありません。npm run fetch を実行すると、電力広域的運営推進機関（広域機関）から計画潮流と潮流実績を取得します。';
       this.line.setOptions([], state.intertie);
@@ -94,7 +106,8 @@ export class IntertiesView extends View {
     this.note.textContent =
       `${st.isDemo ? 'デモの値（デモデータのエリア価格から合成したもので、実際の値ではありません）。' : `${OCCTO_SOURCE}。データは ${formatDay(st.first)}〜${formatDay(st.last)} にあります。`}` +
       '計画潮流（翌日）は前日に策定した値（スポット市場の約定で使った量を含む）、計画潮流（最終）は時間前市場などで変わった後の値、潮流実績は実際に流れた量（5 分ごとの値の 30 分の平均）です。' +
-      '上限は「運用容量 − マージン − 広域調整枠」で、計画潮流が上限に達すると市場分断が起きます。正の値は順方向（連系線の名前の前の側から後ろの側）です。';
+      '上限は「運用容量 − マージン − 広域調整枠」で、計画潮流が上限に達すると市場分断が起きます。正の値は順方向（連系線の名前の前の側から後ろの側）です。' +
+      'エリアの正味の受け入れ量は、そのエリアにつながる連系線の計画潮流（翌日）を足し引きしたもので、スポット市場で約定した買い − 売り（ブロック入札も含む）にあたります（正は受け入れ、負は送り出し）。';
     if (sel.days.length === 0) {
       cards.forEach((c) => c.setEmpty(NO_DATA));
       return;
@@ -114,6 +127,8 @@ export class IntertiesView extends View {
     this.renderProfile(st, sel, key);
     this.renderCongestion(st, sel, key);
     this.renderHeat(st, sel, key);
+    this.renderNet(st, sel);
+    this.renderNetHeat(st, sel);
   }
 
   /** 上限に達したかどうか（1: 順方向、−1: 逆方向、0: 達していない、NaN: 値が無い）をコマごとに */
@@ -355,6 +370,69 @@ export class IntertiesView extends View {
     this.heat.setOption(
       heatmapOption(g, { theme, min, max, colors: t.div, precision: 0, fmt: (v) => `${fmtSigned(v, 0)} MW`, valueLabel: '計画潮流（翌日）' }),
       gridTable(g, `jepx_intertie_${key}_heatmap_${rangeTag(sel)}.csv`),
+    );
+  }
+
+  /** エリアごとの正味の受け入れ量（計画潮流（翌日）を足し引きしたもの）の推移 */
+  private renderNet(st: IntertieStore, sel: Selection): void {
+    const { ds, state, theme } = this.ctx;
+    const gran = curveGranularity(sel, state.intertieGran);
+    const zoom = slotZoom(gran);
+    const net = st.netImports(ds);
+    const raw = buildSeriesPoints(sel, AREA_KEYS.map((a) => ({ a: net[a] })), gran, 'mean');
+    const shown = AREA_KEYS.map((a, i) => ({ name: SERIES_LABEL[a], color: seriesColor(a, theme), dashed: seriesDashed(a), points: raw[i].points })).filter((l) =>
+      l.points.some((p) => Number.isFinite(p[1])),
+    );
+    if (shown.length === 0) {
+      this.net.setEmpty('選択した期間に、エリアの受け入れ量を求められる計画潮流がありません。');
+      return;
+    }
+    this.net.setSubtitle(`${describeSelection(sel, state)}・MW（正は受け入れ、負は送り出し）、${granText(gran)}`);
+    const names = shown.map((l) => l.name);
+    this.net.setOption(
+      {
+        grid: grid({ right: 24, bottom: zoom.bottom }),
+        legend: lineLegend(shown.map((l) => ({ name: l.name, dashed: l.dashed }))),
+        ...(zoom.dataZoom ? { dataZoom: zoom.dataZoom } : {}),
+        tooltip: {
+          trigger: 'axis',
+          formatter: namedTooltip(
+            names,
+            shown.map((l) => l.color),
+            (p) => periodLabel(Number((p.value as number[])[0]), gran),
+            (v) => `${fmtSigned(v, 0)} MW`,
+            shown.map((l) => l.dashed),
+          ),
+        },
+        xAxis: { type: 'time', axisLabel: TIME_AXIS_LABEL },
+        yAxis: valueAxis('MW'),
+        series: shown.map((l) => styledLine(l.name, l.color, theme, gran === 'slot' ? breakGaps(l.points) : l.points, l.dashed, { sampling: 'lttb' })),
+      },
+      {
+        columns: ['期間', ...names.map((n) => `${n}（MW）`)],
+        rows: (shown[0]?.points ?? []).map((p, r) => [periodLabel(p[0], gran), ...shown.map((l) => l.points[r][1])]),
+        digits: [null, ...names.map(() => 1)],
+        filename: `jepx_intertie_net_${rangeTag(sel)}.csv`,
+      },
+    );
+  }
+
+  private renderNetHeat(st: IntertieStore, sel: Selection): void {
+    const { ds, state, theme } = this.ctx;
+    const t = TOKENS[theme];
+    const area = state.intertieArea;
+    const g = buildGrid(sel, { a: st.netImports(ds)[area] }, 'dateSlot');
+    this.netHeat.setTitle(`${SERIES_LABEL[area]}の正味の受け入れ量のヒートマップ`);
+    if (g.cells.length === 0) {
+      this.netHeat.setEmpty('選択した期間に、このエリアの受け入れ量を求められる計画潮流がありません。');
+      return;
+    }
+    this.netHeat.setSubtitle(`${describeSelection(sel, state)}・MW（赤は受け入れ、青は送り出し）${g.note ? `・${g.note}` : ''}`);
+    const [min, max] = colorRange(g, true);
+    this.netHeat.setHeight(heatmapHeight(g));
+    this.netHeat.setOption(
+      heatmapOption(g, { theme, min, max, colors: t.div, precision: 0, fmt: (v) => `${fmtSigned(v, 0)} MW`, valueLabel: '正味の受け入れ量' }),
+      gridTable(g, `jepx_intertie_net_${area}_heatmap_${rangeTag(sel)}.csv`),
     );
   }
 }

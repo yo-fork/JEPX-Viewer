@@ -4,6 +4,7 @@ import { dayFromYmd } from '../src/lib/dates';
 import { generateDemoDays } from '../src/lib/demo';
 import { IntertieStore } from '../src/lib/intertieStore';
 import {
+  areaNetImports,
   atLimit,
   crossingFlows,
   decodeIntertieFy,
@@ -127,7 +128,65 @@ describe('市場分断の境をまたぐ連系線', () => {
   });
 });
 
+/** 中地域の外の連系線の計画潮流（試験用。負は逆方向） */
+const OUTER_PLANS: Partial<Record<IntertieKey, number>> = {
+  hokkaidoHonshu: 300,
+  tohokuTokyo: 5000,
+  tokyoChubu: -900,
+  kansaiChugoku: -2000,
+  kansaiShikoku: -1000,
+  chugokuShikoku: 200,
+  chugokuKyushu: -2500,
+};
+
+describe('エリアごとの正味の受け入れ量', () => {
+  const plans = (v: Partial<Record<IntertieKey, number>>) => (k: IntertieKey) => v[k] ?? Number.NaN;
+  const sum = (net: Record<AreaKey, number>) => Object.values(net).reduce((a, b) => a + b, 0);
+
+  it('エリアにつながる連系線の計画潮流を足し引きし、全エリアの合計は 0 になる（個別の連系線があれば、フェンスと関西-中国間の内訳は使わない）', () => {
+    const net = areaNetImports(
+      plans({ ...OUTER_PLANS, chubuKansai: 1500, chubuHokuriku: 300, hokurikuKansai: 100, chubuFence: 9999, hokurikuFence: 9999, kansaiFence: 9999, kansaiChugokuEast: 777 }),
+    );
+    expect(net).toEqual({ hokkaido: -300, tohoku: -4700, tokyo: 5900, chubu: -2700, hokuriku: 200, kansai: 4600, chugoku: 300, shikoku: -800, kyushu: -2500 });
+    expect(sum(net)).toBe(0);
+  });
+
+  it('個別の連系線が無ければ、中部フェンスを中部の送り出し、北陸フェンスと関西フェンスをそれぞれの受け入れにする', () => {
+    const net = areaNetImports(plans({ ...OUTER_PLANS, chubuFence: 1800, hokurikuFence: 300, kansaiFence: 1500 }));
+    expect([net.chubu, net.hokuriku, net.kansai]).toEqual([-2700, 300, 4500]);
+    expect(sum(net)).toBe(0);
+  });
+
+  it('値の無い連系線につながるエリアだけ NaN', () => {
+    const { chugokuKyushu: _drop, ...rest } = OUTER_PLANS;
+    const net = areaNetImports(plans({ ...rest, chubuFence: 1800, hokurikuFence: 300, kansaiFence: 1500 }));
+    expect([Number.isNaN(net.kyushu), Number.isNaN(net.chugoku), net.shikoku]).toEqual([true, true, -800]);
+  });
+});
+
 describe('連系線のデータ（ブラウザ側）', () => {
+  it('エリアごとの正味の受け入れ量を、コマごとに連系線の計画潮流から求める', async () => {
+    const day = dayFromYmd(2026, 9, 21);
+    const v = newIntertieDay();
+    const set = (k: IntertieKey, x: number) => (v[intertieOffset(INTERTIE_INDEX[k], INTERTIE_FIELD_INDEX.plan, 5)] = x);
+    for (const [k, x] of Object.entries(OUTER_PLANS)) set(k as IntertieKey, x);
+    set('chubuFence', 1800);
+    set('hokurikuFence', 300);
+    set('kansaiFence', 1500);
+    const json = JSON.parse(JSON.stringify(encodeIntertieFy(2026, new Map([[day, v]]))));
+    const index = { firstDate: '2026-09-21', lastDate: '2026-09-21', files: [{ fy: 2026, file: 'interties/fy2026.json', firstDate: '2026-09-21', lastDate: '2026-09-21', days: 1 }] };
+    const st = IntertieStore.fromIndex(index, async () => json)!;
+    await st.ensure(day, day);
+    const ds = new DataStore();
+    ds.addDays(generateDemoDays(dayFromYmd(2026, 9, 20), dayFromYmd(2026, 9, 22), 1), 'bundled');
+    const dataset = ds.dataset()!;
+    const net = st.netImports(dataset);
+    const k = (day - dataset.start) * SLOTS + 5;
+    expect([net.tokyo[k], net.chubu[k], net.kansai[k]]).toEqual([5900, -2700, 4500]);
+    // 値の無いコマと、データの無い日は NaN
+    expect([Number.isNaN(net.tokyo[k - 1]), Number.isNaN(net.tokyo[k - SLOTS])]).toEqual([true, true]);
+  });
+
   it('年度ファイルを必要なときに読み、Dataset の日の並びにそろえる', async () => {
     const plan = parseOcctoCsv(PLAN_CSV).days;
     const reads: string[] = [];

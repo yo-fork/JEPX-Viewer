@@ -6,16 +6,18 @@ import type { IntertieIndex } from './dataFile';
 import { fiscalYearEnd, fiscalYearStart, parseDateString } from './dates';
 import { mulberry32 } from './demo';
 import {
+  areaNetImports,
   decodeIntertieFy,
   INTERTIE_DEFS,
   INTERTIE_FIELD_INDEX,
   INTERTIE_INDEX,
+  INTERTIE_KEYS,
   intertieOffset,
   type IntertieDays,
   type IntertieField,
   type IntertieKey,
 } from './occto';
-import { SERIES_INDEX, SLOTS, type AreaKey } from './series';
+import { AREA_KEYS, SERIES_INDEX, SLOTS, type AreaKey } from './series';
 import type { Dataset } from './store';
 
 export type ReadFile = (file: string) => Promise<unknown>;
@@ -47,6 +49,7 @@ export class IntertieStore {
   private readonly loadedFy = new Set<number>();
   private readonly pendingFy = new Map<number, Promise<void>>();
   private readonly aligned = new Map<string, Float64Array>();
+  private net: { key: string; value: Record<AreaKey, Float64Array> } | null = null;
   private version = 0;
 
   private constructor(
@@ -125,6 +128,23 @@ export class IntertieStore {
     if (this.aligned.size > 60) this.aligned.clear();
     this.aligned.set(key, out);
     return out;
+  }
+
+  /** エリアごとの正味の受け入れ量（MW、Dataset の日の並び × 48。計画潮流（翌日）から occto.ts の areaNetImports で求める） */
+  netImports(ds: Dataset): Record<AreaKey, Float64Array> {
+    const key = `${ds.start}|${ds.n}|${this.version}`;
+    if (this.net?.key === key) return this.net.value;
+    const plans = new Map(INTERTIE_KEYS.map((k) => [k, this.array(ds, k, 'plan')]));
+    const value = Object.fromEntries(AREA_KEYS.map((a) => [a, new Float64Array(ds.n * SLOTS).fill(Number.NaN)])) as Record<AreaKey, Float64Array>;
+    // データのある期間だけ求める
+    const from = Math.max(this.first, ds.start) - ds.start;
+    const to = Math.min(this.last, ds.start + ds.n - 1) - ds.start;
+    for (let k = from * SLOTS; k < (to + 1) * SLOTS; k++) {
+      const net = areaNetImports((line) => plans.get(line)![k]);
+      for (const a of AREA_KEYS) value[a][k] = net[a];
+    }
+    this.net = { key, value };
+    return value;
   }
 
   /** その日・コマの値（無ければ NaN） */

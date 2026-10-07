@@ -132,6 +132,8 @@ export interface AppState {
   intertie: IntertieKey;
   /** 連系線のタブの推移の図の粒度 */
   intertieGran: TrendGran;
+  /** 連系線のタブの、正味の受け入れ量のヒートマップで見るエリア */
+  intertieArea: AreaKey;
   yearMetric: YearMetric;
   tableUnit: TableUnit;
   tableKind: TableKind;
@@ -179,6 +181,7 @@ export const DEFAULT_STATE: AppState = {
   curveGran: 'auto',
   intertie: 'tohokuTokyo',
   intertieGran: 'auto',
+  intertieArea: 'tokyo',
   yearMetric: 'mean',
   tableUnit: 'month',
   tableKind: 'areas',
@@ -292,6 +295,7 @@ const SCHEMA: { [K in keyof AppState]: [string, Codec<AppState[K]>] } = {
   curveGran: ['cgr', oneOf<TrendGran>(['auto', 'slot', 'day', 'week', 'month'])],
   intertie: ['ic', oneOf<IntertieKey>(INTERTIE_KEYS)],
   intertieGran: ['igr', oneOf<TrendGran>(['auto', 'slot', 'day', 'week', 'month'])],
+  intertieArea: ['ia', oneOf(AREA_KEYS)],
   yearMetric: ['ym', oneOf<YearMetric>(['mean', 'max', 'min', 'floor'])],
   tableUnit: ['tu', oneOf<TableUnit>(['day', 'week', 'month', 'fy', 'year', 'dow', 'slot', 'all'])],
   tableKind: ['tk', oneOf<TableKind>(['areas', 'stats'])],

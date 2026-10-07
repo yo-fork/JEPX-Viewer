@@ -90,11 +90,11 @@ describe('入札カーブの URL', () => {
   });
 
   it('連系線のタブで見る連系線と粒度を保存・復元できる', () => {
-    const s = stateFromHash('#tab=interties&ic=chubuFence&igr=slot');
-    expect([s.tab, s.intertie, s.intertieGran]).toEqual(['interties', 'chubuFence', 'slot']);
+    const s = stateFromHash('#tab=interties&ic=chubuFence&igr=slot&ia=kyushu');
+    expect([s.tab, s.intertie, s.intertieGran, s.intertieArea]).toEqual(['interties', 'chubuFence', 'slot', 'kyushu']);
     expect(stateFromHash(stateToHash(s))).toEqual(s);
-    const bad = stateFromHash('#ic=nowhere&igr=hour');
-    expect([bad.intertie, bad.intertieGran]).toEqual(['tohokuTokyo', 'auto']);
+    const bad = stateFromHash('#ic=nowhere&igr=hour&ia=okinawa');
+    expect([bad.intertie, bad.intertieGran, bad.intertieArea]).toEqual(['tohokuTokyo', 'auto', 'tokyo']);
   });
 
   it('期間の図の粒度（30 分値も）と、ヒートマップで見るもの（高騰までの買いの増減・公表値も）を保存・復元できる', () => {

@@ -11,7 +11,7 @@
  */
 import { parseCsv } from './csv';
 import { fiscalYearOfDay, isoFromDay, parseDateString } from './dates';
-import { SLOTS, type AreaKey } from './series';
+import { AREA_KEYS, SLOTS, type AreaKey } from './series';
 
 export const INTERTIE_FY_FORMAT = 'jepx-viewer/intertie-fy@1';
 /** 出典の表示（利用条件で求められている。加工したことも示す） */
@@ -347,7 +347,7 @@ export function atLimit(plan: number, limFwd: number, limRev: number): number {
   return 0;
 }
 
-/** 中地域の個別の連系線（2026 年 3 月 13 日より前の計画潮流）と、それを置き換えたフェンス */
+/** 中地域の個別の連系線（2026 年 3 月 13 日受渡分までの計画潮流）と、それを置き換えたフェンス */
 const CENTRAL_LINES: readonly IntertieKey[] = ['chubuKansai', 'chubuHokuriku', 'hokurikuKansai'];
 const CENTRAL_FENCES: readonly IntertieKey[] = ['chubuFence', 'hokurikuFence', 'kansaiFence'];
 /** 関西-中国間の内訳（合計の連系線と重ねて数えない） */
@@ -383,4 +383,28 @@ export function crossingFlows(groups: readonly (readonly AreaKey[])[], plan: (ke
     out.push({ key: d.key, plan: v, fromGroup: a, toGroup: b });
   }
   return out;
+}
+
+/**
+ * エリアごとの正味の受け入れ量（MW。正は受け入れ、負は送り出し）。エリアにつながる連系線の計画潮流を足し引きして求める。
+ * 翌日の計画潮流はスポット市場の約定の結果なので、スポット市場で約定した買い − 売り（ブロック入札も含む）にあたる。
+ * 中地域は、個別の連系線の値があればそれを、無ければフェンスを使う。中部フェンスは中部から北陸・関西へ、北陸フェンスは北陸へ、
+ * 関西フェンスは関西へ流れる量なので、そのまま各エリアの送り出しと受け入れになる（中部フェンス = 北陸フェンス + 関西フェンス）。
+ * 値の無い連系線につながるエリアは NaN
+ */
+export function areaNetImports(plan: (key: IntertieKey) => number): Record<AreaKey, number> {
+  const net = Object.fromEntries(AREA_KEYS.map((a) => [a, 0])) as Record<AreaKey, number>;
+  const individual = CENTRAL_LINES.some((k) => Number.isFinite(plan(k)));
+  for (const d of INTERTIE_DEFS) {
+    if (SUB_LINES.includes(d.key) || CENTRAL_FENCES.includes(d.key) || (!individual && CENTRAL_LINES.includes(d.key))) continue;
+    const v = plan(d.key);
+    net[d.from[0]] -= v;
+    net[d.to[0]] += v;
+  }
+  if (!individual) {
+    net.chubu -= plan('chubuFence');
+    net.hokuriku += plan('hokurikuFence');
+    net.kansai += plan('kansaiFence');
+  }
+  return net;
 }
