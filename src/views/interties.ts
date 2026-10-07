@@ -160,7 +160,7 @@ export class IntertiesView extends View {
     this.overview = this.card(g1, { title: '連系線ごとの、計画潮流が上限に達したコマの割合', height: 360, wide: true });
     // 連系線を選ぶリストは、それで変わる図（推移、時間帯別、ヒートマップ）の見出しの下に置く
     this.line = selectField<IntertieKey>('連系線', [], s.intertie, (v) => this.set({ intertie: v }));
-    const lineTitle = h('h2', { class: 'view-section-title' }, '選んだ連系線');
+    const lineTitle = h('h2', { class: 'view-section-title' }, '連系線別');
     this.root.append(lineTitle, toolbar(this.line.el));
     this.overview.chart.on('click', (e: unknown) => {
       const key = this.overviewKeys[(e as { dataIndex: number }).dataIndex];
