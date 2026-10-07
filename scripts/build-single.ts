@@ -12,7 +12,8 @@
  *
  * ファイルから直接開いたページでは、ブラウザは別ファイルのモジュールスクリプト・CSS を読み込まず、fetch も使えない。
  * そこで vite build の出力（dist/index.html と assets/ の JS・CSS）を 1 つの HTML にまとめ、
- * 年度ファイル・入札カーブのファイルは <script type="application/json"> として埋め込む（読み出しは src/lib/localData.ts）。
+ * 年度ファイル・入札カーブのファイルは <script> の中に埋め込む（読み出しは src/lib/localData.ts）。
+ * ファイルを小さくするため、manifest 以外は gzip で圧縮して base64 にする（--no-compress では JSON のまま）。
  * --split では埋め込まず、jepxViewerData(…) を呼ぶだけの data/*.js として HTML の隣に書き出す
  * （通常の <script src> なら、ファイルから開いたページでも同じフォルダから読み込める）。
  * CSP は埋め込んだスクリプト・スタイルのハッシュ（--split ではローカルのファイルも）だけを許可し、通信はすべて禁止する。
@@ -21,10 +22,11 @@ import { createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { gzipSync } from 'node:zlib';
 import { CURVE_DAY_FORMAT, CURVE_METRICS_FORMAT, curveDayFile } from '../src/lib/bidCurves';
 import { FY_FILE_FORMAT, MANIFEST_FORMAT, type CurveIndex, type IntertieIndex, type Manifest } from '../src/lib/dataFile';
 import { fiscalYearOfDay, parseDateString } from '../src/lib/dates';
-import { dataScriptPath, EMBED_ATTR, LOCAL_MANIFEST, REGISTER_FN, SCRIPTS_META } from '../src/lib/localData';
+import { dataScriptPath, EMBED_ATTR, ENCODING_ATTR, GZIP_BASE64, LOCAL_MANIFEST, REGISTER_FN, SCRIPTS_META } from '../src/lib/localData';
 import { INTERTIE_FY_FORMAT } from '../src/lib/occto';
 
 /** 1 ファイル版に入れる、1 コマの図に使う入札カーブの日数（入札カーブのタブの「直近 7 日」の比較に足りる分） */
@@ -48,6 +50,8 @@ export interface SingleOptions {
   noCurves: boolean;
   /** 連系線（広域機関の公表値）を入れない */
   noInterties: boolean;
+  /** 埋め込むデータを gzip で圧縮する（--no-compress で JSON のまま） */
+  compress: boolean;
   log: (msg: string) => void;
 }
 
@@ -60,6 +64,7 @@ export function defaultOptions(): SingleOptions {
     split: false,
     noCurves: false,
     noInterties: false,
+    compress: true,
     log: (msg) => console.log(msg),
   };
 }
@@ -72,6 +77,7 @@ const HELP = `使い方: npm run build:single -- [オプション]
   --curve-days <日数>    1 コマの図に使う入札カーブを直近何日分入れるか（既定: 7 日。--split では取得済みのすべて）
   --no-curves            入札カーブを入れない
   --no-interties         連系線（広域機関の公表値）を入れない
+  --no-compress          データを圧縮せず、JSON のまま埋め込む（DecompressionStream に対応していない古いブラウザ向け）
   --out <ファイル>       出力先（既定: dist-single/jepx-viewer.html）
   --data <ディレクトリ>  取得済みデータの場所（既定: public/data）
   --dist <ディレクトリ>  vite build の出力先（既定: dist）`;
@@ -114,6 +120,9 @@ export function parseArgs(argv: string[], base = defaultOptions()): SingleOption
         break;
       case '--no-interties':
         o.noInterties = true;
+        break;
+      case '--no-compress':
+        o.compress = false;
         break;
       case '--out':
         o.out = next();
@@ -181,8 +190,15 @@ export function singleFileCsp(scriptHash: string, styleHash: string, localScript
 
 const lf = (s: string) => s.replace(/\r\n?/g, '\n');
 
-function jsonBlock(file: string, value: unknown): string {
-  // JSON の中の < をエスケープし、</script> で要素が終わらないようにする
+/**
+ * データ用の script 要素。compress なら gzip で圧縮して base64 にする（base64 の文字には < が無いので、要素が途中で終わらない）。
+ * JSON のままなら、中の < をエスケープし、</script> で要素が終わらないようにする
+ */
+function jsonBlock(file: string, value: unknown, compress = false): string {
+  if (compress) {
+    const gz = gzipSync(Buffer.from(JSON.stringify(value), 'utf8'), { level: 9 });
+    return `<script type="application/octet-stream" ${EMBED_ATTR}="${file}" ${ENCODING_ATTR}="${GZIP_BASE64}">${gz.toString('base64')}</script>\n`;
+  }
   return `<script type="application/json" ${EMBED_ATTR}="${file}">${JSON.stringify(value).replace(/</g, '\\u003c')}</script>\n`;
 }
 
@@ -209,10 +225,13 @@ function dataFiles(data: EmbeddedData): [string, unknown][] {
   });
 }
 
-/** データ用の script 要素（データなしのときは manifest を null にして、1 ファイル版であることだけを示す） */
-export function embedBlocks(data: EmbeddedData | null): string {
+/**
+ * データ用の script 要素（データなしのときは manifest を null にして、1 ファイル版であることだけを示す）。
+ * manifest は 1 ファイル版かどうかの判定にも使うので、圧縮しない
+ */
+export function embedBlocks(data: EmbeddedData | null, compress = false): string {
   if (!data) return jsonBlock(LOCAL_MANIFEST, null);
-  return [jsonBlock(LOCAL_MANIFEST, data.manifest), ...dataFiles(data).map(([file, json]) => jsonBlock(file, json))].join('');
+  return [jsonBlock(LOCAL_MANIFEST, data.manifest), ...dataFiles(data).map(([file, json]) => jsonBlock(file, json, compress))].join('');
 }
 
 /** data/*.js の中身（JSON は JavaScript の式としてそのまま書ける） */
@@ -239,11 +258,13 @@ const attr = (attrs: string, name: string) => new RegExp(`\\b${name}="([^"]*)"`)
  * vite build の index.html に JS・CSS・データを埋め込み、CSP を 1 ファイル版のものに差し替える。
  * @param readAsset index.html からの相対パスで JS・CSS を読む
  * @param data 埋め込むデータ（null はデータなし）。'scripts' のときは埋め込まず、HTML と同じ場所の data/*.js から読む
+ * @param compress 埋め込むデータを gzip で圧縮する
  */
 export async function assembleHtml(
   indexHtml: string,
   readAsset: (rel: string) => Promise<string>,
   data: EmbeddedData | null | 'scripts',
+  compress = false,
 ): Promise<string> {
   const split = data === 'scripts';
   // 公開用の CSP は外す（1 ファイル版の CSP に差し替える）
@@ -277,7 +298,7 @@ export async function assembleHtml(
     },
     { at: script.index, end: script.index + script[0].length, text: `<script type="module">${js}</script>` },
     { at: sheet.index, end: sheet.index + sheet[0].length, text: `<style>${css}</style>` },
-    { at: bodyEnd, end: bodyEnd, text: split ? '' : embedBlocks(data) },
+    { at: bodyEnd, end: bodyEnd, text: split ? '' : embedBlocks(data, compress) },
     // 同じ位置なら置き換えを先に、その前への差し込みを後にする
   ].sort((a, b) => b.at - a.at || b.end - a.end);
   let html = base;
@@ -353,7 +374,8 @@ export async function buildSingle(o: SingleOptions): Promise<{ bytes: number; da
     return readFile(file, 'utf8');
   };
   const data = o.noData ? null : await loadData(o);
-  const html = await assembleHtml(indexHtml, readAsset, o.split ? 'scripts' : data);
+  const compress = o.compress && !o.split;
+  const html = await assembleHtml(indexHtml, readAsset, o.split ? 'scripts' : data, compress);
   const htmlDir = path.dirname(o.out);
   await mkdir(htmlDir, { recursive: true });
   // data/*.js を先に書く（HTML を開いたときにデータがそろっているように）
@@ -371,10 +393,12 @@ export async function buildSingle(o: SingleOptions): Promise<{ bytes: number; da
       ? `・入札カーブ ${curves.dates.length} 日分（${curves.dates[0].replace(/^(\d{4})(\d{2})(\d{2})$/, '$1-$2-$3')}〜、指標は ${curves.firstDate}〜${curves.lastDate}）`
       : '') + (ties ? `・連系線 ${ties.firstDate}〜${ties.lastDate}` : '');
   const mb = (n: number) => `${(n / 1024 / 1024).toFixed(1)} MB`;
+  // 圧縮したときは、圧縮しなければどれだけになったかも示す
+  const plain = compress && data ? Buffer.byteLength(await assembleHtml(indexHtml, readAsset, data)) : 0;
   o.log(
     o.split
       ? `作成しました: ${o.out}（${mb(bytes)}）と ${path.join(htmlDir, 'data')}（${mb(dataBytes)}、${range}${curveText}）。2 つは同じ場所に置いてください`
-      : `1 ファイル版を作成しました: ${o.out}（${mb(bytes)}、${range}${curveText}）`,
+      : `1 ファイル版を作成しました: ${o.out}（${mb(bytes)}${plain ? `。データは圧縮して埋め込み、圧縮しなければ ${mb(plain)}` : ''}、${range}${curveText}）`,
   );
   return { bytes, dataBytes, data };
 }

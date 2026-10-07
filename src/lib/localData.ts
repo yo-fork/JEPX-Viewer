@@ -5,12 +5,18 @@
  * manifest.json・spot/fyYYYY.json）を次のどちらかの形で渡す。
  * - inline（既定）: HTML の <script type="application/json" data-jv-file="spot/fy2024.json"> の中に JSON を埋め込む。
  *   実行されないデータ用の script 要素なので、CSP でスクリプトを制限していても読める。
+ *   ファイルを小さくするため、manifest 以外は gzip で圧縮して base64 にして埋め込み（data-jv-encoding="gzip-base64"）、
+ *   ブラウザの DecompressionStream で戻す。
  * - scripts（--split）: HTML と同じ場所の data/spot/fy2024.js が jepxViewerData("spot/fy2024.json", {…}) を呼ぶ。
  *   <script src> は、ファイルから開いたページでも同じフォルダのファイルを読める（fetch と違い CORS の制限を受けない）。
  */
 
 /** データ用 script 要素の属性。値は public/data からの相対パス */
 export const EMBED_ATTR = 'data-jv-file';
+/** 埋め込んだデータの形を示す属性。無ければ JSON のまま */
+export const ENCODING_ATTR = 'data-jv-encoding';
+/** gzip で圧縮して base64 にしたもの */
+export const GZIP_BASE64 = 'gzip-base64';
 export const LOCAL_MANIFEST = 'manifest.json';
 /** scripts 形式であることを示す meta 要素の name */
 export const SCRIPTS_META = 'jepx-viewer-data';
@@ -33,11 +39,29 @@ export function localDataMode(doc: Document = document): LocalDataMode {
   return null;
 }
 
-/** HTML に埋め込んだ JSON を読む */
-export function readEmbedded(file: string, doc: Document = document): unknown {
+/** HTML に埋め込んだ JSON を読む（圧縮して埋め込んだものは戻してから読む） */
+export async function readEmbedded(file: string, doc: Document = document): Promise<unknown> {
   const el = findBlock(file, doc);
   if (!el) throw new Error(`埋め込みデータ（${file}）がありません`);
-  return JSON.parse(el.textContent ?? '');
+  const text = el.textContent ?? '';
+  if (el.getAttribute(ENCODING_ATTR) !== GZIP_BASE64) return JSON.parse(text);
+  return JSON.parse(await gunzipText(base64Bytes(text)));
+}
+
+/** base64 の文字列をバイト列に戻す */
+function base64Bytes(text: string): Uint8Array<ArrayBuffer> {
+  const bin = atob(text.replace(/\s+/g, ''));
+  const out = new Uint8Array(new ArrayBuffer(bin.length));
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+/** gzip で圧縮したバイト列を、UTF-8 の文字列に戻す */
+async function gunzipText(bytes: Uint8Array<ArrayBuffer>): Promise<string> {
+  if (typeof DecompressionStream === 'undefined') {
+    throw new Error('このブラウザは、圧縮して埋め込んだデータを読めません。新しいブラウザ（Edge・Chrome など）で開いてください');
+  }
+  return new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'))).text();
 }
 
 /**

@@ -360,7 +360,7 @@ export class App implements AppApi {
       let json: Manifest | null;
       if (LOCAL_DATA === 'inline') {
         // データなしで作った 1 ファイル版では null
-        json = readEmbedded(LOCAL_MANIFEST) as Manifest | null;
+        json = (await readEmbedded(LOCAL_MANIFEST)) as Manifest | null;
       } else if (LOCAL_DATA === 'scripts') {
         // 一覧はデータを更新するたびに変わるので、毎回読み直す
         json = (await loadDataScript(LOCAL_MANIFEST, `t=${Date.now()}`)) as Manifest;

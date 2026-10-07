@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { gunzipSync, gzipSync } from 'node:zlib';
 import {
   assembleHtml,
   buildSingle,
@@ -55,8 +56,13 @@ const inlineScript = (html: string) => /<script type="module">([\s\S]*?)<\/scrip
 const inlineStyle = (html: string) => /<style>([\s\S]*?)<\/style>/.exec(html)?.[1];
 const cspOf = (html: string) => /<meta http-equiv="Content-Security-Policy" content="([^"]+)">/.exec(html)?.[1] ?? '';
 const sha = (s: string) => createHash('sha256').update(s, 'utf8').digest('base64');
+/** 埋め込んだデータ（圧縮したものは戻す） */
 const blocks = (html: string) =>
-  [...html.matchAll(/<script type="application\/json" data-jv-file="([^"]+)">([\s\S]*?)<\/script>/g)].map((m) => ({ file: m[1], json: JSON.parse(m[2]) as unknown }));
+  [...html.matchAll(/<script type="application\/(?:json|octet-stream)" data-jv-file="([^"]+)"(?: data-jv-encoding="([^"]+)")?>([\s\S]*?)<\/script>/g)].map((m) => ({
+    file: m[1],
+    compressed: m[2] === 'gzip-base64',
+    json: JSON.parse(m[2] === 'gzip-base64' ? gunzipSync(Buffer.from(m[3], 'base64')).toString('utf8') : m[3]) as unknown,
+  }));
 
 const MANIFEST: Manifest = {
   format: MANIFEST_FORMAT,
@@ -121,6 +127,22 @@ describe('assembleHtml', () => {
     expect(html.match(/<\/script>/g)).toHaveLength(4);
   });
 
+  it('compress では、manifest 以外のデータを gzip で圧縮して base64 で埋め込む', async () => {
+    const html = await assembleHtml(INDEX_HTML, readAsset, DATA, true);
+    expect(html).not.toContain('<script>alert(1)');
+    const got = blocks(html);
+    expect(got.map((b) => [b.file, b.compressed])).toEqual([
+      ['manifest.json', false],
+      ['spot/fy2023.json', true],
+      ['spot/fy2024.json', true],
+    ]);
+    expect(got[0].json).toEqual(MANIFEST);
+    expect(got[1].json).toEqual(DATA.files.get('spot/fy2023.json'));
+    expect(html.match(/<\/script>/g)).toHaveLength(4);
+    // CSP は変わらない（データ用の要素は実行されない）
+    expect(cspOf(html)).toBe(cspOf(await assembleHtml(INDEX_HTML, readAsset, DATA)));
+  });
+
   it('JS の中に </body> やタグと同じ文字列があっても、差し込む位置と中身がずれない', async () => {
     const tricky = [
       'const a = "</body></html>";',
@@ -156,7 +178,7 @@ describe('assembleHtml', () => {
 
   it('データなしでは manifest を null にする', async () => {
     const html = await assembleHtml(INDEX_HTML, readAsset, null);
-    expect(blocks(html)).toEqual([{ file: 'manifest.json', json: null }]);
+    expect(blocks(html)).toEqual([{ file: 'manifest.json', compressed: false, json: null }]);
   });
 
   it('想定外の index.html は埋め込まずにエラーにする', async () => {
@@ -354,6 +376,20 @@ describe('buildSingle（入札カーブ）', () => {
     expect(isDataFile('interties/fy2024.json')).toBe(true);
   });
 
+  it('既定ではデータを圧縮して埋め込み、--no-compress では JSON のまま埋め込む（中身は同じ）', async () => {
+    const out = path.join(dir, 'out', 'single.html');
+    await buildSingle(opts({}));
+    const packed = await readFile(out, 'utf8');
+    await buildSingle(opts({ compress: false }));
+    const plain = await readFile(out, 'utf8');
+    expect(blocks(packed).slice(1).every((b) => b.compressed)).toBe(true);
+    expect(blocks(plain).some((b) => b.compressed)).toBe(false);
+    expect(blocks(packed).map((b) => [b.file, b.json])).toEqual(blocks(plain).map((b) => [b.file, b.json]));
+    expect(Buffer.byteLength(packed)).toBeLessThan(Buffer.byteLength(plain));
+    expect(parseArgs(['--no-compress']).compress).toBe(false);
+    expect(parseArgs([]).compress).toBe(true);
+  });
+
   it('--split では取得済みのカーブをすべて data フォルダに書き出す', async () => {
     const out = path.join(dir, 'share', 'viewer.html');
     await buildSingle(opts({ split: true, out }));
@@ -370,13 +406,14 @@ describe('buildSingle（入札カーブ）', () => {
 });
 
 describe('localData（ブラウザ側の読み出し）', () => {
-  const fakeDoc = (items: { file: string; text: string }[], meta = false) =>
+  const fakeDoc = (items: { file: string; text: string; encoding?: string }[], meta = false) =>
     ({
-      querySelectorAll: () => items.map((i) => ({ getAttribute: () => i.file, textContent: i.text })),
+      querySelectorAll: () =>
+        items.map((i) => ({ getAttribute: (name: string) => (name === 'data-jv-file' ? i.file : (i.encoding ?? null)), textContent: i.text })),
       querySelector: (sel: string) => (meta && sel.startsWith('meta') ? {} : null),
     }) as unknown as Document;
 
-  it('渡し方（埋め込み・data/*.js・通常の Web 版）を判定し、埋め込んだ JSON を読む', () => {
+  it('渡し方（埋め込み・data/*.js・通常の Web 版）を判定し、埋め込んだ JSON を読む', async () => {
     expect(localDataMode(fakeDoc([]))).toBeNull();
     expect(localDataMode(fakeDoc([], true))).toBe('scripts');
     const doc = fakeDoc([
@@ -384,9 +421,17 @@ describe('localData（ブラウザ側の読み出し）', () => {
       { file: 'spot/fy2024.json', text: '{"fy":2024,"s":"\\u003c/script>"}' },
     ]);
     expect(localDataMode(doc)).toBe('inline');
-    expect(readEmbedded('manifest.json', doc)).toBeNull();
-    expect(readEmbedded('spot/fy2024.json', doc)).toEqual({ fy: 2024, s: '</script>' });
-    expect(() => readEmbedded('spot/fy2020.json', doc)).toThrow(/ありません/);
+    expect(await readEmbedded('manifest.json', doc)).toBeNull();
+    expect(await readEmbedded('spot/fy2024.json', doc)).toEqual({ fy: 2024, s: '</script>' });
+    await expect(readEmbedded('spot/fy2020.json', doc)).rejects.toThrow(/ありません/);
+  });
+
+  it('gzip で圧縮して base64 で埋め込んだデータを、戻して読む（日本語も）', async () => {
+    const value = { fy: 2024, note: '連系線</script>', values: Array.from({ length: 2000 }, (_, i) => i / 10) };
+    const text = gzipSync(Buffer.from(JSON.stringify(value), 'utf8')).toString('base64');
+    // 改行を挟んでも読める
+    const doc = fakeDoc([{ file: 'spot/fy2024.json', text: `\n${text.slice(0, 40)}\n${text.slice(40)}\n`, encoding: 'gzip-base64' }]);
+    expect(await readEmbedded('spot/fy2024.json', doc)).toEqual(value);
   });
 
   it('data/ の外や別のサイトを指す名前は読まない', () => {
