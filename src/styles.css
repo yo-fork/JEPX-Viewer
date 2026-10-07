@@ -89,6 +89,8 @@
 
 html {
   -webkit-text-size-adjust: 100%;
+  /* ページ内で移った先（scrollIntoView やフォーカス）を、画面の上端に出す絞り込みの行に隠さない */
+  scroll-padding-top: calc(var(--sticky-filter-h, 0px) + 8px);
 }
 
 body {
@@ -446,6 +448,75 @@ input[type='number'] {
 .chip-action {
   padding: 2px 10px;
   color: var(--ink2);
+}
+
+/* 下にスクロールして絞り込み行が隠れたときに、画面の上端に出す 1 行の絞り込み */
+.sticky-filter {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 40;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  visibility: hidden;
+  transform: translateY(-100%);
+  transition:
+    transform 0.15s ease,
+    visibility 0s linear 0.15s;
+}
+
+.sticky-filter.is-shown {
+  visibility: visible;
+  transform: none;
+  transition: transform 0.15s ease;
+}
+
+.filter-bar.is-compact {
+  gap: 8px;
+  max-width: 1440px;
+  margin: 0 auto;
+  padding: 8px 24px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.filter-bar.is-compact .filter-row {
+  align-items: center;
+  gap: 8px 16px;
+}
+
+/* 項目の途中では折り返さず、項目ごとに次の行へ送る */
+.filter-bar.is-compact > .filter-row:first-child > * {
+  flex: none;
+}
+
+.field.is-inline {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+}
+
+.filter-bar .btn[aria-expanded]::after {
+  content: '▾';
+  color: var(--muted);
+}
+
+.filter-bar .btn[aria-expanded='true'] {
+  background: var(--wash);
+}
+
+.filter-bar .btn[aria-expanded='true']::after {
+  content: '▴';
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sticky-filter,
+  .sticky-filter.is-shown {
+    transition: none;
+  }
 }
 
 /* ===== ビュー ===== */
@@ -932,6 +1003,18 @@ input[type='number'] {
 
   .filter-status {
     margin-left: 0;
+  }
+
+  .filter-bar.is-compact {
+    padding: 4px 12px;
+  }
+
+  /* 画面の上端の絞り込みは 1 行に収め、はみ出す分は横にスクロールする（フォーカスの枠が切れないよう内側に余白を取る） */
+  .filter-bar.is-compact > .filter-row:first-child {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    padding: 4px;
+    scrollbar-width: thin;
   }
 
   .card {

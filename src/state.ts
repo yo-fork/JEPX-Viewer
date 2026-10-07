@@ -2,7 +2,7 @@
  * 画面の状態と URL ハッシュとの相互変換。
  * 既定値と異なる項目だけを URL に載せるので、表示中の切り口をそのままリンクで共有できる。
  */
-import { fiscalYearEnd, fiscalYearOfDay, fiscalYearStart, isoFromDay, parseDateString } from './lib/dates';
+import { dayFromYmd, fiscalYearEnd, fiscalYearOfDay, fiscalYearStart, isoFromDay, parseDateString, ymdFromDay } from './lib/dates';
 import type { Granularity } from './lib/aggregate';
 import type { DayType } from './lib/select';
 import { CURVE_TARGETS, type CurveTarget } from './lib/areaCurves';
@@ -357,4 +357,44 @@ export function fiscalYearsIn(extent: Extent): number[] {
   const out: number[] = [];
   for (let fy = fiscalYearOfDay(extent.last); fy >= fiscalYearOfDay(extent.first); fy--) out.push(fy);
   return out;
+}
+
+/** 期間の ◀ ▶ で移る先（年度のプリセットか、日付で決めた期間） */
+export type RangeShift = { preset: `fy${number}` } | { preset: 'custom'; from: number; to: number };
+
+/**
+ * 前後の期間（絞り込みの ◀ ▶）。年度は前後の年度にする。日付で決めた期間は、月の初めから月末までなら同じ月数だけ、
+ * ほか（「直近」を含む）は同じ日数だけずらす。月数でずらすときはデータの端の月を短くし、日数でずらすときは日数を変えずに
+ * データのある範囲に寄せる。「全期間」のときと、データの端まで来ていてずらせないときは null
+ */
+export function shiftRange(state: { preset: string; from: number; to: number }, extent: Extent, dir: -1 | 1): RangeShift | null {
+  const fy = /^fy(\d{4})$/.exec(state.preset);
+  if (fy) {
+    const next = Number(fy[1]) + dir;
+    return fiscalYearsIn(extent).includes(next) ? { preset: `fy${next}` } : null;
+  }
+  if (state.preset === 'all') return null;
+  const { first, last } = extent;
+  const { from, to } = resolveRange(state.preset, extent, state);
+  if (dir < 0 ? from <= first : to >= last) return null;
+  const months = state.preset === 'custom' ? wholeMonths(from, to, extent) : 0;
+  if (months > 0) {
+    const { y, m } = ymdFromDay(from);
+    const start = m + dir * months;
+    const a = Math.max(first, dayFromYmd(y, start, 1));
+    const b = Math.min(last, dayFromYmd(y, start + months, 0));
+    return a <= b ? { preset: 'custom', from: a, to: b } : null;
+  }
+  const len = to - from + 1;
+  const a = Math.max(first, Math.min(from + dir * len, last - len + 1));
+  return { preset: 'custom', from: a, to: Math.min(last, a + len - 1) };
+}
+
+/** 月の初めから月末まで（データの端で切れた月を含む）の期間なら、その月数。そうでなければ 0 */
+function wholeMonths(from: number, to: number, extent: Extent): number {
+  const a = ymdFromDay(from);
+  const b = ymdFromDay(to);
+  const fromStart = a.d === 1 || from === extent.first;
+  const toEnd = ymdFromDay(to + 1).d === 1 || to === extent.last;
+  return fromStart && toEnd ? (b.y - a.y) * 12 + (b.m - a.m) + 1 : 0;
 }

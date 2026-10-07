@@ -1,13 +1,21 @@
 /**
  * 画面上部の絞り込み行（期間 → 曜日区分 → 時間帯 → 表示系列）。すべてのタブに共通で効く。
+ * 下にスクロールして画面上部の行が隠れたときに画面の上端に出す、1 行の版（compact）も作れる。
  */
-import { isoFromDay, parseDateString, slotStartLabel } from '../lib/dates';
+import { formatDay, isoFromDay, parseDateString, slotStartLabel } from '../lib/dates';
 import { PRICE_KEYS, SERIES_SHORT, SLOTS, type PriceKey } from '../lib/series';
-import { SLOT_PRESETS, fiscalYearsIn, type AppState, type Extent, type SlotPresetId } from '../state';
+import { SLOT_PRESETS, fiscalYearsIn, shiftRange, type AppState, type Extent, type RangeShift, type SlotPresetId } from '../state';
 import { h, uniqueId } from './dom';
 import { seriesColor, seriesDashed, type ThemeName } from './theme';
 
 export type FilterPatch = Partial<Pick<AppState, 'preset' | 'from' | 'to' | 'dayType' | 'slotPreset' | 'slotStart' | 'slotEnd' | 'series'>>;
+
+export interface FilterBarOptions {
+  /** 1 行の版にする（表示系列は、ボタンを押したときだけ出す） */
+  compact?: boolean;
+  /** 1 行の版の「先頭へ」ボタンを押したとき */
+  onTop?: () => void;
+}
 
 const RANGE_PRESETS: [string, string][] = [
   ['last7', '直近7日'],
@@ -19,6 +27,8 @@ const RANGE_PRESETS: [string, string][] = [
 export class FilterBar {
   readonly el: HTMLElement;
   private readonly preset: HTMLSelectElement;
+  private readonly prevBtn: HTMLButtonElement;
+  private readonly nextBtn: HTMLButtonElement;
   private readonly fromInput: HTMLInputElement;
   private readonly toInput: HTMLInputElement;
   private readonly dayType: HTMLSelectElement;
@@ -28,12 +38,22 @@ export class FilterBar {
   private readonly customSlots: HTMLElement;
   private readonly chips = new Map<PriceKey, HTMLButtonElement>();
   private readonly status: HTMLElement;
+  /** 1 行の版で、表示系列の行を開け閉めするボタンと、その行（画面上部の版では null） */
+  private readonly seriesToggle: HTMLButtonElement | null;
+  private readonly chipPanel: HTMLElement | null;
   private fyKey = '';
   private series: PriceKey[] = [];
+  /** ◀ ▶ で移る先の期間（移れなければ null） */
+  private steps: [RangeShift | null, RangeShift | null] = [null, null];
 
-  constructor(private readonly onChange: (patch: FilterPatch) => void) {
+  constructor(
+    private readonly onChange: (patch: FilterPatch) => void,
+    opts: FilterBarOptions = {},
+  ) {
     const ids = { preset: uniqueId('f'), from: uniqueId('f'), to: uniqueId('f'), dt: uniqueId('f'), tz: uniqueId('f') };
     this.preset = h('select', { id: ids.preset, onchange: () => this.onChange({ preset: this.preset.value }) });
+    this.prevBtn = h('button', { type: 'button', class: 'btn', onclick: () => this.step(0) }, '◀');
+    this.nextBtn = h('button', { type: 'button', class: 'btn', onclick: () => this.step(1) }, '▶');
     this.fromInput = h('input', { id: ids.from, type: 'date', onchange: () => this.onDateChange() });
     this.toInput = h('input', { id: ids.to, type: 'date', 'aria-label': '終了日', onchange: () => this.onDateChange() });
     this.dayType = h(
@@ -72,24 +92,50 @@ export class FilterBar {
     );
 
     this.status = h('span', { class: 'filter-status', role: 'status', 'aria-live': 'polite' });
-    this.el = h(
-      'section',
-      { class: 'filter-bar', 'aria-label': '絞り込み条件' },
-      h(
-        'div',
-        { class: 'filter-row' },
+    // 1 行の版は、項目名を入力欄の左に置く
+    const field = (label: HTMLElement, control: HTMLElement) => h('div', { class: opts.compact ? 'field is-inline' : 'field' }, label, control);
+    const fields = [
+      field(
+        h('label', { for: ids.preset }, '期間'),
+        // 狭い画面で折り返すときは、開始日〜終了日を同じ行に置く
         h(
           'div',
-          { class: 'field' },
-          h('label', { for: ids.preset }, '期間'),
-          h('div', { class: 'field-inline' }, this.preset, this.fromInput, h('span', { 'aria-hidden': 'true' }, '〜'), this.toInput),
+          { class: 'field-inline' },
+          this.preset,
+          h('span', { class: 'date-nav' }, this.prevBtn, this.nextBtn),
+          h('span', { class: 'date-nav' }, this.fromInput, h('span', { 'aria-hidden': 'true' }, '〜'), this.toInput),
         ),
-        h('div', { class: 'field' }, h('label', { for: ids.dt }, '曜日'), this.dayType),
-        h('div', { class: 'field' }, h('label', { for: ids.tz }, '時間帯'), h('div', { class: 'field-inline' }, this.slotPreset, this.customSlots)),
-        this.status,
       ),
-      h('div', { class: 'filter-row' }, h('div', { class: 'field field-series' }, h('span', { class: 'field-label' }, '表示系列'), chipRow)),
-    );
+      field(h('label', { for: ids.dt }, '曜日'), this.dayType),
+      field(h('label', { for: ids.tz }, '時間帯'), h('div', { class: 'field-inline' }, this.slotPreset, this.customSlots)),
+    ];
+    if (opts.compact) {
+      const panelId = uniqueId('f');
+      this.seriesToggle = h('button', { type: 'button', class: 'btn', 'aria-expanded': 'false', 'aria-controls': panelId, onclick: () => this.toggleChips() });
+      this.chipPanel = h('div', { id: panelId, class: 'filter-row', hidden: true }, chipRow);
+      this.el = h(
+        'section',
+        { class: 'filter-bar is-compact', 'aria-label': '絞り込み条件（画面の上端）' },
+        h(
+          'div',
+          { class: 'filter-row' },
+          fields,
+          this.seriesToggle,
+          this.status,
+          h('button', { type: 'button', class: 'btn btn-ghost', onclick: () => opts.onTop?.() }, '▲ 先頭へ'),
+        ),
+        this.chipPanel,
+      );
+    } else {
+      this.seriesToggle = null;
+      this.chipPanel = null;
+      this.el = h(
+        'section',
+        { class: 'filter-bar', 'aria-label': '絞り込み条件' },
+        h('div', { class: 'filter-row' }, fields, this.status),
+        h('div', { class: 'filter-row' }, h('div', { class: 'field field-series' }, h('span', { class: 'field-label' }, '表示系列'), chipRow)),
+      );
+    }
     this.fromInput.setAttribute('aria-label', '開始日');
   }
 
@@ -114,6 +160,9 @@ export class FilterBar {
     }
     this.fromInput.value = isoFromDay(state.from);
     this.toInput.value = isoFromDay(state.to);
+    this.steps = [shiftRange(state, extent, -1), shiftRange(state, extent, 1)];
+    showStep(this.prevBtn, '前の期間', this.steps[0]);
+    showStep(this.nextBtn, '次の期間', this.steps[1]);
     this.dayType.value = state.dayType;
     this.slotPreset.value = state.slotPreset;
     this.customSlots.hidden = state.slotPreset !== 'custom';
@@ -124,10 +173,23 @@ export class FilterBar {
       btn.setAttribute('aria-pressed', String(state.series.includes(k)));
       btn.style.setProperty('--c', seriesColor(k, theme));
     }
+    if (this.seriesToggle) this.seriesToggle.textContent = `表示系列（${state.series.length}）`;
   }
 
   setStatus(text: string): void {
     this.status.textContent = text;
+  }
+
+  private step(i: 0 | 1): void {
+    const s = this.steps[i];
+    if (s) this.onChange(s);
+  }
+
+  private toggleChips(): void {
+    if (!this.seriesToggle || !this.chipPanel) return;
+    const open = this.chipPanel.hidden;
+    this.chipPanel.hidden = !open;
+    this.seriesToggle.setAttribute('aria-expanded', String(open));
   }
 
   private onDateChange(): void {
@@ -157,4 +219,12 @@ export class FilterBar {
     const next = on ? this.series.filter((k) => k !== key) : PRICE_KEYS.filter((k) => k === key || this.series.includes(k));
     this.onChange({ series: next });
   }
+}
+
+/** ◀ ▶ のボタンの説明に移る先の期間を入れ、移れなければ押せなくする */
+function showStep(btn: HTMLButtonElement, label: string, step: RangeShift | null): void {
+  btn.disabled = step === null;
+  const text = !step ? label : `${label}（${'from' in step ? `${formatDay(step.from)}〜${formatDay(step.to)}` : `${step.preset.slice(2)}年度`}）`;
+  btn.title = text;
+  btn.setAttribute('aria-label', text);
 }

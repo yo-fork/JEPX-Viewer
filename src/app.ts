@@ -53,6 +53,9 @@ export class App implements AppApi {
   private readonly demoBanner: HTMLElement;
   private readonly tabButtons = new Map<TabId, HTMLButtonElement>();
   private readonly filterBar: FilterBar;
+  /** 絞り込み行が画面の上に隠れたときに、画面の上端に出す 1 行の絞り込み */
+  private readonly stickyBar: FilterBar;
+  private readonly stickyEl: HTMLElement;
   private readonly workspace: HTMLElement;
   private readonly viewHost: HTMLElement;
   private readonly emptyEl: HTMLElement;
@@ -137,8 +140,10 @@ export class App implements AppApi {
     }
 
     this.filterBar = new FilterBar((patch) => this.setState(patch));
+    this.stickyBar = new FilterBar((patch) => this.setState(patch), { compact: true, onTop: () => window.scrollTo({ top: 0, behavior: 'smooth' }) });
+    this.stickyEl = h('div', { class: 'sticky-filter' }, this.stickyBar.el);
     this.viewHost = h('main', { id: 'view', class: 'view', role: 'tabpanel', tabindex: '-1' });
-    this.workspace = h('div', { class: 'workspace', hidden: true }, tabs, this.filterBar.el, this.viewHost);
+    this.workspace = h('div', { class: 'workspace', hidden: true }, tabs, this.filterBar.el, this.stickyEl, this.viewHost);
     this.emptyEl = this.buildEmptyState();
     // 取得済みデータ（manifest.json）の有無が分かるまでは空状態を出さない
     this.emptyEl.hidden = true;
@@ -158,6 +163,7 @@ export class App implements AppApi {
 
     root.replaceChildren(header, this.demoBanner, this.emptyEl, this.workspace, footer, this.toastHost, this.dropOverlay, this.fileInput);
     this.setupDragAndDrop();
+    this.setupStickyFilter();
   }
 
   async start(): Promise<void> {
@@ -207,7 +213,7 @@ export class App implements AppApi {
 
     const range = resolveRange(this.state.preset, extent, this.state);
     this.state = { ...this.state, ...range };
-    this.filterBar.sync(this.state, extent, this.theme);
+    for (const bar of [this.filterBar, this.stickyBar]) bar.sync(this.state, extent, this.theme);
     this.syncUrl();
 
     // 概要タブは前年同期との比較に 1 年前のデータも使う
@@ -226,7 +232,7 @@ export class App implements AppApi {
           : null;
     if (pending || curvesPending || curveSpot || intertiesPending) {
       this.viewHost.classList.add('is-loading');
-      this.filterBar.setStatus('データを読み込み中…');
+      this.setFilterStatus('データを読み込み中…');
       await Promise.all([
         pending,
         curvesPending,
@@ -237,7 +243,7 @@ export class App implements AppApi {
     }
     // 追い越された古い render が読み込み表示を残していても、ここで必ず解除する
     this.viewHost.classList.remove('is-loading');
-    this.filterBar.setStatus('');
+    this.setFilterStatus('');
 
     const ds = this.store.dataset();
     if (!ds) {
@@ -289,9 +295,15 @@ export class App implements AppApi {
     if (this.manifest) this.statusEl.title = `取得日時: ${new Date(this.manifest.generatedAt).toLocaleString('ja-JP')}`;
   }
 
+  private setFilterStatus(text: string): void {
+    this.filterBar.setStatus(text);
+    this.stickyBar.setStatus(text);
+  }
+
   private showWorkspace(show: boolean): void {
     this.workspace.hidden = !show;
     this.emptyEl.hidden = show;
+    this.updateStickyFilter();
     if (!show && this.view) {
       this.view.unmount();
       this.view = null;
@@ -588,6 +600,21 @@ export class App implements AppApi {
       this.dropOverlay.hidden = true;
       void this.importFiles([...(ev.dataTransfer?.files ?? [])]);
     });
+  }
+
+  /**
+   * 下にスクロールして絞り込み行が画面の上に隠れはじめたら、画面の上端に 1 行の絞り込みを出す（グラフを見たまま期間などを変えられる）。
+   * ページ内で移った先（scrollIntoView やフォーカス）がその下に隠れないよう、高さを CSS の変数にしておく
+   */
+  private setupStickyFilter(): void {
+    const update = () => this.updateStickyFilter();
+    window.addEventListener('scroll', update, { passive: true });
+    window.addEventListener('resize', update);
+    new ResizeObserver(() => document.documentElement.style.setProperty('--sticky-filter-h', `${this.stickyEl.offsetHeight}px`)).observe(this.stickyEl);
+  }
+
+  private updateStickyFilter(): void {
+    this.stickyEl.classList.toggle('is-shown', !this.workspace.hidden && this.filterBar.el.getBoundingClientRect().top < 0);
   }
 
   private toast(message: string, kind: 'info' | 'error' = 'info'): void {

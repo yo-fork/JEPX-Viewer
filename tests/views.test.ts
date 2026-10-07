@@ -5,7 +5,7 @@ import { generateDemoDays } from '../src/lib/demo';
 import { select } from '../src/lib/select';
 import { PRICE_KEYS } from '../src/lib/series';
 import { DataStore } from '../src/lib/store';
-import { stateFromHash, stateToHash } from '../src/state';
+import { shiftRange, stateFromHash, stateToHash } from '../src/state';
 import { dayRange } from '../src/views/calendar';
 import { CommonRange, endLabels, fixedAxis, unionRange, valueRange, whiskerRange } from '../src/views/common';
 import { histogramBins, histogramCounts } from '../src/views/distribution';
@@ -54,6 +54,45 @@ describe('URL の状態', () => {
     expect(s.preset).toBe('last365');
     expect(s.series).toEqual(['system', 'tokyo', 'kansai', 'kyushu']);
     expect(s.threshold).toBe(30);
+  });
+});
+
+describe('前後の期間（◀ ▶）', () => {
+  const d = dayFromYmd;
+  const extent = { first: d(2021, 4, 1), last: d(2025, 9, 15) };
+  const custom = (from: number, to: number) => ({ preset: 'custom', from, to });
+  const preset = (p: string) => ({ preset: p, from: Number.NaN, to: Number.NaN });
+
+  it('年度は前後の年度にし、データのない年度と「全期間」からは移らない', () => {
+    expect(shiftRange(preset('fy2023'), extent, -1)).toEqual({ preset: 'fy2022' });
+    expect(shiftRange(preset('fy2023'), extent, 1)).toEqual({ preset: 'fy2024' });
+    expect(shiftRange(preset('fy2021'), extent, -1)).toBeNull();
+    expect(shiftRange(preset('fy2025'), extent, 1)).toBeNull();
+    expect(shiftRange(preset('all'), extent, -1)).toBeNull();
+  });
+
+  it('月の初めから月末までの期間は同じ月数だけずらし、データの端の月は短くする', () => {
+    expect(shiftRange(custom(d(2025, 1, 1), d(2025, 1, 31)), extent, 1)).toEqual(custom(d(2025, 2, 1), d(2025, 2, 28)));
+    expect(shiftRange(custom(d(2025, 4, 1), d(2025, 6, 30)), extent, -1)).toEqual(custom(d(2025, 1, 1), d(2025, 3, 31)));
+    expect(shiftRange(custom(d(2024, 11, 1), d(2024, 12, 31)), extent, 1)).toEqual(custom(d(2025, 1, 1), d(2025, 2, 28)));
+    expect(shiftRange(custom(d(2025, 8, 1), d(2025, 8, 31)), extent, 1)).toEqual(custom(d(2025, 9, 1), d(2025, 9, 15)));
+    // データの最終日で切れた月から戻ると、1 か月分になる
+    expect(shiftRange(custom(d(2025, 9, 1), d(2025, 9, 15)), extent, -1)).toEqual(custom(d(2025, 8, 1), d(2025, 8, 31)));
+  });
+
+  it('ほかの期間と「直近」は同じ日数だけずらし、データの端では日数を変えずに寄せる', () => {
+    expect(shiftRange(custom(d(2025, 8, 5), d(2025, 8, 11)), extent, -1)).toEqual(custom(d(2025, 7, 29), d(2025, 8, 4)));
+    expect(shiftRange(custom(d(2025, 9, 5), d(2025, 9, 11)), extent, 1)).toEqual(custom(d(2025, 9, 9), d(2025, 9, 15)));
+    expect(shiftRange(custom(d(2021, 4, 3), d(2021, 4, 9)), extent, -1)).toEqual(custom(d(2021, 4, 1), d(2021, 4, 7)));
+    expect(shiftRange(preset('last30'), extent, -1)).toEqual(custom(extent.last - 59, extent.last - 30));
+    expect(shiftRange(preset('last30'), extent, 1)).toBeNull();
+    // 「直近」は月の初めから始まっていても日数でずらす
+    expect(shiftRange(preset('last7'), { ...extent, last: d(2025, 9, 7) }, -1)).toEqual(custom(d(2025, 8, 25), d(2025, 8, 31)));
+  });
+
+  it('データの端からは、その向きにはずらせない', () => {
+    expect(shiftRange(custom(extent.first, d(2021, 4, 30)), extent, -1)).toBeNull();
+    expect(shiftRange(custom(d(2025, 9, 1), extent.last), extent, 1)).toBeNull();
   });
 });
 
