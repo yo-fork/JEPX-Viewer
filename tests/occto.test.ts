@@ -12,6 +12,7 @@ import {
   hasIntertieFields,
   INTERTIE_FIELD_INDEX,
   INTERTIE_INDEX,
+  intertieNote,
   intertieOffset,
   intertieTitle,
   mergeIntertieDays,
@@ -246,6 +247,14 @@ describe('連系線の推移の図の注記', () => {
     expect(notes.some((n) => n.includes('npm run fetch'))).toBe(false);
     // デモでは、実際の公表のされ方の説明は付けない
     expect(coverageNotes('chubuKansai', cov('1111000', '1110000'), false)[0]).toContain('値があるのは');
+  });
+
+  it('フェンスには、どの連系線を合わせたものかを書く', () => {
+    expect(intertieNote('chubuFence')).toContain('三重東近江線（中部-関西間）と南福光（中部-北陸間）');
+    expect(intertieNote('kansaiFence')).toContain('三重東近江線（中部-関西間）と越前嶺南線（北陸-関西間）');
+    expect(intertieNote('hokurikuFence')).toContain('南福光（中部-北陸間）と越前嶺南線（北陸-関西間）');
+    expect(intertieNote('chubuKansai')).toContain('潮流実績も公表されていません');
+    expect(intertieNote('tohokuTokyo')).toBeNull();
   });
 
   it('どの連系線にも値の無い日は、取得できていない日として取り直し方を書く', () => {
