@@ -6,7 +6,19 @@ import { aggregateBySlot } from '../lib/aggregate';
 import { formatDay, slotRangeLabel, slotStartLabel } from '../lib/dates';
 import { fmtNum, fmtPct, fmtSigned } from '../lib/format';
 import type { IntertieStore } from '../lib/intertieStore';
-import { atLimit, INTERTIE_DEFS, INTERTIE_INDEX, intertieTitle, OCCTO_SOURCE, type IntertieDef, type IntertieField, type IntertieKey } from '../lib/occto';
+import {
+  atLimit,
+  INTERTIE_DEFS,
+  INTERTIE_INDEX,
+  INTERTIE_KEYS,
+  intertieNote,
+  intertieTitle,
+  NO_FLOW_LINES,
+  OCCTO_SOURCE,
+  type IntertieDef,
+  type IntertieField,
+  type IntertieKey,
+} from '../lib/occto';
 import { AREA_KEYS, AREAS, SERIES_LABEL, SLOTS, type AreaKey } from '../lib/series';
 import type { Selection } from '../lib/select';
 import { accMean } from '../lib/stats';
@@ -38,6 +50,81 @@ const TREND_LINES: { field: IntertieField; name: string; color: 'cat0' | 'cat1' 
   { field: 'limFwd', name: '上限（順方向）', color: 'neutral', dashed: true },
   { field: 'limRev', name: '上限（逆方向）', color: 'neutral', dashed: true },
 ];
+
+/**
+ * 選んだ日（古い順）ごとの、値があるかどうか。plan・actual は選んだ連系線の計画潮流（翌日）と潮流実績、
+ * anyPlan・anyActual はどれかの連系線にあるか（どの連系線にも無い日は、取得できていない日）
+ */
+export interface LineCoverage {
+  days: number[];
+  plan: boolean[];
+  actual: boolean[];
+  anyPlan: boolean[];
+  anyActual: boolean[];
+}
+
+/** flags が true の最初と最後の位置（[from, to] の中で。無ければ null） */
+function span(flags: boolean[], from = 0, to = flags.length - 1): [number, number] | null {
+  let a = -1;
+  let b = -1;
+  for (let i = from; i <= to; i++) {
+    if (!flags[i]) continue;
+    if (a < 0) a = i;
+    b = i;
+  }
+  return a < 0 ? null : [a, b];
+}
+
+/** 値の無い日の並び（続いている日はまとめ、3 つまで書く） */
+function daysText(days: number[], idx: number[]): string {
+  const runs: [number, number][] = [];
+  for (const i of idx) {
+    const r = runs[runs.length - 1];
+    if (r && i === r[1] + 1) r[1] = i;
+    else runs.push([i, i]);
+  }
+  const text = runs.slice(0, 3).map(([a, b]) => (a === b ? formatDay(days[a]) : `${formatDay(days[a])}〜${formatDay(days[b])}`));
+  return `${text.join('、')}${runs.length > 3 ? ' など' : ''}`;
+}
+
+/**
+ * 推移の図の下に出す注記: 選んだ期間のうち、この連系線の値がある範囲と、値の無い日（その日は線が切れる）。
+ * 公表のされ方に決まりのある連系線は、その説明も付ける（special: デモでは付けない）
+ */
+export function coverageNotes(key: IntertieKey, c: LineCoverage, special = true): string[] {
+  const notes: string[] = [];
+  const about = special ? intertieNote(key) : null;
+  if (about) notes.push(about);
+  const p = span(c.plan);
+  if (!p) return notes;
+  const range = (a: number, b: number) => Array.from({ length: b - a + 1 }, (_, i) => a + i);
+  const all = span(c.anyPlan) ?? p;
+  if (p[0] > all[0] || p[1] < all[1]) notes.push(`この期間のうち、この連系線の値があるのは ${formatDay(c.days[p[0]])}〜${formatDay(c.days[p[1]])} です。`);
+  let refetch = false;
+  const planHoles = range(p[0], p[1]).filter((i) => !c.plan[i]);
+  if (planHoles.length > 0) {
+    notes.push(`計画潮流の無い日が ${planHoles.length} 日あります（${daysText(c.days, planHoles)}）。`);
+    refetch ||= planHoles.some((i) => !c.anyPlan[i]);
+  }
+  // 潮流実績は、どれかの連系線に潮流実績のある日の中で見る（まだ実績の無い翌日の分などは数えない）
+  if (!NO_FLOW_LINES.includes(key)) {
+    const w = span(c.anyActual, p[0], p[1]);
+    const a = w && span(c.actual, w[0], w[1]);
+    if (!w) notes.push('この期間には潮流実績がありません。');
+    else if (!a) notes.push('この期間には、この連系線の潮流実績がありません。');
+    else {
+      if (w[0] > p[0]) notes.push(`潮流実績は ${formatDay(c.days[w[0]])} からです。`);
+      if (a[0] > w[0] || a[1] < w[1]) notes.push(`この連系線の潮流実績があるのは ${formatDay(c.days[a[0]])}〜${formatDay(c.days[a[1]])} です。`);
+      const flowHoles = range(a[0], a[1]).filter((i) => !c.actual[i]);
+      if (flowHoles.length > 0) {
+        notes.push(`潮流実績の無い日が ${flowHoles.length} 日あります（${daysText(c.days, flowHoles)}）。`);
+        refetch ||= flowHoles.some((i) => !c.anyActual[i]);
+      }
+    }
+  }
+  if (refetch) notes.push('どの連系線にも値の無い日は、広域機関から取得できていない日です。npm run fetch を実行し直すと取り直します。');
+  return notes;
+}
 
 interface LineStat {
   key: IntertieKey;
@@ -94,6 +181,7 @@ export class IntertiesView extends View {
     const { sel, ds, state } = this.ctx;
     const st = this.ctx.interties;
     const cards = [this.overview, this.trend, this.profile, this.congestion, this.heat, this.net, this.netHeat];
+    this.trend.footer.replaceChildren();
     this.gran.set(state.intertieGran);
     this.netGran.set(state.intertieGran);
     this.netArea.set(state.intertieArea);
@@ -129,6 +217,26 @@ export class IntertiesView extends View {
     this.renderHeat(st, sel, key);
     this.renderNet(st, sel);
     this.renderNetHeat(st, sel);
+  }
+
+  /** 選んだ日ごとに、選んだ連系線とどれかの連系線に、計画潮流と潮流実績があるか */
+  private coverage(st: IntertieStore, sel: Selection, key: IntertieKey): LineCoverage {
+    const { ds } = this.ctx;
+    const has = (a: Float64Array, i: number) => {
+      for (let s = 0; s < SLOTS; s++) if (!Number.isNaN(a[i * SLOTS + s])) return true;
+      return false;
+    };
+    const plans = INTERTIE_KEYS.map((k) => st.array(ds, k, 'plan'));
+    const actuals = INTERTIE_KEYS.map((k) => st.array(ds, k, 'actual'));
+    const line = INTERTIE_INDEX[key];
+    const days = [...sel.days];
+    return {
+      days: days.map((i) => ds.start + i),
+      plan: days.map((i) => has(plans[line], i)),
+      actual: days.map((i) => has(actuals[line], i)),
+      anyPlan: days.map((i) => plans.some((a) => has(a, i))),
+      anyActual: days.map((i) => actuals.some((a) => has(a, i))),
+    };
   }
 
   /** 上限に達したかどうか（1: 順方向、−1: 逆方向、0: 達していない、NaN: 値が無い）をコマごとに */
@@ -231,6 +339,8 @@ export class IntertiesView extends View {
     const shown = TREND_LINES.map((l, i) => ({ ...l, points: raw[i].points })).filter((l) => l.points.some((p) => Number.isFinite(p[1])));
     this.trend.setTitle(`${intertieTitle(key)}の計画潮流と上限の推移`);
     this.trend.setSubtitle(`${describeSelection(sel, state)}・MW（正は順方向: ${forward(key)}）、${granText(gran)}`);
+    // 値の無い期間や日（線が切れる所）と、その理由を図の下に書く
+    this.trend.footer.replaceChildren(...coverageNotes(key, this.coverage(st, sel, key), !st.isDemo).map((text) => h('p', { class: 'card-note' }, text)));
     const names = shown.map((l) => l.name);
     const ends = endLabels(names, shown.map((l) => l.points.map((p) => p[1])), theme, 260);
     this.trend.setOption(

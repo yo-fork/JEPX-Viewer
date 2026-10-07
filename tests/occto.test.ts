@@ -23,6 +23,7 @@ import {
   type IntertieKey,
 } from '../src/lib/occto';
 import { SERIES_INDEX, SLOTS, type AreaKey } from '../src/lib/series';
+import { coverageNotes, type LineCoverage } from '../src/views/interties';
 import { DataStore } from '../src/lib/store';
 
 /** 連系線空容量（翌日）の CSV（広域機関の形。2 コマ分と、知らない連系線） */
@@ -226,5 +227,41 @@ describe('連系線のデータ（ブラウザ側）', () => {
       expect(plan[k]).toBe(tohoku[k] < tokyo[k] ? 5550 : -2400);
     }
     expect(split).toBeGreaterThan(0);
+  });
+});
+
+describe('連系線の推移の図の注記', () => {
+  const day0 = dayFromYmd(2026, 3, 10);
+  /** 1 文字が 1 日（1 は値あり、0 は値なし） */
+  const cov = (plan: string, actual: string, anyPlan = '1'.repeat(plan.length), anyActual = '1'.repeat(plan.length)): LineCoverage => {
+    const flags = (s: string) => [...s].map((ch) => ch === '1');
+    return { days: [...plan].map((_, i) => day0 + i), plan: flags(plan), actual: flags(actual), anyPlan: flags(anyPlan), anyActual: flags(anyActual) };
+  };
+
+  it('中地域の個別の連系線は、値のある期間と、フェンスに変わったことを書く', () => {
+    const notes = coverageNotes('chubuKansai', cov('1111000', '1110000'));
+    expect(notes[0]).toContain('2026 年 3 月 13 日受渡分まで');
+    expect(notes).toContain('この期間のうち、この連系線の値があるのは 2026/03/10〜2026/03/13 です。');
+    expect(notes).toContain('この連系線の潮流実績があるのは 2026/03/10〜2026/03/12 です。');
+    expect(notes.some((n) => n.includes('npm run fetch'))).toBe(false);
+    // デモでは、実際の公表のされ方の説明は付けない
+    expect(coverageNotes('chubuKansai', cov('1111000', '1110000'), false)[0]).toContain('値があるのは');
+  });
+
+  it('どの連系線にも値の無い日は、取得できていない日として取り直し方を書く', () => {
+    const notes = coverageNotes('tohokuTokyo', cov('1100111', '1100111', '1100111', '1100111'));
+    expect(notes).toContain('計画潮流の無い日が 2 日あります（2026/03/12〜2026/03/13）。');
+    expect(notes).toContain('潮流実績の無い日が 2 日あります（2026/03/12〜2026/03/13）。');
+    expect(notes[notes.length - 1]).toContain('npm run fetch');
+    expect(coverageNotes('tohokuTokyo', cov('1111111', '1111111'))).toEqual([]);
+  });
+
+  it('潮流実績の無い連系線（関西-中国間の内訳）と、まだ実績の無い翌日は、潮流実績が無いと書かない', () => {
+    expect(coverageNotes('kansaiChugokuEast', cov('1111111', '0000000'))).toEqual([expect.stringContaining('潮流実績と計画潮流（最終）は公表されていません')]);
+    // 最後の日（翌日）は、どの連系線にも潮流実績がまだ無い
+    expect(coverageNotes('tohokuTokyo', cov('1111111', '1111110', '1111111', '1111110'))).toEqual([]);
+    expect(coverageNotes('tohokuTokyo', cov('1111111', '0000000', '1111111', '0000000'))).toEqual(['この期間には潮流実績がありません。']);
+    expect(coverageNotes('tohokuTokyo', cov('1111111', '0000000'))).toEqual(['この期間には、この連系線の潮流実績がありません。']);
+    expect(coverageNotes('tohokuTokyo', cov('1111111', '0001111', '1111111', '0001111'))).toEqual(['潮流実績は 2026/03/13 からです。']);
   });
 });

@@ -352,6 +352,23 @@ const CENTRAL_LINES: readonly IntertieKey[] = ['chubuKansai', 'chubuHokuriku', '
 const CENTRAL_FENCES: readonly IntertieKey[] = ['chubuFence', 'hokurikuFence', 'kansaiFence'];
 /** 関西-中国間の内訳（合計の連系線と重ねて数えない） */
 const SUB_LINES: readonly IntertieKey[] = ['kansaiChugokuEast', 'kansaiChugokuWest'];
+/** 潮流実績が公表されていない連系線（関西-中国間の内訳。潮流実績の CSV には合計の関西-中国間だけがある） */
+export const NO_FLOW_LINES: readonly IntertieKey[] = SUB_LINES;
+
+/**
+ * 公表のされ方に決まりのある連系線の説明（推移の図の注記に出す。無ければ null）。
+ * 中地域は 2026 年 3 月 13 日受渡分を境に、個別の連系線からフェンスに変わった（13 日受渡分だけは両方ある）
+ */
+export function intertieNote(key: IntertieKey): string | null {
+  if (CENTRAL_LINES.includes(key)) {
+    return '中部-関西間、中部-北陸間、北陸-関西間の計画潮流は、2026 年 3 月 13 日受渡分まで公表されています（3 月 14 日受渡分からは、中部フェンス、北陸フェンス、関西フェンスで管理しています）。';
+  }
+  if (key === 'chubuFence' || key === 'kansaiFence') {
+    return '中部フェンスと関西フェンスの計画潮流は、2026 年 3 月 13 日受渡分から公表されています（それより前は、中部-関西間などの個別の連系線で管理していました）。';
+  }
+  if (NO_FLOW_LINES.includes(key)) return '関西-中国間（東）と（西）は関西-中国間の内訳で、潮流実績と計画潮流（最終）は公表されていません（関西-中国間にはあります）。';
+  return null;
+}
 
 /** 市場分断のまとまりの境をまたぐ連系線と、その計画潮流（順方向に流れたときに送る側・受ける側のまとまりの番号） */
 export interface CrossingFlow {
