@@ -155,24 +155,33 @@ export class IntertiesView extends View {
   protected build(): void {
     const s = this.ctx.state;
     this.note = h('p', { class: 'view-note' });
+    this.root.append(this.note, h('h2', { class: 'view-section-title' }, '連系線ごとの比較'));
+    const g1 = this.grid();
+    this.overview = this.card(g1, { title: '連系線ごとの、計画潮流が上限に達したコマの割合', height: 360, wide: true });
+    // 連系線を選ぶリストは、それで変わる図（推移、時間帯別、ヒートマップ）の見出しの下に置く
     this.line = selectField<IntertieKey>('連系線', [], s.intertie, (v) => this.set({ intertie: v }));
-    this.root.append(this.note, toolbar(this.line.el));
-    const g = this.grid();
-    this.overview = this.card(g, { title: '連系線ごとの、計画潮流が上限に達したコマの割合', height: 360, wide: true });
+    const lineTitle = h('h2', { class: 'view-section-title' }, '選んだ連系線');
+    this.root.append(lineTitle, toolbar(this.line.el));
     this.overview.chart.on('click', (e: unknown) => {
       const key = this.overviewKeys[(e as { dataIndex: number }).dataIndex];
-      if (key) this.set({ intertie: key });
+      if (!key) return;
+      // 押した連系線の図が見えるように移る
+      this.set({ intertie: key });
+      lineTitle.scrollIntoView({ behavior: 'smooth', block: 'start' });
     });
-    this.trend = this.card(g, { title: '計画潮流と上限の推移', height: 360, wide: true });
+    const g2 = this.grid();
+    this.trend = this.card(g2, { title: '計画潮流と上限の推移', height: 360, wide: true });
     this.gran = segmented('粒度', CURVE_GRAN_OPTIONS, s.intertieGran, (v) => this.set({ intertieGran: v }));
     this.trend.addControls(this.gran.el);
-    this.profile = this.card(g, { title: '時間帯別の平均', height: 320 });
-    this.congestion = this.card(g, { title: '時間帯別の、上限に達したコマの割合', height: 320 });
-    this.heat = this.card(g, { title: '計画潮流（翌日）のヒートマップ', height: 480, wide: true });
-    this.net = this.card(g, { title: 'エリアごとの正味の受け入れ量の推移', height: 360, wide: true });
+    this.profile = this.card(g2, { title: '時間帯別の平均', height: 320 });
+    this.congestion = this.card(g2, { title: '時間帯別の、上限に達したコマの割合', height: 320 });
+    this.heat = this.card(g2, { title: '計画潮流（翌日）のヒートマップ', height: 480, wide: true });
+    this.root.append(h('h2', { class: 'view-section-title' }, 'エリアごとの受け入れ量'));
+    const g3 = this.grid();
+    this.net = this.card(g3, { title: 'エリアごとの正味の受け入れ量の推移', height: 360, wide: true });
     this.netGran = segmented('粒度', CURVE_GRAN_OPTIONS, s.intertieGran, (v) => this.set({ intertieGran: v }));
     this.net.addControls(this.netGran.el);
-    this.netHeat = this.card(g, { title: 'エリアの正味の受け入れ量のヒートマップ', height: 480, wide: true });
+    this.netHeat = this.card(g3, { title: 'エリアの正味の受け入れ量のヒートマップ', height: 480, wide: true });
     this.netArea = selectField<AreaKey>('エリア', AREAS.map((a) => ({ value: a.key, label: a.label })), s.intertieArea, (v) => this.set({ intertieArea: v }));
     this.netHeat.addControls(this.netArea.el);
   }
