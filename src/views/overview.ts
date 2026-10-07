@@ -14,7 +14,7 @@ import { renderTiles } from '../ui/kpi';
 import { TOKENS } from '../ui/theme';
 import { ttHeader, ttRow } from '../ui/tooltip';
 import { NO_DATA, View } from './base';
-import { axisTooltip, categoryBarOption, describeSelection, endLabels, grid, isNarrow, labelRoom, lineSeries, PRICE_UNIT, priceText, rangeTag, seriesLegend, slotAxis, valueAxis } from './common';
+import { axisTooltip, categoryBarOption, describeSelection, endLabels, grid, isNarrow, labelRoom, LINE_SAMPLING, lineSeries, PRICE_UNIT, priceText, rangeTag, seriesLegend, slotAxis, valueAxis } from './common';
 import { autoGranularity, breakGaps, buildSeriesPoints, periodLabel, TIME_AXIS_LABEL } from './timeseries';
 import { slotStartLabel } from '../lib/dates';
 
@@ -119,7 +119,7 @@ export class OverviewView extends View {
         xAxis: { type: 'time', axisLabel: TIME_AXIS_LABEL },
         yAxis: valueAxis(),
         series: keys.map((k, i) =>
-          lineSeries(k, theme, gran === 'slot' ? breakGaps(data[i].points) : data[i].points, { sampling: 'lttb', z: k === 'system' ? 3 : 2, ...ends[i] }),
+          lineSeries(k, theme, gran === 'slot' ? breakGaps(data[i].points) : data[i].points, { sampling: LINE_SAMPLING, z: k === 'system' ? 3 : 2, ...ends[i] }),
         ),
       },
       {

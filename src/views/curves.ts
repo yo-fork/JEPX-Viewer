@@ -58,6 +58,7 @@ import {
   grid,
   isNarrow,
   labelRoom,
+  LINE_SAMPLING,
   lineLegend,
   PRICE_UNIT,
   rangeTag,
@@ -1268,7 +1269,7 @@ export class CurvesView extends View {
         xAxis: { type: 'time', axisLabel: TIME_AXIS_LABEL },
         yAxis: valueAxis('GW'),
         series: defs.map((d, i) =>
-          styledLine(d.name, colors[i], theme, gran === 'slot' ? breakGaps(data[i]) : data[i], false, { sampling: 'lttb', ...ends[i] }),
+          styledLine(d.name, colors[i], theme, gran === 'slot' ? breakGaps(data[i]) : data[i], false, { sampling: LINE_SAMPLING, ...ends[i] }),
         ),
       },
       {

@@ -29,7 +29,7 @@ import { h } from '../ui/dom';
 import { seriesColor, seriesDashed, TOKENS } from '../ui/theme';
 import { ttHeader, ttNote, ttRow } from '../ui/tooltip';
 import { NO_DATA, View } from './base';
-import { describeSelection, endLabels, grid, labelRoom, lineLegend, rangeTag, slotAxis, styledLine, valueAxis } from './common';
+import { describeSelection, endLabels, grid, labelRoom, LINE_SAMPLING, lineLegend, rangeTag, slotAxis, styledLine, valueAxis } from './common';
 import { CURVE_GRAN_OPTIONS, curveGranularity, granText, namedTooltip, slotZoom } from './curveCommon';
 import { buildGrid, colorRange, gridTable, heatmapHeight, heatmapOption } from './heatmap';
 import { breakGaps, buildSeriesPoints, periodLabel, TIME_AXIS_LABEL } from './timeseries';
@@ -362,7 +362,7 @@ export class IntertiesView extends View {
         yAxis: valueAxis('MW'),
         series: shown.map((l, i) =>
           styledLine(l.name, color[l.color], theme, gran === 'slot' ? breakGaps(l.points) : l.points, l.dashed, {
-            sampling: 'lttb',
+            sampling: LINE_SAMPLING,
             ...(l.field === 'actual' ? { lineStyle: { width: 1.5 } } : {}),
             ...ends[i],
           }),
@@ -516,7 +516,7 @@ export class IntertiesView extends View {
         },
         xAxis: { type: 'time', axisLabel: TIME_AXIS_LABEL },
         yAxis: valueAxis('MW'),
-        series: shown.map((l) => styledLine(l.name, l.color, theme, gran === 'slot' ? breakGaps(l.points) : l.points, l.dashed, { sampling: 'lttb' })),
+        series: shown.map((l) => styledLine(l.name, l.color, theme, gran === 'slot' ? breakGaps(l.points) : l.points, l.dashed, { sampling: LINE_SAMPLING })),
       },
       {
         columns: ['期間', ...names.map((n) => `${n}（MW）`)],

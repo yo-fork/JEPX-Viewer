@@ -21,6 +21,7 @@ import {
   endLabels,
   grid,
   labelRoom,
+  LINE_SAMPLING,
   lineLegend,
   lineSeries,
   PRICE_UNIT,
@@ -198,7 +199,7 @@ export class TrendView extends View {
     this.chart.setHeight(440);
     const ends = endLabels(keys.map((k) => SERIES_SHORT[k]), data.map((d) => d.points.map((p) => p[1])), theme, 320);
     const series: Record<string, unknown>[] = keys.map((k, i) =>
-      lineSeries(k, theme, gran === 'slot' ? breakGaps(data[i].points) : data[i].points, { sampling: 'lttb', z: k === 'system' ? 4 : 3, ...ends[i] }),
+      lineSeries(k, theme, gran === 'slot' ? breakGaps(data[i].points) : data[i].points, { sampling: LINE_SAMPLING, z: k === 'system' ? 4 : 3, ...ends[i] }),
     );
     let tooltip = axisTooltip(keys, theme, (p) => periodLabel(p.value[0], gran));
     if (withRange) {
@@ -327,14 +328,14 @@ export class TrendView extends View {
           styledLine(`${SERIES_SHORT[r]}${REF_SUFFIX}`, seriesColor(r, theme), theme, line(pointsOf.get(r)!), seriesDashed(r), {
             xAxisIndex: i,
             yAxisIndex: i,
-            sampling: 'lttb',
+            sampling: LINE_SAMPLING,
             lineStyle: { width: 1.25, type: seriesDashed(r) ? [5, 3] : 'solid', opacity: 0.9 },
             z: 2,
           }),
         );
         seriesKeyOf.push(r);
       }
-      series.push(lineSeries(k, theme, line(pointsOf.get(k)!), { xAxisIndex: i, yAxisIndex: i, sampling: 'lttb', z: 3 }));
+      series.push(lineSeries(k, theme, line(pointsOf.get(k)!), { xAxisIndex: i, yAxisIndex: i, sampling: LINE_SAMPLING, z: 3 }));
       seriesKeyOf.push(k);
     });
 

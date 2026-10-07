@@ -55,7 +55,7 @@ import { renderTiles, type StatTile } from '../ui/kpi';
 import { TOKENS, type ThemeName } from '../ui/theme';
 import { ttHeader, ttNote, ttRow } from '../ui/tooltip';
 import type { ViewContext } from './base';
-import { categoryBarOption, describeSelection, endLabels, grid, legend, PRICE_UNIT, rangeTag, styledLine, valueAxis, withAlpha } from './common';
+import { categoryBarOption, describeSelection, endLabels, grid, legend, LINE_SAMPLING, PRICE_UNIT, rangeTag, styledLine, valueAxis, withAlpha } from './common';
 import {
   CURVE_GRAN_OPTIONS,
   curveGranularity,
@@ -1308,7 +1308,7 @@ export class SensitivitySection {
         yAxis: valueAxis(opts.unit, opts.min !== undefined ? { min: opts.min } : {}),
         series: lines.map((l, i) =>
           styledLine(l.name, l.color, theme, gran === 'slot' ? breakGaps(data[i]) : data[i], l.dashed, {
-            sampling: 'lttb',
+            sampling: LINE_SAMPLING,
             ...ends[i],
             // 最後に描く系列に付けて、「実際の買い」の文字が線の下に隠れないようにする
             ...(opts.zeroLine && i === lines.length - 1

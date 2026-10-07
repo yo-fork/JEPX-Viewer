@@ -15,6 +15,13 @@ import { ttHeader, ttRow } from '../ui/tooltip';
 
 export const PRICE_UNIT = '円/kWh';
 
+/**
+ * 点の多い折れ線の間引き方（横軸の 1 画素に 2 点以上あるとき）。区間ごとの最小と最大を残すので、価格の急な上下も消えない。
+ * lttb は使わない。ECharts 6.1 の lttb は、値の無い点だけの区間に当たると、拡大（dataZoom）で絞り込んだ後の番号を
+ * 元のデータの番号として使うため、別の時刻の点を拾い、拡大すると線を前の時刻から描き直してしまう
+ */
+export const LINE_SAMPLING = 'minmax';
+
 /** 軸ラベルがはみ出さない範囲でグラフ領域を取る */
 export function grid(extra: Record<string, unknown> = {}): Record<string, unknown> {
   return { left: 8, right: 20, top: 44, bottom: 8, outerBoundsMode: 'same', outerBoundsContain: 'all', ...extra };
