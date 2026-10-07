@@ -4,7 +4,7 @@
  */
 import { toCsv } from '../lib/csv';
 import { fmtNum } from '../lib/format';
-import { downloadText, h, uniqueId } from './dom';
+import { canDownload, downloadText, h, uniqueId } from './dom';
 import { initChart, type echarts, type EChartsOption } from './echarts';
 import type { ThemeName } from './theme';
 
@@ -54,7 +54,7 @@ export class ChartCard {
     );
     this.csvBtn = h(
       'button',
-      { type: 'button', class: 'btn btn-ghost btn-sm', onclick: () => this.downloadCsv(), title: 'この図のデータを CSV で保存' },
+      { type: 'button', class: 'btn btn-ghost btn-sm', onclick: () => this.downloadCsv(), title: 'この図のデータを CSV で保存', hidden: !canDownload() },
       'CSV',
     );
     this.chartEl = h('div', { class: 'chart', style: `height:${opts.height}px`, role: 'img', 'aria-labelledby': titleId });
@@ -166,7 +166,11 @@ export class ChartCard {
     );
     const note =
       t.rows.length > MAX_TABLE_ROWS
-        ? h('p', { class: 'table-note' }, `先頭 ${fmtNum(MAX_TABLE_ROWS)} 行を表示しています（全 ${fmtNum(t.rows.length)} 行は CSV で保存できます）。`)
+        ? h(
+            'p',
+            { class: 'table-note' },
+            `先頭 ${fmtNum(MAX_TABLE_ROWS)} 行を表示しています${canDownload() ? `（全 ${fmtNum(t.rows.length)} 行は CSV で保存できます）` : ''}。`,
+          )
         : null;
     this.tableEl.replaceChildren(table, ...(note ? [note] : []));
   }

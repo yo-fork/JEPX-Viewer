@@ -204,12 +204,40 @@ export function saveThemeMode(mode: ThemeMode): void {
   }
 }
 
+/**
+ * 外側のページ（Claude の Artifact の表示など）が根の要素の data-theme で指定した配色（無ければ null）。
+ * 配色が「自動」のときは、OS の設定よりこちらに従う。アプリが付けたものと見分けるため、最後に付けた値も覚えておく
+ */
+let hostTheme: ThemeName | null | undefined;
+let appliedTheme: string | undefined;
+
+const asTheme = (v: string | undefined): ThemeName | null => (v === 'light' || v === 'dark' ? v : null);
+
+/** 外側のページが指定した配色（アプリが data-theme を付ける前に読む） */
+function readHostTheme(): ThemeName | null {
+  if (hostTheme === undefined) hostTheme = asTheme(document.documentElement.dataset.theme);
+  return hostTheme;
+}
+
 export function applyThemeMode(mode: ThemeMode): void {
-  if (mode === 'auto') delete document.documentElement.dataset.theme;
-  else document.documentElement.dataset.theme = mode;
+  const root = document.documentElement;
+  const theme = mode === 'auto' ? readHostTheme() : mode;
+  if (theme) root.dataset.theme = theme;
+  else delete root.dataset.theme;
+  appliedTheme = root.dataset.theme;
 }
 
 export function effectiveTheme(mode: ThemeMode): ThemeName {
   if (mode !== 'auto') return mode;
-  return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  return readHostTheme() ?? (window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+}
+
+/** 外側のページが配色を変えたら onChange を呼ぶ（アプリ自身が付けた値への変化では呼ばない） */
+export function watchHostTheme(onChange: () => void): void {
+  const root = document.documentElement;
+  new MutationObserver(() => {
+    if (root.dataset.theme === appliedTheme) return;
+    hostTheme = asTheme(root.dataset.theme);
+    onChange();
+  }).observe(root, { attributes: true, attributeFilter: ['data-theme'] });
 }

@@ -10,7 +10,7 @@ import { PRICE_KEYS, SERIES_COUNT, SERIES_INDEX, SERIES_LABEL, SERIES_SHORT, SLO
 import { accMean, accStd, quantileSorted } from '../lib/stats';
 import type { TableKind, TableUnit } from '../state';
 import { numberField, segmented, selectField, toolbar, type Segmented, type SelectField } from '../ui/controls';
-import { downloadText, h } from '../ui/dom';
+import { canDownload, downloadText, h } from '../ui/dom';
 import { NO_DATA, View } from './base';
 import { describeSelection, monthLabel, PRICE_UNIT, rangeTag } from './common';
 import { periodLabel } from './timeseries';
@@ -75,10 +75,16 @@ export class TableView extends View {
         h(
           'div',
           { class: 'card-actions' },
-          h('button', { type: 'button', class: 'btn btn-sm', onclick: () => this.downloadTable() }, 'この表を CSV で保存'),
+          h('button', { type: 'button', class: 'btn btn-sm', onclick: () => this.downloadTable(), hidden: !canDownload() }, 'この表を CSV で保存'),
           h(
             'button',
-            { type: 'button', class: 'btn btn-sm', onclick: () => this.downloadRaw(), title: '絞り込み条件に合う 30 分値を JEPX と同じ列名で保存' },
+            {
+              type: 'button',
+              class: 'btn btn-sm',
+              onclick: () => this.downloadRaw(),
+              title: '絞り込み条件に合う 30 分値を JEPX と同じ列名で保存',
+              hidden: !canDownload(),
+            },
             '30分値を CSV で保存',
           ),
         ),
@@ -233,7 +239,9 @@ export class TableView extends View {
       ),
     );
     this.note.textContent =
-      t.rows.length > MAX_ROWS ? `先頭 ${fmtNum(MAX_ROWS)} 行を表示しています（全 ${fmtNum(t.rows.length)} 行は CSV で保存できます）。` : `${fmtNum(t.rows.length)} 行`;
+      t.rows.length > MAX_ROWS
+        ? `先頭 ${fmtNum(MAX_ROWS)} 行を表示しています${canDownload() ? `（全 ${fmtNum(t.rows.length)} 行は CSV で保存できます）` : ''}。`
+        : `${fmtNum(t.rows.length)} 行`;
   }
 
   private downloadTable(): void {

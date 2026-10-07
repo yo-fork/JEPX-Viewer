@@ -223,7 +223,8 @@ npm run build:single   # dist-single/jepx-viewer.html に出力
 | `--no-curves` | 入札カーブを入れない |
 | `--no-interties` | 連系線（広域機関の計画潮流と潮流実績）を入れない |
 | `--no-compress` | データを圧縮せず、JSON のまま埋め込む（圧縮したデータを戻せない古いブラウザ向け） |
-| `--out <ファイル>` | 出力先（既定: `dist-single/jepx-viewer.html`） |
+| `--artifact` | Claude の Artifact に出すページにする（下記） |
+| `--out <ファイル>` | 出力先（既定: `dist-single/jepx-viewer.html`、`--artifact` では `dist-single/artifact/jepx-viewer.html`） |
 
 例: `npm run build:single -- --from 2021`
 
@@ -256,6 +257,26 @@ dist-single/
 - HTML と `data` フォルダは、同じ場所に並べて置いてください。
 - `--out` に共有フォルダの場所を指定すると、そこへ直接書き込めます（例: `npm run build:single -- --split --out "\\server\share\JEPX\jepx-viewer.html"`）。`npm run fetch` とこのコマンドを Windows のタスク スケジューラなどで定期的に実行すれば、毎日の更新も自動化できます。
 - ファイルから開いたページは JSON を読めないため、データは数値の一覧を登録するだけの JavaScript ファイル（.js）にしています。`data` フォルダの中身もブラウザで実行されるので、共有フォルダは更新する人だけが書き込めるようにしてください（HTML も同じです）。読み込むのは `data` フォルダの決まった名前のファイルだけで、ネット上のスクリプトや通信は CSP で禁止しています。
+
+#### Claude の Artifact に出す
+
+`--artifact` を付けると、Claude の Artifact（claude.ai に置くページ）として出すためのページを作ります。
+Artifact は公開するときにページを `<head>` などで包むので、題名、CSS、JS、データだけを並べた形にします。
+CSP は Artifact の側で決まっているので、ページには入れません。
+
+```sh
+npm run build:single -- --artifact --no-data    # データなし（デモと、読み込んだ CSV で使う）
+npm run build:single -- --artifact --from 2025  # 2025 年度以降のデータを埋め込む
+npm run build:single -- --artifact --split      # データを data フォルダに JSON のまま分けて出す
+```
+
+- Artifact のページは 16 MB までなので、データを埋め込むときは `--from` で年度を絞ります。16 MB を超えると、作成するときにエラーにします。
+- `--split` では、`data` フォルダの中身をページと一緒に `data/` として出します（ページはそれを fetch で読みます）。ファイル 1 つは 16 MB まで、1 つの Artifact に入るのは合わせて 256 MB までです。
+- データが無いときは、最初からデモを表示します。
+- Artifact の中ではファイルを保存できないので、CSV で保存するボタンは出しません。
+- Artifact のリンクの `#` 以降はページに届かないので、絞り込み条件をリンクで共有することはできません。
+- 配色が「自動」のときは、Artifact を見ている人の配色の設定に合わせます。
+- データを入れたページを人と共有するときは、JEPX と広域機関のデータの利用条件を確認してください。
 
 ## 集計の定義
 

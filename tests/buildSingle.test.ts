@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { gunzipSync, gzipSync } from 'node:zlib';
 import {
+  ARTIFACT_OUT,
+  assembleArtifact,
   assembleHtml,
   buildSingle,
   dataScript,
@@ -43,6 +45,8 @@ const INDEX_HTML = `<!doctype html>
   </body>
 </html>
 `;
+/** 題名のある index.html（実際の index.html と同じく、題名を head に書く） */
+const TITLED_HTML = INDEX_HTML.replace('<meta charset="utf-8" />', '<meta charset="utf-8" />\n    <title>JEPX Viewer</title>');
 /** 置き換えで意味を持つ $& などや、HTML を狂わせる並び、CRLF をわざと含める */
 const JS = 'const s = "</script><!--";\r\nconst r = "$&$1$$";\r\nconsole.log(s, r);\r\n';
 const CSS = 'body{color:red}\r\n.a::before{content:"<"}\r\n';
@@ -181,6 +185,25 @@ describe('assembleHtml', () => {
     expect(blocks(html)).toEqual([{ file: 'manifest.json', compressed: false, json: null }]);
   });
 
+  it('Artifact では <html>・<head>・<body> と CSP を書かず、題名を先頭に置き、Artifact の中だと示す', async () => {
+    const html = await assembleArtifact(TITLED_HTML, readAsset, null);
+    expect(html.startsWith('<title>JEPX Viewer</title>\n<style>')).toBe(true);
+    expect(html).not.toMatch(/<!doctype|<html|<head|<body|<\/body>|<meta/i);
+    expect(html).toContain('<div id="app" lang="ja" data-host="artifact"></div>');
+    expect(inlineScript(html)).toBe(escapeInlineScript(JS.replace(/\r\n/g, '\n')));
+    expect(inlineStyle(html)).toBe(CSS.replace(/\r\n/g, '\n'));
+    // データなしでも manifest（null）を埋め込み、データを探しに行かない
+    expect(blocks(html)).toEqual([{ file: 'manifest.json', compressed: false, json: null }]);
+    expect(blocks(await assembleArtifact(TITLED_HTML, readAsset, DATA, true)).map((b) => [b.file, b.compressed])).toEqual([
+      ['manifest.json', false],
+      ['spot/fy2023.json', true],
+      ['spot/fy2024.json', true],
+    ]);
+    // ページと一緒に出す data/*.json を fetch で読むときは、何も埋め込まない
+    expect(blocks(await assembleArtifact(TITLED_HTML, readAsset, 'fetch'))).toEqual([]);
+    await expect(assembleArtifact(INDEX_HTML, readAsset, null)).rejects.toThrow(/<title>/);
+  });
+
   it('想定外の index.html は埋め込まずにエラーにする', async () => {
     const twoScripts = INDEX_HTML.replace('</head>', '<script type="module" src="./assets/b.js"></script></head>');
     await expect(assembleHtml(twoScripts, readAsset, null)).rejects.toThrow(/script 2 個/);
@@ -214,6 +237,10 @@ describe('parseArgs', () => {
     expect(() => parseArgs(['--curve-days', '0'])).toThrow(/1 以上/);
     expect(() => parseArgs(['--curve-days', 'x'])).toThrow(/1 以上/);
     expect(() => parseArgs(['--curve-days', '3', '--no-curves'])).toThrow(/同時に指定できません/);
+    // --artifact は、出力先を指定しなければ Artifact 用の場所に出す
+    expect(parseArgs(['--artifact'])).toMatchObject({ artifact: true, out: ARTIFACT_OUT });
+    expect(parseArgs(['--out', 'y.html', '--artifact']).out).toBe('y.html');
+    expect(d.artifact).toBe(false);
   });
 });
 
@@ -277,6 +304,26 @@ describe('buildSingle', () => {
     expect(calls.map((c) => c[0])).toEqual(['manifest.json', 'spot/fy2023.json', 'spot/fy2024.json']);
     expect((calls[0][1] as Manifest).files.map((f) => f.file)).toEqual(['spot/fy2023.json', 'spot/fy2024.json']);
     expect([...decodeFyFile(calls[2][1]).keys()]).toEqual([...days2024.keys()]);
+  });
+
+  it('--artifact --split では、ページと一緒に出す data/*.json を取得済みデータと同じ名前と中身で書く', async () => {
+    const dist = path.join(dir, 'dist-titled');
+    await mkdir(path.join(dist, 'assets'), { recursive: true });
+    await writeFile(path.join(dist, 'index.html'), TITLED_HTML);
+    await writeFile(path.join(dist, 'assets', 'index-abc.js'), JS);
+    await writeFile(path.join(dist, 'assets', 'index-abc.css'), CSS);
+    const out = path.join(dir, 'artifact', 'page.html');
+    const { dataBytes } = await buildSingle(opts({ artifact: true, split: true, dist, out }));
+    const html = await readFile(out, 'utf8');
+    expect(html.startsWith('<title>')).toBe(true);
+    expect(blocks(html)).toEqual([]);
+    const read = async (file: string) => JSON.parse(await readFile(path.join(dir, 'artifact', 'data', file), 'utf8')) as unknown;
+    const manifest = (await read('manifest.json')) as Manifest;
+    expect(manifest.files.map((f) => f.file)).toEqual(['spot/fy2023.json', 'spot/fy2024.json']);
+    expect(manifest.source).toBe('local');
+    expect([...decodeFyFile(await read('spot/fy2024.json')).keys()]).toEqual([...days2024.keys()]);
+    expect(await read('spot/fy2023.json')).toEqual(JSON.parse(await readFile(path.join(dir, 'data', 'spot', 'fy2023.json'), 'utf8')));
+    expect(dataBytes).toBeGreaterThan(0);
   });
 
   it('--no-data ではデータを読まない。データが無ければ取得方法を案内する', async () => {

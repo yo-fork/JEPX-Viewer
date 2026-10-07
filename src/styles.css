@@ -457,6 +457,8 @@ input[type='number'] {
   left: 0;
   right: 0;
   z-index: 40;
+  /* スマートフォンの画面上端の表示（時刻など）に重ならないようにする */
+  padding-top: env(safe-area-inset-top, 0px);
   border-bottom: 1px solid var(--border);
   background: var(--surface);
   box-shadow: var(--shadow);
@@ -934,7 +936,7 @@ input[type='number'] {
 .toasts {
   position: fixed;
   right: 16px;
-  bottom: 16px;
+  bottom: calc(16px + env(safe-area-inset-bottom, 0px));
   z-index: 60;
   display: flex;
   flex-direction: column;

@@ -42,6 +42,17 @@ export function uniqueId(prefix = 'jv'): string {
   return `${prefix}-${uid}`;
 }
 
+let downloads = true;
+
+/** ファイルを保存できない所（Claude の Artifact の中など）で、保存のボタンを出さないようにする */
+export function disableDownloads(): void {
+  downloads = false;
+}
+
+export function canDownload(): boolean {
+  return downloads;
+}
+
 export function downloadText(filename: string, text: string, mime = 'text/csv;charset=utf-8'): void {
   // Excel で文字化けしないよう UTF-8 BOM を付ける
   const blob = new Blob(['﻿', text], { type: mime });

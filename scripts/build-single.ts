@@ -5,6 +5,7 @@
  *   npm run build:single -- --from 2021     2021 年度以降だけ埋め込む
  *   npm run build:single -- --no-data       データを埋め込まない（各自が JEPX の CSV を読み込む）
  *   npm run build:single -- --split         データを HTML に入れず、HTML と同じ場所の data フォルダに出力する（共有フォルダ向け）
+ *   npm run build:single -- --artifact      Claude の Artifact に出すページを作る（--split ではデータを data/*.json として出す）
  *
  * 入札カーブ（npm run fetch で取得したもの）は、指標をすべてと、1 コマの図に使うカーブを直近 7 日分入れる
  * （1 日分が数百 KB あるため。--curve-days で変えられる）。--split では取得済みのカーブをすべて data フォルダに書き出す。
@@ -52,8 +53,15 @@ export interface SingleOptions {
   noInterties: boolean;
   /** 埋め込むデータを gzip で圧縮する（--no-compress で JSON のまま） */
   compress: boolean;
+  /** Claude の Artifact に出すページにする（--split ではデータを data/ に JSON のまま書き出し、fetch で読む） */
+  artifact: boolean;
   log: (msg: string) => void;
 }
+
+/** --artifact で --out を指定しなかったときの出力先 */
+export const ARTIFACT_OUT = 'dist-single/artifact/jepx-viewer.html';
+/** Artifact に出せるページと、ページと一緒に出すファイル 1 つの大きさの上限（16 MB。少なめに見積もる） */
+export const ARTIFACT_MAX_BYTES = 16_000_000;
 
 export function defaultOptions(): SingleOptions {
   return {
@@ -62,6 +70,7 @@ export function defaultOptions(): SingleOptions {
     out: 'dist-single/jepx-viewer.html',
     noData: false,
     split: false,
+    artifact: false,
     noCurves: false,
     noInterties: false,
     compress: true,
@@ -78,12 +87,14 @@ const HELP = `使い方: npm run build:single -- [オプション]
   --no-curves            入札カーブを入れない
   --no-interties         連系線（広域機関の公表値）を入れない
   --no-compress          データを圧縮せず、JSON のまま埋め込む（DecompressionStream に対応していない古いブラウザ向け）
-  --out <ファイル>       出力先（既定: dist-single/jepx-viewer.html）
+  --artifact             Claude の Artifact に出すページにする（--split ではデータを data フォルダに JSON のまま出す）
+  --out <ファイル>       出力先（既定: dist-single/jepx-viewer.html、--artifact では ${ARTIFACT_OUT}）
   --data <ディレクトリ>  取得済みデータの場所（既定: public/data）
   --dist <ディレクトリ>  vite build の出力先（既定: dist）`;
 
 export function parseArgs(argv: string[], base = defaultOptions()): SingleOptions {
   const o = { ...base };
+  let outGiven = false;
   const year = (a: string, v: string) => {
     const n = Number(v);
     if (!Number.isInteger(n)) throw new Error(`${a} には年度（例: 2024）を指定してください`);
@@ -124,8 +135,12 @@ export function parseArgs(argv: string[], base = defaultOptions()): SingleOption
       case '--no-compress':
         o.compress = false;
         break;
+      case '--artifact':
+        o.artifact = true;
+        break;
       case '--out':
         o.out = next();
+        outGiven = true;
         break;
       case '--data':
         o.data = next();
@@ -145,6 +160,7 @@ export function parseArgs(argv: string[], base = defaultOptions()): SingleOption
   if (o.from !== undefined && o.to !== undefined && o.from > o.to) throw new Error('--from が --to より後になっています');
   if (o.split && o.noData) throw new Error('--split と --no-data は同時に指定できません');
   if (o.noCurves && o.curveDays !== undefined) throw new Error('--curve-days と --no-curves は同時に指定できません');
+  if (o.artifact && !outGiven) o.out = ARTIFACT_OUT;
   return o;
 }
 
@@ -239,6 +255,26 @@ export function dataScript(file: string, json: unknown): string {
   return `${REGISTER_FN}(${JSON.stringify(file)}, ${JSON.stringify(json)});\n`;
 }
 
+const mb = (n: number) => `${(n / 1024 / 1024).toFixed(1)} MB`;
+
+/**
+ * Artifact でページと一緒に出す data/*.json（public/data と同じ名前）を書き出し、合計バイト数を返す。
+ * 一覧（manifest.json）は最後に書く。Artifact に出せない大きさのファイルがあれば、書く前にエラーにする
+ */
+async function writeDataJson(htmlDir: string, data: EmbeddedData): Promise<number> {
+  const texts = [...dataFiles(data), [LOCAL_MANIFEST, data.manifest] as [string, unknown]].map(([file, json]) => [file, JSON.stringify(json)] as const);
+  const big = texts.find(([, text]) => Buffer.byteLength(text) > ARTIFACT_MAX_BYTES);
+  if (big) throw new Error(`${big[0]} が ${mb(Buffer.byteLength(big[1]))} あり、Artifact に出せる 1 ファイル 16 MB を超えています（--from で年度を絞ってください）`);
+  let bytes = 0;
+  for (const [file, text] of texts) {
+    const out = path.join(htmlDir, 'data', file);
+    await mkdir(path.dirname(out), { recursive: true });
+    await writeFile(out, text);
+    bytes += Buffer.byteLength(text);
+  }
+  return bytes;
+}
+
 /** HTML と同じ場所に data/*.js を書き出し、合計バイト数を返す。一覧（manifest.js）はデータファイルをそろえてから最後に書く */
 async function writeDataScripts(htmlDir: string, data: EmbeddedData): Promise<number> {
   let bytes = 0;
@@ -254,6 +290,27 @@ async function writeDataScripts(htmlDir: string, data: EmbeddedData): Promise<nu
 
 const attr = (attrs: string, name: string) => new RegExp(`\\b${name}="([^"]*)"`).exec(attrs)?.[1];
 
+/** vite build の index.html（公開用の CSP は外したもの）が読み込む JS・CSS を探し、埋め込める形で読む */
+async function readBundle(base: string, readAsset: (rel: string) => Promise<string>) {
+  if (/<link\b[^>]*\brel="modulepreload"/.test(base)) throw new Error('分割されたスクリプト（modulepreload）には対応していません');
+  const scripts = [...base.matchAll(/<script\b([^>]*)><\/script>/g)];
+  const sheets = [...base.matchAll(/<link\b([^>]*\brel="stylesheet"[^>]*)>/g)];
+  if (scripts.length !== 1 || sheets.length !== 1) {
+    throw new Error(`index.html のスクリプト・CSS の数が想定と異なります（script ${scripts.length} 個・CSS ${sheets.length} 個。各 1 個のみ対応）`);
+  }
+  const [script, sheet] = [scripts[0], sheets[0]];
+  const src = attr(script[1], 'src');
+  const href = attr(sheet[1], 'href');
+  if (!src || attr(script[1], 'type') !== 'module' || !href) throw new Error('index.html のスクリプト・CSS の指定が想定と異なります');
+  const js = escapeInlineScript(lf(await readAsset(src)));
+  const css = lf(await readAsset(href));
+  if (/<\/style/i.test(css)) throw new Error('CSS に </style が含まれているため埋め込めません');
+  return { script, sheet, js, css };
+}
+
+/** 公開用の CSP を外した index.html（1 ファイル版の CSP に差し替えるか、Artifact では入れない） */
+const withoutCsp = (indexHtml: string) => indexHtml.replace(/<meta http-equiv="Content-Security-Policy"[^>]*>\s*/, () => '');
+
 /**
  * vite build の index.html に JS・CSS・データを埋め込み、CSP を 1 ファイル版のものに差し替える。
  * @param readAsset index.html からの相対パスで JS・CSS を読む
@@ -267,25 +324,11 @@ export async function assembleHtml(
   compress = false,
 ): Promise<string> {
   const split = data === 'scripts';
-  // 公開用の CSP は外す（1 ファイル版の CSP に差し替える）
-  const base = indexHtml.replace(/<meta http-equiv="Content-Security-Policy"[^>]*>\s*/, () => '');
-  if (/<link\b[^>]*\brel="modulepreload"/.test(base)) throw new Error('分割されたスクリプト（modulepreload）には対応していません');
-  const scripts = [...base.matchAll(/<script\b([^>]*)><\/script>/g)];
-  const sheets = [...base.matchAll(/<link\b([^>]*\brel="stylesheet"[^>]*)>/g)];
-  if (scripts.length !== 1 || sheets.length !== 1) {
-    throw new Error(`index.html のスクリプト・CSS の数が想定と異なります（script ${scripts.length} 個・CSS ${sheets.length} 個。各 1 個のみ対応）`);
-  }
-  const [script, sheet] = [scripts[0], sheets[0]];
-  const src = attr(script[1], 'src');
-  const href = attr(sheet[1], 'href');
-  if (!src || attr(script[1], 'type') !== 'module' || !href) throw new Error('index.html のスクリプト・CSS の指定が想定と異なります');
+  const base = withoutCsp(indexHtml);
+  const { script, sheet, js, css } = await readBundle(base, readAsset);
   const headEnd = base.indexOf('<head>') + '<head>'.length;
   const bodyEnd = base.lastIndexOf('</body>');
   if (headEnd < '<head>'.length || bodyEnd < 0) throw new Error('index.html に <head> または </body> が見つかりません');
-
-  const js = escapeInlineScript(lf(await readAsset(src)));
-  const css = lf(await readAsset(href));
-  if (/<\/style/i.test(css)) throw new Error('CSS に </style が含まれているため埋め込めません');
   const csp = singleFileCsp(cspHash(js), cspHash(css), split);
 
   // 差し込む位置はすべて元の index.html で決め、後ろから差し込む。埋め込んだ JS・データの中身に
@@ -304,6 +347,31 @@ export async function assembleHtml(
   let html = base;
   for (const e of edits) html = html.slice(0, e.at) + e.text + html.slice(e.end);
   return html;
+}
+
+/**
+ * Claude の Artifact に出すページ。Artifact は公開するときに <!doctype html>・<head>・<body> で包むので、
+ * 題名、CSS、アプリを置く要素、JS、データだけを並べる（題名はファイルの先頭 8 KB から探されるので最初に置く）。
+ * CSP は Artifact の側で決まっているので入れない。アプリを置く要素の data-host で、Artifact の中だとアプリに伝える。
+ * @param data 埋め込むデータ（null はデータなし）。'fetch' のときは埋め込まず、ページと一緒に出す data/*.json を fetch で読む
+ */
+export async function assembleArtifact(
+  indexHtml: string,
+  readAsset: (rel: string) => Promise<string>,
+  data: EmbeddedData | null | 'fetch',
+  compress = false,
+): Promise<string> {
+  const { js, css } = await readBundle(withoutCsp(indexHtml), readAsset);
+  const title = /<title>([^<]*)<\/title>/.exec(indexHtml)?.[1];
+  if (!title) throw new Error('index.html に <title> が見つかりません');
+  return [
+    `<title>${title}</title>`,
+    `<style>${css}</style>`,
+    // <html lang="ja"> は書けないので、日本語の字形で表示されるようアプリを置く要素に付ける
+    '<div id="app" lang="ja" data-host="artifact"></div>',
+    `<script type="module">${js}</script>`,
+    data === 'fetch' ? '' : embedBlocks(data, compress),
+  ].join('\n');
 }
 
 async function readJson(o: SingleOptions, file: string, format: string): Promise<unknown> {
@@ -375,13 +443,18 @@ export async function buildSingle(o: SingleOptions): Promise<{ bytes: number; da
   };
   const data = o.noData ? null : await loadData(o);
   const compress = o.compress && !o.split;
-  const html = await assembleHtml(indexHtml, readAsset, o.split ? 'scripts' : data, compress);
+  const html = o.artifact
+    ? await assembleArtifact(indexHtml, readAsset, o.split ? 'fetch' : data, compress)
+    : await assembleHtml(indexHtml, readAsset, o.split ? 'scripts' : data, compress);
+  const bytes = Buffer.byteLength(html);
+  if (o.artifact && bytes > ARTIFACT_MAX_BYTES) {
+    throw new Error(`Artifact に出せるページは 16 MB までですが、${mb(bytes)} になりました。--from で年度を絞るか、--split でデータを分けてください`);
+  }
   const htmlDir = path.dirname(o.out);
   await mkdir(htmlDir, { recursive: true });
-  // data/*.js を先に書く（HTML を開いたときにデータがそろっているように）
-  const dataBytes = o.split && data ? await writeDataScripts(htmlDir, data) : 0;
+  // データのファイルを先に書く（HTML を開いたときにデータがそろっているように）
+  const dataBytes = o.split && data ? await (o.artifact ? writeDataJson(htmlDir, data) : writeDataScripts(htmlDir, data)) : 0;
   await writeFile(o.out, html);
-  const bytes = Buffer.byteLength(html);
   const files = data?.manifest.files ?? [];
   const range = files.length
     ? `${files[0].fy}〜${files[files.length - 1].fy} 年度（${files[0].firstDate}〜${files[files.length - 1].lastDate}）`
@@ -392,13 +465,15 @@ export async function buildSingle(o: SingleOptions): Promise<{ bytes: number; da
     (curves
       ? `・入札カーブ ${curves.dates.length} 日分（${curves.dates[0].replace(/^(\d{4})(\d{2})(\d{2})$/, '$1-$2-$3')}〜、指標は ${curves.firstDate}〜${curves.lastDate}）`
       : '') + (ties ? `・連系線 ${ties.firstDate}〜${ties.lastDate}` : '');
-  const mb = (n: number) => `${(n / 1024 / 1024).toFixed(1)} MB`;
   // 圧縮したときは、圧縮しなければどれだけになったかも示す
-  const plain = compress && data ? Buffer.byteLength(await assembleHtml(indexHtml, readAsset, data)) : 0;
+  const uncompressed = () => (o.artifact ? assembleArtifact(indexHtml, readAsset, data) : assembleHtml(indexHtml, readAsset, data));
+  const plain = compress && data ? Buffer.byteLength(await uncompressed()) : 0;
+  const what = o.artifact ? 'Artifact に出すページを' : o.split ? '' : '1 ファイル版を';
+  const where = !o.split ? '' : o.artifact ? '。data フォルダの中身は、ページと一緒に data/ として出してください' : '。2 つは同じ場所に置いてください';
   o.log(
     o.split
-      ? `作成しました: ${o.out}（${mb(bytes)}）と ${path.join(htmlDir, 'data')}（${mb(dataBytes)}、${range}${curveText}）。2 つは同じ場所に置いてください`
-      : `1 ファイル版を作成しました: ${o.out}（${mb(bytes)}${plain ? `。データは圧縮して埋め込み、圧縮しなければ ${mb(plain)}` : ''}、${range}${curveText}）`,
+      ? `${what}作成しました: ${o.out}（${mb(bytes)}）と ${path.join(htmlDir, 'data')}（${mb(dataBytes)}、${range}${curveText}）${where}`
+      : `${what}作成しました: ${o.out}（${mb(bytes)}${plain ? `。データは圧縮して埋め込み、圧縮しなければ ${mb(plain)}` : ''}、${range}${curveText}）`,
   );
   return { bytes, dataBytes, data };
 }

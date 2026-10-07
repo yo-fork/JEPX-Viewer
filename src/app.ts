@@ -14,9 +14,9 @@ import { select } from './lib/select';
 import { PRICE_KEYS } from './lib/series';
 import { DataStore } from './lib/store';
 import { DEFAULT_STATE, TABS, resolveRange, stateFromHash, stateToHash, type AppState, type Extent, type TabId } from './state';
-import { h } from './ui/dom';
+import { disableDownloads, h } from './ui/dom';
 import { FilterBar } from './ui/filterBar';
-import { applyThemeMode, effectiveTheme, loadThemeMode, saveThemeMode, type ThemeMode, type ThemeName } from './ui/theme';
+import { applyThemeMode, effectiveTheme, loadThemeMode, saveThemeMode, watchHostTheme, type ThemeMode, type ThemeName } from './ui/theme';
 import type { AppApi, View, ViewContext } from './views/base';
 import { createView } from './views';
 
@@ -30,6 +30,11 @@ const JEPX_SPOT_URL = 'https://www.jepx.jp/electricpower/market-data/spot/';
 const RETRY_AFTER_MS = 30_000;
 
 export class App implements AppApi {
+  /**
+   * Claude の Artifact として公開したページ（npm run build:single -- --artifact）。ファイルの保存ができないので保存のボタンを出さず、
+   * データが無ければ最初からデモを表示する（URL の # 以降はページに届かないので、demo=1 では切り替えられない）
+   */
+  private readonly inArtifact: boolean;
   private state: AppState;
   private readonly store = new DataStore();
   private manifest: Manifest | null = null;
@@ -64,6 +69,8 @@ export class App implements AppApi {
   private readonly dropOverlay: HTMLElement;
 
   constructor(root: HTMLElement) {
+    this.inArtifact = root.dataset.host === 'artifact';
+    if (this.inArtifact) disableDownloads();
     this.state = stateFromHash(location.hash);
     this.themeMode = loadThemeMode();
     applyThemeMode(this.themeMode);
@@ -169,8 +176,9 @@ export class App implements AppApi {
   async start(): Promise<void> {
     window.addEventListener('hashchange', () => this.onHashChange());
     window.matchMedia?.('(prefers-color-scheme: dark)').addEventListener('change', () => this.setThemeMode(this.themeMode));
+    watchHostTheme(() => this.setThemeMode(this.themeMode));
     await this.loadManifest();
-    if (!this.manifest && new URLSearchParams(location.hash.slice(1)).get('demo') === '1') this.loadDemo();
+    if (!this.manifest && (this.inArtifact || new URLSearchParams(location.hash.slice(1)).get('demo') === '1')) this.loadDemo();
     this.requestRender();
   }
 
@@ -556,8 +564,8 @@ export class App implements AppApi {
           ),
           h('button', { type: 'button', class: 'btn btn-primary', onclick: () => this.fileInput.click() }, 'CSV ファイルを選択'),
         ),
-        // ファイルで受け取った人はリポジトリを持っていないので、取得コマンドの案内は出さない
-        LOCAL_DATA
+        // ファイルや Artifact で受け取った人はリポジトリを持っていないので、取得コマンドの案内は出さない
+        LOCAL_DATA || this.inArtifact
           ? null
           : h(
               'div',
