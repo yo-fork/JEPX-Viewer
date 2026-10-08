@@ -8,6 +8,8 @@ import { mulberry32 } from './demo';
 import {
   areaNetImports,
   decodeIntertieFy,
+  DERIVED_FIELDS,
+  FENCE_PARTS,
   INTERTIE_DEFS,
   INTERTIE_FIELD_INDEX,
   INTERTIE_INDEX,
@@ -41,6 +43,12 @@ const DEMO_LIMITS: Partial<Record<IntertieKey, [number, number]>> = {
 
 type Source = { kind: 'files'; index: IntertieIndex; read: ReadFile } | { kind: 'demo'; ds: Dataset };
 
+/** 公表されていないコマを補った値と、補ったコマの印（1。補わない連系線・値の種類では null） */
+export interface DerivedValues {
+  values: Float64Array;
+  derived: Uint8Array | null;
+}
+
 export class IntertieStore {
   /** データのある期間 */
   readonly first: number;
@@ -49,6 +57,7 @@ export class IntertieStore {
   private readonly loadedFy = new Set<number>();
   private readonly pendingFy = new Map<number, Promise<void>>();
   private readonly aligned = new Map<string, Float64Array>();
+  private readonly derivedArrays = new Map<string, DerivedValues>();
   private net: { key: string; value: Record<AreaKey, Float64Array> } | null = null;
   private version = 0;
 
@@ -130,6 +139,34 @@ export class IntertieStore {
     return out;
   }
 
+  /**
+   * array と同じ値に、中部フェンスと関西フェンスの計画潮流と潮流実績だけは、公表されていないコマ（2026 年 3 月 12 日受渡分まで）を
+   * 個別の連系線の和（occto.ts の FENCE_PARTS）で補ったもの。上限と運用容量は補わない
+   */
+  withDerived(ds: Dataset, line: IntertieKey, field: IntertieField): DerivedValues {
+    const values = this.array(ds, line, field);
+    const parts = FENCE_PARTS[line];
+    if (!parts || !DERIVED_FIELDS.includes(field)) return { values, derived: null };
+    const key = `${line}|${field}|${ds.start}|${ds.n}|${this.version}`;
+    let out = this.derivedArrays.get(key);
+    if (out) return out;
+    const sources = parts.map((p) => this.array(ds, p, field));
+    const filled = values.slice();
+    const derived = new Uint8Array(filled.length);
+    for (let k = 0; k < filled.length; k++) {
+      if (!Number.isNaN(filled[k])) continue;
+      let sum = 0;
+      for (const a of sources) sum += a[k];
+      if (Number.isNaN(sum)) continue;
+      filled[k] = Math.round(sum * 10) / 10;
+      derived[k] = 1;
+    }
+    out = { values: filled, derived };
+    if (this.derivedArrays.size > 20) this.derivedArrays.clear();
+    this.derivedArrays.set(key, out);
+    return out;
+  }
+
   /** エリアごとの正味の受け入れ量（MW、Dataset の日の並び × 48。計画潮流（翌日）から occto.ts の areaNetImports で求める） */
   netImports(ds: Dataset): Record<AreaKey, Float64Array> {
     const key = `${ds.start}|${ds.n}|${this.version}`;
@@ -153,10 +190,10 @@ export class IntertieStore {
     return i < 0 || i >= ds.n ? Number.NaN : this.array(ds, line, field)[i * SLOTS + slot];
   }
 
-  /** 読み込んだ期間に計画潮流の値がある連系線（INTERTIE_DEFS の順） */
+  /** 読み込んだ期間に計画潮流の値（中部フェンスと関西フェンスは、個別の連系線から補った値も含む）がある連系線（INTERTIE_DEFS の順） */
   linesWithData(ds: Dataset, from: number, to: number): IntertieKey[] {
     return INTERTIE_DEFS.map((d) => d.key).filter((k) => {
-      const a = this.array(ds, k, 'plan');
+      const a = this.withDerived(ds, k, 'plan').values;
       for (let i = Math.max(0, from - ds.start); i <= Math.min(ds.n - 1, to - ds.start); i++) {
         for (let s = 0; s < SLOTS; s++) if (!Number.isNaN(a[i * SLOTS + s])) return true;
       }

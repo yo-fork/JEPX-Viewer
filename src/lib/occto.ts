@@ -355,6 +355,30 @@ const SUB_LINES: readonly IntertieKey[] = ['kansaiChugokuEast', 'kansaiChugokuWe
 /** 潮流実績が公表されていない連系線（関西-中国間の内訳。潮流実績の CSV には合計の関西-中国間だけがある） */
 export const NO_FLOW_LINES: readonly IntertieKey[] = SUB_LINES;
 
+/** 中地域の個別の連系線の、説明の文で使う名前 */
+const CENTRAL_SHORT: Partial<Record<IntertieKey, string>> = {
+  chubuKansai: '三重東近江線（中部-関西間）',
+  chubuHokuriku: '南福光（中部-北陸間）',
+  hokurikuKansai: '越前嶺南線（北陸-関西間）',
+};
+
+/**
+ * 2026 年 3 月 13 日受渡分より前は公表されていないフェンスと、それにあたる個別の連系線（どれもフェンスの順方向に流れる向きが正）。
+ * 計画潮流と潮流実績は、この和で求められる（13 日受渡分は、両方ある 48 コマすべてで計画潮流が一致した。3 月より前からある北陸フェンスも、
+ * 個別の連系線の計画潮流の和と全コマで一致した）。上限と運用容量は、北陸フェンスでは個別の連系線の和にならなかったので求めない
+ */
+export const FENCE_PARTS: Partial<Record<IntertieKey, readonly IntertieKey[]>> = {
+  chubuFence: ['chubuKansai', 'chubuHokuriku'],
+  kansaiFence: ['chubuKansai', 'hokurikuKansai'],
+};
+/** フェンスの公表されていないコマを、個別の連系線の和で補う値の種類 */
+export const DERIVED_FIELDS: readonly IntertieField[] = ['plan', 'actual'];
+
+/** フェンスにあたる個別の連系線の名前（「三重東近江線（中部-関西間）と南福光（中部-北陸間）」） */
+export function fencePartsText(key: IntertieKey): string {
+  return (FENCE_PARTS[key] ?? []).map((k) => CENTRAL_SHORT[k]).join('と');
+}
+
 /**
  * 公表のされ方に決まりのある連系線の説明（推移の図の注記に出す。無ければ null）。
  * 中地域は 2026 年 3 月 13 日受渡分を境に、個別の連系線からフェンスに変わった（13 日受渡分だけは両方ある）。
@@ -366,9 +390,9 @@ export function intertieNote(key: IntertieKey): string | null {
     return '中部-関西間、中部-北陸間、北陸-関西間の計画潮流は、2026 年 3 月 13 日受渡分まで公表されています。3 月 14 日受渡分からは、中部フェンス、北陸フェンス、関西フェンスの値だけが公表され、個別の連系線の値は計画潮流も潮流実績も公表されていません。';
   }
   const since = '計画潮流は 2026 年 3 月 13 日受渡分から公表されています（それより前は、個別の連系線で管理していました）。';
-  if (key === 'chubuFence') return `中部フェンスは、三重東近江線（中部-関西間）と南福光（中部-北陸間）を合わせたもので、中部から北陸と関西へ流れる量です。${since}`;
-  if (key === 'kansaiFence') return `関西フェンスは、三重東近江線（中部-関西間）と越前嶺南線（北陸-関西間）を合わせたもので、中部と北陸から関西へ流れる量です。${since}`;
-  if (key === 'hokurikuFence') return '北陸フェンスは、南福光（中部-北陸間）と越前嶺南線（北陸-関西間）を合わせたもので、中部と関西から北陸へ流れる量です。';
+  if (key === 'chubuFence') return `中部フェンスは、${fencePartsText(key)}を合わせたもので、中部から北陸と関西へ流れる量です。${since}`;
+  if (key === 'kansaiFence') return `関西フェンスは、${fencePartsText(key)}を合わせたもので、中部と北陸から関西へ流れる量です。${since}`;
+  if (key === 'hokurikuFence') return `北陸フェンスは、${CENTRAL_SHORT.chubuHokuriku}と${CENTRAL_SHORT.hokurikuKansai}を合わせたもので、中部と関西から北陸へ流れる量です。`;
   if (NO_FLOW_LINES.includes(key)) return '関西-中国間（東）と（西）は関西-中国間の内訳で、潮流実績と計画潮流（最終）は公表されていません（関西-中国間にはあります）。';
   return null;
 }

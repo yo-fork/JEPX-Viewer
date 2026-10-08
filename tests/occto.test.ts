@@ -189,6 +189,45 @@ describe('連系線のデータ（ブラウザ側）', () => {
     expect([Number.isNaN(net.tokyo[k - 1]), Number.isNaN(net.tokyo[k - SLOTS])]).toEqual([true, true]);
   });
 
+  it('中部フェンスと関西フェンスの計画潮流と潮流実績は、公表されていないコマを個別の連系線の和で補う（上限は補わない）', async () => {
+    const before = dayFromYmd(2026, 3, 12);
+    const after = dayFromYmd(2026, 3, 13);
+    const put = (v: Float64Array, k: IntertieKey, f: IntertieField, x: number) => (v[intertieOffset(INTERTIE_INDEX[k], INTERTIE_FIELD_INDEX[f], 0)] = x);
+    const a = newIntertieDay();
+    for (const f of ['plan', 'actual'] as const) {
+      put(a, 'chubuKansai', f, 100);
+      put(a, 'chubuHokuriku', f, -300);
+      put(a, 'hokurikuKansai', f, 50);
+    }
+    put(a, 'chubuKansai', 'limFwd', 1000);
+    put(a, 'hokurikuFence', 'plan', -350);
+    // 公表されているフェンスの値は、そのまま使う
+    const b = newIntertieDay();
+    put(b, 'chubuKansai', 'plan', 100);
+    put(b, 'hokurikuKansai', 'plan', 50);
+    put(b, 'chubuHokuriku', 'plan', 0);
+    put(b, 'kansaiFence', 'plan', 999);
+    const json = JSON.parse(JSON.stringify(encodeIntertieFy(2025, new Map([[before, a], [after, b]]))));
+    const index = { firstDate: '2026-03-12', lastDate: '2026-03-13', files: [{ fy: 2025, file: 'interties/fy2025.json', firstDate: '2026-03-12', lastDate: '2026-03-13', days: 2 }] };
+    const st = IntertieStore.fromIndex(index, async () => json)!;
+    await st.ensure(before, after);
+    const ds = new DataStore();
+    ds.addDays(generateDemoDays(before, after + 1, 1), 'bundled');
+    const dataset = ds.dataset()!;
+    const k = (d: number) => (d - dataset.start) * SLOTS;
+    const chubu = st.withDerived(dataset, 'chubuFence', 'plan');
+    const kansai = st.withDerived(dataset, 'kansaiFence', 'plan');
+    expect([chubu.values[k(before)], chubu.derived![k(before)]]).toEqual([-200, 1]);
+    expect([kansai.values[k(before)], kansai.derived![k(before)]]).toEqual([150, 1]);
+    expect([kansai.values[k(after)], kansai.derived![k(after)]]).toEqual([999, 0]);
+    expect(st.withDerived(dataset, 'kansaiFence', 'actual').values[k(before)]).toBe(150);
+    // 上限と、3 月より前から公表されている北陸フェンスは補わない
+    expect(st.withDerived(dataset, 'kansaiFence', 'limFwd')).toEqual({ values: st.array(dataset, 'kansaiFence', 'limFwd'), derived: null });
+    expect(st.withDerived(dataset, 'hokurikuFence', 'plan').derived).toBeNull();
+    // 補った値しか無い期間でも、連系線を選べる
+    expect(st.linesWithData(dataset, before, before)).toEqual(['chubuFence', 'hokurikuFence', 'kansaiFence', 'chubuKansai', 'chubuHokuriku', 'hokurikuKansai']);
+  });
+
   it('年度ファイルを必要なときに読み、Dataset の日の並びにそろえる', async () => {
     const plan = parseOcctoCsv(PLAN_CSV).days;
     const reads: string[] = [];

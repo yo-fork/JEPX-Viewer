@@ -2,12 +2,13 @@
  * 連系線: 電力広域的運営推進機関（広域機関）が公表している、地域間連系線ごとの計画潮流・上限・潮流実績。
  * 連系線ごとの、計画潮流が上限に達したコマ（市場分断が起きる）の割合、選んだ連系線の推移・時間帯別の様子・ヒートマップ。
  */
-import { aggregateBySlot } from '../lib/aggregate';
-import { formatDay, slotRangeLabel, slotStartLabel } from '../lib/dates';
+import { aggregateBySlot, type Granularity } from '../lib/aggregate';
+import { formatDay, slotRangeLabel, slotStartLabel, wallClockMs } from '../lib/dates';
 import { fmtNum, fmtPct, fmtSigned } from '../lib/format';
 import type { IntertieStore } from '../lib/intertieStore';
 import {
   atLimit,
+  fencePartsText,
   INTERTIE_DEFS,
   INTERTIE_INDEX,
   INTERTIE_KEYS,
@@ -228,7 +229,9 @@ export class IntertiesView extends View {
     this.renderNetHeat(st, sel);
   }
 
-  /** 選んだ日ごとに、選んだ連系線とどれかの連系線に、計画潮流と潮流実績があるか */
+  /**
+   * 選んだ日ごとに、選んだ連系線（個別の連系線から計算した値も含む）とどれかの連系線（公表値）に、計画潮流と潮流実績があるか
+   */
   private coverage(st: IntertieStore, sel: Selection, key: IntertieKey): LineCoverage {
     const { ds } = this.ctx;
     const has = (a: Float64Array, i: number) => {
@@ -237,15 +240,31 @@ export class IntertiesView extends View {
     };
     const plans = INTERTIE_KEYS.map((k) => st.array(ds, k, 'plan'));
     const actuals = INTERTIE_KEYS.map((k) => st.array(ds, k, 'actual'));
-    const line = INTERTIE_INDEX[key];
+    const plan = st.withDerived(ds, key, 'plan').values;
+    const actual = st.withDerived(ds, key, 'actual').values;
     const days = [...sel.days];
     return {
       days: days.map((i) => ds.start + i),
-      plan: days.map((i) => has(plans[line], i)),
-      actual: days.map((i) => has(actuals[line], i)),
+      plan: days.map((i) => has(plan, i)),
+      actual: days.map((i) => has(actual, i)),
       anyPlan: days.map((i) => plans.some((a) => has(a, i))),
       anyActual: days.map((i) => actuals.some((a) => has(a, i))),
     };
+  }
+
+  /** 選んだ日のうち、個別の連系線から計算した値（marks が 1 のコマ）のある最初と最後の日（無ければ null） */
+  private derivedSpan(sel: Selection, marks: (Uint8Array | null)[]): [number, number] | null {
+    const ms = marks.filter((m): m is Uint8Array => m !== null);
+    let a = -1;
+    let b = -1;
+    for (const i of sel.days) {
+      let any = false;
+      for (let s = 0; s < SLOTS && !any; s++) any = ms.some((m) => m[i * SLOTS + s] === 1);
+      if (!any) continue;
+      if (a < 0) a = i;
+      b = i;
+    }
+    return a < 0 ? null : [this.ctx.ds.start + a, this.ctx.ds.start + b];
   }
 
   /** 上限に達したかどうか（1: 順方向、−1: 逆方向、0: 達していない、NaN: 値が無い）をコマごとに */
@@ -343,15 +362,44 @@ export class IntertiesView extends View {
     const color = { cat0: t.cat[0], cat1: t.cat[1], cat2: t.cat[2], neutral: t.neutralSeries };
     const gran = curveGranularity(sel, state.intertieGran);
     const zoom = slotZoom(gran);
-    const raw = buildSeriesPoints(sel, TREND_LINES.map((l) => ({ a: st.array(ds, key, l.field) })), gran, 'mean');
+    // 中部フェンスと関西フェンスの計画潮流と潮流実績は、公表されていない 3 月 12 日受渡分までを個別の連系線から計算した値で補う
+    const values = TREND_LINES.map((l) => st.withDerived(ds, key, l.field));
+    const raw = buildSeriesPoints(sel, values.map((v) => ({ a: v.values })), gran, 'mean');
     // 値の無い種類（潮流実績は 2025 年 4 月から）は出さない
     const shown = TREND_LINES.map((l, i) => ({ ...l, points: raw[i].points })).filter((l) => l.points.some((p) => Number.isFinite(p[1])));
+    const marks = values.map((v) => v.derived);
+    const calc = this.derivedSpan(sel, marks);
+    const calcPeriods = calc ? this.derivedPeriods(sel, gran, marks) : new Set<number>();
+    const planCalc = this.derivedSpan(sel, [values[0].derived]);
+    // 計算した値の終わり（公表値の始まり）に縦線を引く（選んだ期間に公表値もあるとき）
+    const boundary = planCalc && planCalc[1] < sel.to ? wallClockMs(planCalc[1] + 1) : null;
     this.trend.setTitle(`${intertieTitle(key)}の計画潮流と上限の推移`);
     this.trend.setSubtitle(`${describeSelection(sel, state)}・MW（正は順方向: ${forward(key)}）、${granText(gran)}`);
-    // 値の無い期間や日（線が切れる所）と、その理由を図の下に書く
-    this.trend.footer.replaceChildren(...coverageNotes(key, this.coverage(st, sel, key), !st.isDemo).map((text) => h('p', { class: 'card-note' }, text)));
+    // 値の無い期間や日（線が切れる所）と、その理由を図の下に書く。計算した値の説明は、連系線の説明のすぐ後に置く
+    const notes = coverageNotes(key, this.coverage(st, sel, key), !st.isDemo);
+    if (calc) {
+      notes.splice(
+        1,
+        0,
+        `${formatDay(calc[0])}〜${formatDay(calc[1])} の計画潮流（翌日）と潮流実績は、公表されている${fencePartsText(key)}の値を足して計算したものです。` +
+          'フェンスの上限は個別の連系線の上限の和にならないので、この期間の上限は描いていません。',
+      );
+    }
+    this.trend.footer.replaceChildren(...notes.map((text) => h('p', { class: 'card-note' }, text)));
     const names = shown.map((l) => l.name);
     const ends = endLabels(names, shown.map((l) => l.points.map((p) => p[1])), theme, 260);
+    const markLine = boundary
+      ? {
+          markLine: {
+            symbol: 'none',
+            silent: true,
+            animation: false,
+            lineStyle: { color: t.muted, width: 1, type: 'solid' },
+            label: { formatter: 'ここから公表値', position: 'insideEndTop', color: t.muted, fontSize: 11 },
+            data: [{ xAxis: boundary }],
+          },
+        }
+      : {};
     this.trend.setOption(
       {
         grid: grid({ right: labelRoom(names.length), bottom: zoom.bottom }),
@@ -362,7 +410,10 @@ export class IntertiesView extends View {
           formatter: namedTooltip(
             names,
             shown.map((l) => color[l.color]),
-            (p) => periodLabel(Number((p.value as number[])[0]), gran),
+            (p) => {
+              const x = Number((p.value as number[])[0]);
+              return `${periodLabel(x, gran)}${calcPeriods.has(x) ? '（計算値を含む）' : ''}`;
+            },
             (v) => `${fmtSigned(v, 0)} MW`,
             shown.map((l) => l.dashed),
           ),
@@ -374,29 +425,53 @@ export class IntertiesView extends View {
             sampling: LINE_SAMPLING,
             ...(l.field === 'actual' ? { lineStyle: { width: 1.5 } } : {}),
             ...ends[i],
+            ...(i === 0 ? markLine : {}),
           }),
         ),
       },
       {
-        columns: ['期間', ...names.map((n) => `${n}（MW）`)],
-        rows: (shown[0]?.points ?? []).map((p, r) => [periodLabel(p[0], gran), ...shown.map((l) => l.points[r][1])]),
-        digits: [null, ...names.map(() => 1)],
+        columns: ['期間', ...names.map((n) => `${n}（MW）`), ...(calc ? ['備考'] : [])],
+        rows: (shown[0]?.points ?? []).map((p, r) => [
+          periodLabel(p[0], gran),
+          ...shown.map((l) => l.points[r][1]),
+          ...(calc ? [calcPeriods.has(p[0]) ? `計画潮流と潮流実績は${fencePartsText(key)}から計算` : ''] : []),
+        ]),
+        digits: [null, ...names.map(() => 1), ...(calc ? [null] : [])],
         filename: `jepx_intertie_${key}_${rangeTag(sel)}.csv`,
       },
     );
+  }
+
+  /** 粒度ごとの期間（代表時刻）のうち、個別の連系線から計算した値を含むもの */
+  private derivedPeriods(sel: Selection, gran: Granularity, marks: (Uint8Array | null)[]): Set<number> {
+    const ms = marks.filter((m): m is Uint8Array => m !== null);
+    // 計算したコマは 1、ほかは 0 にして期間ごとに平均し、0 より大きい期間を選ぶ
+    const share = new Float64Array(this.ctx.ds.n * SLOTS);
+    for (let k = 0; k < share.length; k++) share[k] = ms.some((m) => m[k] === 1) ? 1 : 0;
+    const [pts] = buildSeriesPoints(sel, [{ a: share }], gran, 'mean');
+    return new Set(pts.points.filter((p) => p[1] > 0).map((p) => p[0]));
   }
 
   private renderProfile(st: IntertieStore, sel: Selection, key: IntertieKey): void {
     const { ds, state, theme } = this.ctx;
     const t = TOKENS[theme];
     const color = { cat0: t.cat[0], cat1: t.cat[1], cat2: t.cat[2], neutral: t.neutralSeries };
-    const lines = TREND_LINES.filter((l) => l.field !== 'planFinal')
-      .map((l) => {
-        const g = aggregateBySlot(sel, { a: st.array(ds, key, l.field) });
+    // 推移の図と同じく、中部フェンスと関西フェンスの計画潮流と潮流実績は、個別の連系線から計算した値も使う
+    const values = TREND_LINES.filter((l) => l.field !== 'planFinal').map((l) => ({ l, v: st.withDerived(ds, key, l.field) }));
+    const lines = values
+      .map(({ l, v }) => {
+        const g = aggregateBySlot(sel, { a: v.values });
         return { ...l, values: sel.slots.map((s) => accMean(g.acc[s])) };
       })
       .filter((l) => l.values.some(Number.isFinite));
-    this.profile.setSubtitle(`${describeSelection(sel, state)}・各コマの平均（MW、正は ${forward(key)}）`);
+    const calc = this.derivedSpan(
+      sel,
+      values.map(({ v }) => v.derived),
+    );
+    this.profile.setSubtitle(
+      `${describeSelection(sel, state)}・各コマの平均（MW、正は ${forward(key)}）` +
+        (calc ? `・${formatDay(calc[0])}〜${formatDay(calc[1])} の計画潮流と潮流実績は個別の連系線から計算（上限は公表値のあるコマだけの平均）` : ''),
+    );
     const names = lines.map((l) => l.name);
     this.profile.setOption(
       {
@@ -442,6 +517,11 @@ export class IntertiesView extends View {
       }
       return { s, n, fwd: n > 0 ? (fwd / n) * 100 : Number.NaN, rev: n > 0 ? (rev / n) * 100 : Number.NaN };
     });
+    // 上限は公表値だけを使う（個別の連系線から計算した中部フェンスと関西フェンスの値には、上限が無い）
+    if (rows.every((r) => r.n === 0)) {
+      this.congestion.setEmpty('選択した期間には、この連系線の上限が公表されていないので、上限に達したコマの割合は求められません。');
+      return;
+    }
     this.congestion.setSubtitle(`${describeSelection(sel, state)}・計画潮流（翌日）が上限に達した日の割合（%）`);
     const names = [`順方向（${forward(key)}）`, `逆方向（${backward(key)}）`];
     const colors = [t.cat[0], t.cat[1]];
@@ -477,13 +557,18 @@ export class IntertiesView extends View {
   private renderHeat(st: IntertieStore, sel: Selection, key: IntertieKey): void {
     const { ds, state, theme } = this.ctx;
     const t = TOKENS[theme];
-    const g = buildGrid(sel, { a: st.array(ds, key, 'plan') }, 'dateSlot');
+    const plan = st.withDerived(ds, key, 'plan');
+    const g = buildGrid(sel, { a: plan.values }, 'dateSlot');
     this.heat.setTitle(`${intertieTitle(key)}の計画潮流（翌日）のヒートマップ`);
     if (g.cells.length === 0) {
       this.heat.setEmpty('選択した期間に、この連系線の計画潮流がありません。');
       return;
     }
-    this.heat.setSubtitle(`${describeSelection(sel, state)}・MW（赤は順方向: ${forward(key)}、青は逆方向）${g.note ? `・${g.note}` : ''}`);
+    const calc = this.derivedSpan(sel, [plan.derived]);
+    this.heat.setSubtitle(
+      `${describeSelection(sel, state)}・MW（赤は順方向: ${forward(key)}、青は逆方向）${g.note ? `・${g.note}` : ''}` +
+        (calc ? `・${formatDay(calc[0])}〜${formatDay(calc[1])} は個別の連系線から計算` : ''),
+    );
     const [min, max] = colorRange(g, true);
     this.heat.setHeight(heatmapHeight(g));
     this.heat.setOption(
