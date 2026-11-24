@@ -77,9 +77,9 @@ import {
   legendTextWidth,
   namedTooltip,
   PLOT_TOP,
-  slotZoom,
   targetLabel,
   targetText,
+  trendZoom,
   wrappedLegend,
   type AxisParam,
 } from './curveCommon';
@@ -1242,7 +1242,7 @@ export class CurvesView extends View {
     const colors = ordinalColors(defs.length, theme, side === 'buy');
     this.depthGran.set(state.curveGran);
     const gran = curveGranularity(sel, state.curveGran);
-    const zoom = slotZoom(gran);
+    const zoom = trendZoom(gran);
     const raw = buildSeriesPoints(sel, defs.map((d) => ({ a: cs.metricArray(ds, d.key) })), gran, 'mean');
     const data = raw.map((r) => r.points.map(([x, v]) => [x, v / 1000] as [number, number]));
     const names = defs.map((d) => d.name);
@@ -1256,7 +1256,7 @@ export class CurvesView extends View {
       {
         grid: grid({ top: legend.top + 8, right: labelRoom(defs.length), bottom: zoom.bottom }),
         legend: legend.legend,
-        ...(zoom.dataZoom ? { dataZoom: zoom.dataZoom } : {}),
+        dataZoom: zoom.dataZoom,
         tooltip: {
           trigger: 'axis',
           formatter: namedTooltip(

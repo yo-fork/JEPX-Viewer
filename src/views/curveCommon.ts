@@ -7,6 +7,7 @@ import { SYSTEM_LABEL } from '../lib/bidCurves';
 import { isoFromDay } from '../lib/dates';
 import { fmtNum } from '../lib/format';
 import { ttHeader, ttRow } from '../ui/tooltip';
+import { yZoomOption } from '../ui/yZoom';
 import { lineLegend } from './common';
 import type { Granularity } from '../lib/aggregate';
 import type { Selection } from '../lib/select';
@@ -138,12 +139,13 @@ export function curveGranularity(sel: Selection, g: TrendGran): Granularity {
 }
 
 /**
- * 30 分値のときは点が多いので、横軸を拡大できるようにする（ホイール・ドラッグと、下のスライダー）。
+ * 推移の図の拡大。縦軸はいつでも拡大できる（Shift + ホイールなど。yZoom.ts）。
+ * 30 分値のときは点が多いので、横軸も拡大できるようにする（ホイール・ドラッグと、下のスライダー）。
  * 返す bottom は、スライダーの分を空けたグラフ領域の下の余白
  */
-export function slotZoom(gran: Granularity): { dataZoom?: Record<string, unknown>[]; bottom: number } {
-  if (gran !== 'slot') return { bottom: 8 };
-  return { dataZoom: [{ type: 'inside', xAxisIndex: 0 }, { type: 'slider', xAxisIndex: 0, height: 16, bottom: 6 }], bottom: 40 };
+export function trendZoom(gran: Granularity): { dataZoom: Record<string, unknown>[]; bottom: number } {
+  if (gran !== 'slot') return { dataZoom: [yZoomOption()], bottom: 8 };
+  return { dataZoom: [{ type: 'inside', xAxisIndex: 0 }, { type: 'slider', xAxisIndex: 0, height: 16, bottom: 6 }, yZoomOption()], bottom: 40 };
 }
 
 export function granText(gran: Granularity): string {

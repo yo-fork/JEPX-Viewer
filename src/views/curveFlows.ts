@@ -17,7 +17,7 @@ import { TOKENS } from '../ui/theme';
 import { ttHeader, ttNote, ttRow } from '../ui/tooltip';
 import type { ViewContext } from './base';
 import { describeSelection, grid, rangeTag, valueAxis } from './common';
-import { slotZoom, wrappedLegend } from './curveCommon';
+import { trendZoom, wrappedLegend } from './curveCommon';
 import { TIME_AXIS_LABEL } from './timeseries';
 
 /** 期間の図に、境ごとの系列として出す数（ほかは「そのほかの境」にまとめる） */
@@ -163,7 +163,7 @@ export function renderFlowPeriod(card: ChartCard, ctx: ViewContext, cs: CurveSto
   const seriesOf = (p: FlowPoint) => (p.flow.kind === 'many' ? MANY_NAME : top.includes(boundaryName(p.flow.groups)) ? boundaryName(p.flow.groups) : OTHER_NAME);
   const names = [...top, ...(points.some((p) => seriesOf(p) === OTHER_NAME) ? [OTHER_NAME] : []), ...(points.some((p) => p.flow.kind === 'many') ? [MANY_NAME] : [])];
   const colorOf = (name: string) => (name === OTHER_NAME || name === MANY_NAME ? t.neutralSeries : t.cat[top.indexOf(name) % t.cat.length]);
-  const zoom = slotZoom('slot');
+  const zoom = trendZoom('slot');
   const legend = wrappedLegend(names, card.chart.getWidth(), undefined, names.map((n) => (n === MANY_NAME ? 'emptyCircle' : 'circle')));
   const byName = new Map(names.map((n) => [n, [] as FlowPoint[]]));
   for (const p of points) byName.get(seriesOf(p))!.push(p);
@@ -174,7 +174,7 @@ export function renderFlowPeriod(card: ChartCard, ctx: ViewContext, cs: CurveSto
       grid: grid({ top: legend.top + 8, right: 24, bottom: zoom.bottom }),
       // 3 つ以上に分かれたコマの合計は、境ごとの量より大きく縦軸が広がるので、凡例で選んだときだけ出す
       legend: { ...legend.legend, selected: { [MANY_NAME]: false } },
-      ...(zoom.dataZoom ? { dataZoom: zoom.dataZoom } : {}),
+      dataZoom: zoom.dataZoom,
       tooltip: {
         trigger: 'item',
         formatter: (param: { seriesName: string; data: { p: FlowPoint } }) => {

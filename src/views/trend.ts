@@ -14,6 +14,7 @@ import { chipGroup, segmented, toolbar, type ChipGroup, type Segmented } from '.
 import { h } from '../ui/dom';
 import { seriesColor, seriesDashed, TOKENS } from '../ui/theme';
 import { ttHeader, ttRow } from '../ui/tooltip';
+import { isYZoomEvent, yZoomOption } from '../ui/yZoom';
 import { NO_DATA, View } from './base';
 import {
   axisTooltip,
@@ -109,7 +110,10 @@ export class TrendView extends View {
     const g = this.grid();
     this.chart = this.card(g, { title: '価格の推移', height: 440, wide: true });
     this.chart.footer.append(this.zoomNote);
-    this.chart.chart.on('datazoom', () => this.rememberZoom());
+    // 縦軸の拡大（yZoom.ts）は描き直すと解除されるので、覚えるのは横軸の範囲だけ
+    this.chart.chart.on('datazoom', (e: unknown) => {
+      if (!isYZoomEvent(e)) this.rememberZoom();
+    });
   }
 
   protected render(): void {
@@ -243,6 +247,7 @@ export class TrendView extends View {
         dataZoom: [
           { type: 'inside', throttle: 50, ...range },
           { type: 'slider', height: 22, bottom: 8, showDetail: false, brushSelect: false, borderColor: t.border, ...range },
+          yZoomOption(),
         ],
         series,
       },
@@ -375,6 +380,8 @@ export class TrendView extends View {
         dataZoom: [
           { type: 'inside', xAxisIndex: axisIdx, throttle: 50, ...range },
           { type: 'slider', xAxisIndex: axisIdx, height: 22, bottom: 8, left: 16, right: 16, showDetail: false, brushSelect: false, ...range },
+          // 縦軸の拡大は全部の図にまとめてかける（縦軸は全図共通のまま）
+          yZoomOption(axisIdx),
         ],
         series,
       },

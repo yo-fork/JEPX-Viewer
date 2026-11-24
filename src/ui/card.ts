@@ -7,6 +7,7 @@ import { fmtNum } from '../lib/format';
 import { canDownload, downloadText, h, uniqueId } from './dom';
 import { initChart, type echarts, type EChartsOption } from './echarts';
 import type { ThemeName } from './theme';
+import { YZoom } from './yZoom';
 
 export interface TableData {
   columns: string[];
@@ -32,6 +33,8 @@ export class ChartCard {
   /** グラフの下に置く補足（表示・非表示でグラフの位置が動かないよう、グラフより後ろに置く） */
   readonly footer: HTMLDivElement;
   readonly chart: echarts.ECharts;
+  /** 縦軸の拡大（推移の図など、設定に縦軸の dataZoom があるときだけ効く） */
+  private readonly yZoom: YZoom;
   private readonly chartEl: HTMLDivElement;
   private readonly tableEl: HTMLDivElement;
   private readonly emptyEl: HTMLDivElement;
@@ -77,6 +80,8 @@ export class ChartCard {
     );
     parent.append(this.el);
     this.chart = initChart(this.chartEl, opts.theme);
+    this.yZoom = new YZoom(this.chartEl, this.chart);
+    this.chartEl.after(this.yZoom.note);
     this.ro = new ResizeObserver(() => this.chart.resize());
     this.ro.observe(this.chartEl);
   }
@@ -88,6 +93,7 @@ export class ChartCard {
     // その場で描き直す（lazyUpdate にしない）。lazyUpdate では新しい設定のモデルがすぐに作られる一方、描き直しは次のフレームになる。
     // そのあいだにマウスが動くと、古い図形が新しいモデルのまだデータの無い系列を参照して、ECharts の中で例外になる
     this.chart.setOption({ useUTC: true, ...opt } as EChartsOption, { notMerge: true });
+    this.yZoom.update(opt);
     this.table = table;
     this.csvBtn.disabled = !table;
     this.toggleBtn.disabled = !table;
@@ -127,6 +133,7 @@ export class ChartCard {
     this.csvBtn.disabled = empty;
     if (empty) {
       this.chart.clear();
+      this.yZoom.update(null);
       this.table = null;
     }
   }
@@ -182,6 +189,7 @@ export class ChartCard {
 
   dispose(): void {
     this.ro.disconnect();
+    this.yZoom.dispose();
     // ヒートマップなど要素の多い図は描画が複数フレームに分かれる。途中で破棄すると zrender の
     // 次フレームの描画が例外になるため、空の状態を同期描画して保留中の描画を打ち切ってから破棄する。
     try {

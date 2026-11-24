@@ -67,9 +67,9 @@ import {
   legendTextWidth,
   namedTooltip,
   PLOT_TOP,
-  slotZoom,
   targetLabel,
   targetText,
+  trendZoom,
   wrappedLegend,
   type AxisParam,
 } from './curveCommon';
@@ -1285,7 +1285,7 @@ export class SensitivitySection {
     }
     const names = lines.map((l) => l.name);
     const legendOf = wrappedLegend(names, card.chart.getWidth(), lines.map((l) => l.dashed));
-    const zoom = slotZoom(gran);
+    const zoom = trendZoom(gran);
     const ends = endLabels(lines.map((l) => l.short), data.map((d) => d.map((p) => p[1])), theme, 260);
     const room = Math.max(...lines.map((l) => (legendTextWidth(l.short) * 11) / 12)) + 16;
     card.setSubtitle(opts.subtitle);
@@ -1293,7 +1293,7 @@ export class SensitivitySection {
       {
         grid: grid({ top: legendOf.top + 8, right: Math.max(24, room), bottom: zoom.bottom }),
         legend: legendOf.legend,
-        ...(zoom.dataZoom ? { dataZoom: zoom.dataZoom } : {}),
+        dataZoom: zoom.dataZoom,
         tooltip: {
           trigger: 'axis',
           formatter: namedTooltip(

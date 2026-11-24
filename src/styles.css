@@ -704,6 +704,18 @@ input[type='number'] {
   font-size: 12px;
 }
 
+/* 縦軸の拡大の説明は、図を隠しているあいだ（表で見る、データが無い）は出さない */
+.chart[hidden] + .y-zoom-note {
+  display: none;
+}
+
+/* タッチ操作の端末では Shift を押せないので、操作の説明は出さない */
+@media (hover: none) {
+  .y-zoom-note:not(.zoomed) {
+    display: none;
+  }
+}
+
 .card-empty {
   display: grid;
   place-items: center;

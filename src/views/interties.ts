@@ -47,7 +47,7 @@ import {
   valueAxis,
   withAlpha,
 } from './common';
-import { CURVE_GRAN_OPTIONS, curveGranularity, granText, namedTooltip, slotZoom, type AxisParam } from './curveCommon';
+import { CURVE_GRAN_OPTIONS, curveGranularity, granText, namedTooltip, trendZoom, type AxisParam } from './curveCommon';
 import { buildGrid, colorRange, gridTable, heatmapHeight, heatmapOption } from './heatmap';
 import { breakGaps, buildSeriesPoints, periodLabel, TIME_AXIS_LABEL } from './timeseries';
 
@@ -466,7 +466,7 @@ export class IntertiesView extends View {
     const t = TOKENS[theme];
     const color = { cat0: t.cat[0], cat1: t.cat[1], cat2: t.cat[2], neutral: t.neutralSeries };
     const gran = curveGranularity(sel, state.intertieGran);
-    const zoom = slotZoom(gran);
+    const zoom = trendZoom(gran);
     // 中部フェンスと関西フェンスの計画潮流と潮流実績は、公表されていない 3 月 12 日受渡分までを個別の連系線から計算した値で補う
     const values = TREND_LINES.map((l) => st.withDerived(ds, key, l.field));
     const raw = buildSeriesPoints(sel, values.map((v) => ({ a: v.values })), gran, 'mean');
@@ -567,7 +567,7 @@ export class IntertiesView extends View {
       {
         grid: grid({ right: labelRoom(lines.length), bottom: zoom.bottom }),
         legend: lineLegend([], { data: legendItems }),
-        ...(zoom.dataZoom ? { dataZoom: zoom.dataZoom } : {}),
+        dataZoom: zoom.dataZoom,
         tooltip: {
           trigger: 'axis',
           formatter: rowsTooltip(tips, (p) => {
@@ -801,7 +801,7 @@ export class IntertiesView extends View {
   private renderNet(st: IntertieStore, sel: Selection): void {
     const { ds, state, theme } = this.ctx;
     const gran = curveGranularity(sel, state.intertieGran);
-    const zoom = slotZoom(gran);
+    const zoom = trendZoom(gran);
     const net = st.netImports(ds);
     const raw = buildSeriesPoints(sel, AREA_KEYS.map((a) => ({ a: net[a] })), gran, 'mean');
     const shown = AREA_KEYS.map((a, i) => ({ name: SERIES_LABEL[a], color: seriesColor(a, theme), dashed: seriesDashed(a), points: raw[i].points })).filter((l) =>
@@ -817,7 +817,7 @@ export class IntertiesView extends View {
       {
         grid: grid({ right: 24, bottom: zoom.bottom }),
         legend: lineLegend(shown.map((l) => ({ name: l.name, dashed: l.dashed }))),
-        ...(zoom.dataZoom ? { dataZoom: zoom.dataZoom } : {}),
+        dataZoom: zoom.dataZoom,
         tooltip: {
           trigger: 'axis',
           formatter: namedTooltip(
