@@ -1,5 +1,6 @@
 /**
  * JEPX「スポット市場 取引結果」・価格感応度の年度別 CSV と、受渡日ごとの入札カーブを取得し、ビューア用のデータ（public/data）に変換する。
+ * 間接送電権の取引結果（年度別 CSV）も取得する。
  *
  *   npm run fetch                             取引結果（2005 年度〜今年度）と価格感応度（2021 年度〜）、直近 90 日の入札カーブを取得（取得済みはスキップ）
  *   npm run fetch -- --from 2016              取引結果は 2016 年度以降だけ
@@ -7,6 +8,7 @@
  *   npm run fetch -- --no-curves              入札カーブを取得しない
  *   npm run fetch -- --no-sensitivity         価格感応度（JEPX の公表値）を取得しない
  *   npm run fetch -- --no-interties           連系線（広域機関の計画潮流・潮流実績）を取得しない
+ *   npm run fetch -- --no-transmission-rights 間接送電権（JEPX の取引結果）を取得しない
  *   npm run fetch -- --force                  取得済みの年度・日も取り直す
  *   npm run fetch -- --keep-csv               元の CSV も public/data/raw/ に保存する
  *   npm run fetch -- --from-dir ./csv         手元の CSV（ダウンロード・保存しておいたもの）を変換する（通信なし。複数指定できる）
@@ -52,6 +54,7 @@ import {
   type IntertieIndex,
   type Manifest,
   type ManifestEntry,
+  type RightsIndex,
 } from '../src/lib/dataFile';
 import { fiscalYearOfDay, isoFromDay, parseDateString, todayJst } from '../src/lib/dates';
 import { decodeCsvBytes } from '../src/lib/encoding';
@@ -75,6 +78,18 @@ import {
 import { absorbedOfDay, publishedAt } from '../src/lib/sensitivity';
 import { DEFAULT_OCCTO_BASE, describeResponse, OcctoClient, type OcctoRanges } from './occto';
 import { SENSITIVITY_KEYS, SERIES_COUNT, SERIES_INDEX, SLOTS, type SeriesKey } from '../src/lib/series';
+import {
+  allProducts,
+  decodeRightsFile,
+  encodeRightsFile,
+  FIRST_RIGHTS_FY,
+  isRightsCsv,
+  parseRightsCsv,
+  RIGHTS_FILE,
+  rightsSpan,
+  type RightsProduct,
+  type RightsYears,
+} from '../src/lib/transmissionRights';
 
 export const JEPX_SPOT_PAGE = 'https://www.jepx.jp/electricpower/market-data/spot/';
 export const DEFAULT_URL_TEMPLATE = 'https://www.jepx.jp/js/csv_read.php?dir=spot_summary&file=spot_summary_{fy}.csv';
@@ -82,6 +97,8 @@ export const DEFAULT_URL_TEMPLATE = 'https://www.jepx.jp/js/csv_read.php?dir=spo
 export const DEFAULT_CURVES_URL_TEMPLATE = 'https://www.jepx.jp/js/csv_read.php?dir={dir}&file={file}';
 /** JEPX が公表している価格感応度（年度ごと。2021 年度から） */
 export const DEFAULT_SENSITIVITY_URL_TEMPLATE = 'https://www.jepx.jp/js/csv_read.php?dir=virtualprice&file=virtualprice_{fy}.csv';
+/** JEPX「間接送電権市場」の取引結果（約定日の年度ごと。2019 年度から） */
+export const DEFAULT_RIGHTS_URL_TEMPLATE = 'https://www.jepx.jp/js/csv_read.php?dir=transmission_rights&file=transmission_rights_{fy}.csv';
 export const FIRST_SENSITIVITY_FY = 2021;
 /** JEPX のスポット市場は 2005 年 4 月に開始 */
 export const FIRST_FY = 2005;
@@ -117,6 +134,9 @@ export interface FetchOptions {
   intertiesTo: number;
   /** 広域機関の系統情報サービスの場所（画面の URL の共通部分） */
   occtoBase: string;
+  /** 間接送電権（JEPX の取引結果）を取得する */
+  rights: boolean;
+  rightsUrlTemplate: string;
 }
 
 export function defaultOptions(): FetchOptions {
@@ -142,6 +162,8 @@ export function defaultOptions(): FetchOptions {
     intertiesFrom: tomorrow - (DEFAULT_CURVE_DAYS - 1),
     intertiesTo: tomorrow,
     occtoBase: DEFAULT_OCCTO_BASE,
+    rights: true,
+    rightsUrlTemplate: DEFAULT_RIGHTS_URL_TEMPLATE,
     fromDirs: [],
   };
 }
@@ -217,6 +239,12 @@ export function parseArgs(argv: string[], base = defaultOptions()): FetchOptions
       case '--occto-url':
         o.occtoBase = next();
         break;
+      case '--no-transmission-rights':
+        o.rights = false;
+        break;
+      case '--transmission-rights-url-template':
+        o.rightsUrlTemplate = next();
+        break;
       case '-h':
       case '--help':
         console.log(HELP);
@@ -243,6 +271,7 @@ const HELP = `使い方: npm run fetch -- [オプション]
   --interties-to <日付>  連系線を取得する最後の受渡日（既定: 翌日）
   --no-interties         連系線を取得しない
   --occto-url <URL>      広域機関の系統情報サービスの場所（既定: ${DEFAULT_OCCTO_BASE}）
+  --no-transmission-rights  間接送電権（JEPX の取引結果、${FIRST_RIGHTS_FY} 年度から）を取得しない
   --out <ディレクトリ>   出力先（既定: public/data）
   --force                取得済みの年度・日も取り直す
   --keep-csv             元の CSV を <出力先>/raw/ に保存する
@@ -250,6 +279,7 @@ const HELP = `使い方: npm run fetch -- [オプション]
   --url-template <URL>   取引結果の取得元 URL（{fy} が年度に置き換わる）
   --curves-url-template <URL>  入札カーブの取得元 URL（{dir}・{file} が置き換わる）
   --sensitivity-url-template <URL>  価格感応度の取得元 URL（{fy} が年度に置き換わる）
+  --transmission-rights-url-template <URL>  間接送電権の取得元 URL（{fy} が年度に置き換わる）
   --delay <ミリ秒>       連続取得の間隔（既定: 1500）`;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -468,6 +498,7 @@ export async function writeManifest(out: string, source: string, touchedCurveFys
   }
   const curves = await writeCurveIndex(out, touchedCurveFys);
   const interties = await intertieIndex(out);
+  const transmissionRights = await rightsIndex(out);
   const manifest: Manifest = {
     format: MANIFEST_FORMAT,
     generatedAt: new Date().toISOString(),
@@ -475,6 +506,7 @@ export async function writeManifest(out: string, source: string, touchedCurveFys
     files: entries,
     ...(curves ? { curves } : {}),
     ...(interties ? { interties } : {}),
+    ...(transmissionRights ? { transmissionRights } : {}),
   };
   await mkdir(out, { recursive: true });
   await writeFile(path.join(out, 'manifest.json'), JSON.stringify(manifest, null, 2));
@@ -507,6 +539,7 @@ async function readHead(file: string, size = 8192): Promise<string> {
  *   （同じ日が複数あれば後に読んだもの。フォルダは指定の順、フォルダの中は名前の順に読む）
  * - 分断エリアだけがある日は、変換済みの入札カーブがあれば名前を付け直す（別々に変換したとき）
  * - 入札カーブは --curves-from / --curves-to を指定したときだけ受渡日で絞る（既定はすべて）
+ * - 間接送電権の取引結果は、約定日の年度ごとに、変換済みのファイルの同じ年度と入れ替える
  * - 読めない CSV は飛ばして最後にまとめて知らせ、1 件も変換できなければエラーにする
  */
 async function convertDir(o: FetchOptions): Promise<Set<number>> {
@@ -538,6 +571,8 @@ async function convertDir(o: FetchOptions): Promise<Set<number>> {
   const groups = new Map<number, AreaGroup[][]>();
   const curveFiles: typeof files = [];
   const intertie: IntertieDays = new Map();
+  // 間接送電権: 約定日の年度 → 商品名 → 商品（同じ CSV を 2 回読んでも、量が重ならないように）
+  const rights = new Map<number, Map<string, RightsProduct>>();
   for (const f of files) {
     try {
       const head = await readHead(f.path);
@@ -546,6 +581,18 @@ async function convertDir(o: FetchOptions): Promise<Set<number>> {
         const res = parseOcctoCsv(await read(f.path));
         mergeIntertieDays(intertie, res.days, occto === 'plan' ? PLAN_FIELDS : FLOW_FIELDS);
         o.log(`${f.label}: 連系線の${occto === 'plan' ? '計画潮流（翌日）' : '潮流実績'} ${isoFromDay(res.firstDay)}〜${isoFromDay(res.lastDay)}${unknownLines(res.unknown)}`);
+        continue;
+      }
+      if (isRightsCsv(head)) {
+        const res = parseRightsCsv(await read(f.path));
+        for (const p of res.products) {
+          const fy = fiscalYearOfDay(p.tradeDay);
+          if (fy < o.from - 1 || fy > o.to) continue;
+          let m = rights.get(fy);
+          if (!m) rights.set(fy, (m = new Map()));
+          m.set(p.code, p);
+        }
+        o.log(`${f.label}: 間接送電権 ${res.products.length} 商品${res.skipped > 0 ? `（読めない ${res.skipped} 行は飛ばしました）` : ''}`);
         continue;
       }
       const kind = curveCsvKind(head);
@@ -642,8 +689,17 @@ async function convertDir(o: FetchOptions): Promise<Set<number>> {
   if (outside > 0) o.log(`入札カーブ: --curves-from / --curves-to の範囲外の ${outside} 日は変換しませんでした`);
   const savedInterties = intertie.size > 0 ? await saveInterties(o.out, intertie) : 0;
   if (savedInterties > 0) o.log(`連系線: ${intertie.size} 日分を ${savedInterties} 年度のファイルに入れました`);
+  // 間接送電権は、CSV のあった年度だけを入れ替える（ほかの年度は、変換済みのものを残す）
+  if (rights.size > 0) {
+    const stored = await readRights(o.out);
+    for (const [fy, m] of rights) stored.set(fy, [...m.values()]);
+    await writeRights(o.out, stored);
+    o.log(`間接送電権: ${[...rights.keys()].sort((a, b) => a - b).join('、')} 年度を ${RIGHTS_FILE} に入れました`);
+  }
   if (failed.length > 0) o.log(`読み込めなかった CSV: ${failed.length} 件（${failed.join(', ')}）`);
-  if (days.size === 0 && savedFy === 0 && touched.size === 0 && renamed === 0 && savedInterties === 0) throw new Error(`${where} に変換できる CSV がありません`);
+  if (days.size === 0 && savedFy === 0 && touched.size === 0 && renamed === 0 && savedInterties === 0 && rights.size === 0) {
+    throw new Error(`${where} に変換できる CSV がありません`);
+  }
   return touched;
 }
 
@@ -838,6 +894,7 @@ export async function run(o: FetchOptions): Promise<Manifest> {
     try {
       await fetchAll(o, dispatcher, pace);
       if (o.curves) touched = await fetchCurves(o, dispatcher, pace);
+      if (o.rights) await fetchRights(o, dispatcher, pace);
       if (o.interties) await fetchInterties(o, dispatcher, pace);
     } finally {
       await dispatcher.close();
@@ -856,7 +913,80 @@ export async function run(o: FetchOptions): Promise<Manifest> {
   }
   if (manifest.curves) o.log(`入札カーブ: ${manifest.curves.dates.length} 日（${manifest.curves.firstDate}〜${manifest.curves.lastDate}）`);
   if (manifest.interties) o.log(`連系線: ${manifest.interties.firstDate}〜${manifest.interties.lastDate}`);
+  const rights = manifest.transmissionRights;
+  if (rights) o.log(`間接送電権: ${rights.products} 商品（${rights.firstDate}〜${rights.lastDate} の受渡分）`);
   return manifest;
+}
+
+// ---- 間接送電権（JEPX） ----
+
+/** 出力先にある間接送電権の取引結果（無いか読めなければ空） */
+async function readRights(out: string): Promise<RightsYears> {
+  const p = path.join(out, RIGHTS_FILE);
+  if (!existsSync(p)) return new Map();
+  try {
+    return decodeRightsFile(JSON.parse(await readFile(p, 'utf8')));
+  } catch {
+    return new Map();
+  }
+}
+
+async function writeRights(out: string, years: RightsYears): Promise<void> {
+  const p = path.join(out, RIGHTS_FILE);
+  await mkdir(path.dirname(p), { recursive: true });
+  await writeFile(p, JSON.stringify(encodeRightsFile(years)));
+}
+
+/**
+ * JEPX から間接送電権の取引結果（約定日の年度ごとの CSV）を取得し、1 つのファイルにまとめる。
+ * 取引結果の最初の年度（--from）の前の年度から取る（その年度の 4 月、5 月の受渡分は、前の年度に取引されるため）。
+ * 前年度より前の取得済みの年度は取り直さない（今年度と前年度は、新しい取引を入れるため毎回取り直す）
+ */
+async function fetchRights(o: FetchOptions, dispatcher: EnvHttpProxyAgent, pace: () => Promise<void>): Promise<void> {
+  const years = await readRights(o.out);
+  const currentFy = fiscalYearOfDay(todayJst());
+  let changed = false;
+  let skipped = 0;
+  for (let fy = Math.max(FIRST_RIGHTS_FY, o.from - 1); fy <= o.to; fy++) {
+    if (!o.force && fy < currentFy - 1 && years.has(fy)) {
+      skipped++;
+      continue;
+    }
+    await pace();
+    let bytes: Uint8Array | null;
+    try {
+      bytes = await download(o.rightsUrlTemplate.replace(/\{fy\}/g, String(fy)), dispatcher);
+    } catch (err) {
+      o.log(`${fy}年度: 間接送電権の取引結果を取得できませんでした（${(err as Error).message}）`);
+      continue;
+    }
+    if (!bytes || bytes.length === 0) {
+      o.log(`${fy}年度: 間接送電権の取引結果はありません`);
+      continue;
+    }
+    if (o.keepCsv) {
+      await mkdir(path.join(o.out, 'raw'), { recursive: true });
+      await writeFile(path.join(o.out, 'raw', `transmission_rights_${fy}.csv`), bytes);
+    }
+    try {
+      const res = parseRightsCsv(decodeCsvBytes(bytes).text);
+      years.set(fy, res.products);
+      changed = true;
+      o.log(`${fy}年度: 間接送電権 ${res.products.length} 商品${res.skipped > 0 ? `（読めない ${res.skipped} 行は飛ばしました）` : ''}`);
+    } catch (err) {
+      o.log(`${fy}年度: 間接送電権の CSV を解釈できませんでした（${(err as Error).message}）`);
+    }
+  }
+  if (changed) await writeRights(o.out, years);
+  if (skipped > 0) o.log(`間接送電権: 取得済みの ${skipped} 年度はスキップ`);
+}
+
+/** 出力先にある間接送電権の取引結果の一覧（無いか、商品が無ければ undefined） */
+async function rightsIndex(out: string): Promise<RightsIndex | undefined> {
+  const products = allProducts(await readRights(out));
+  const span = rightsSpan(products);
+  if (!span) return undefined;
+  return { file: RIGHTS_FILE, firstDate: isoFromDay(span[0]), lastDate: isoFromDay(span[1]), products: products.length };
 }
 
 // ---- 連系線（広域機関） ----

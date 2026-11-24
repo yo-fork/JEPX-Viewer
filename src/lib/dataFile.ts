@@ -3,6 +3,7 @@
  *
  * manifest.json … 年度ファイルの一覧
  * spot/fyYYYY.json … 1 年度分。系列ごとに「日数 × 48 コマ」の配列（欠損は null）
+ * （連系線は occto.ts、間接送電権は transmissionRights.ts、入札カーブは bidCurves.ts にファイル形式がある）
  */
 import { fiscalYearOfDay, isoFromDay, parseDateString } from './dates';
 import { newDayValues, type DayMap } from './jepxCsv';
@@ -36,6 +37,8 @@ export interface Manifest {
   curves?: CurveIndex;
   /** 連系線（広域機関の公表値。取得していなければ無い） */
   interties?: IntertieIndex;
+  /** 間接送電権（JEPX の取引結果。取得していなければ無い） */
+  transmissionRights?: RightsIndex;
 }
 
 /** 取得済みの連系線の年度ファイルの一覧（interties/fyYYYY.json） */
@@ -43,6 +46,16 @@ export interface IntertieIndex {
   firstDate: string;
   lastDate: string;
   files: ManifestEntry[];
+}
+
+/** 取得済みの間接送電権の取引結果（interties/transmission-rights.json） */
+export interface RightsIndex {
+  file: string;
+  /** 商品の対象期間の最初と最後の日 */
+  firstDate: string;
+  lastDate: string;
+  /** 商品の数 */
+  products: number;
 }
 
 /** 取得済みの入札カーブの一覧（curves/ 以下） */

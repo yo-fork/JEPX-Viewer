@@ -10,6 +10,7 @@
  * 入札カーブ（npm run fetch で取得したもの）は、指標をすべてと、1 コマの図に使うカーブを直近 7 日分入れる
  * （1 日分が数百 KB あるため。--curve-days で変えられる）。--split では取得済みのカーブをすべて data フォルダに書き出す。
  * 連系線（広域機関の公表値）は、埋め込む年度の年度ファイルを入れる（--no-interties で入れない）。
+ * 間接送電権（JEPX の取引結果）は、入れた連系線の期間にかかる商品だけを入れる（連系線を入れないときは入れない）。
  *
  * ファイルから直接開いたページでは、ブラウザは別ファイルのモジュールスクリプト・CSS を読み込まず、fetch も使えない。
  * そこで vite build の出力（dist/index.html と assets/ の JS・CSS）を 1 つの HTML にまとめ、
@@ -25,10 +26,11 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { gzipSync } from 'node:zlib';
 import { CURVE_DAY_FORMAT, CURVE_METRICS_FORMAT, curveDayFile } from '../src/lib/bidCurves';
-import { FY_FILE_FORMAT, MANIFEST_FORMAT, type CurveIndex, type IntertieIndex, type Manifest } from '../src/lib/dataFile';
-import { fiscalYearOfDay, parseDateString } from '../src/lib/dates';
+import { FY_FILE_FORMAT, MANIFEST_FORMAT, type CurveIndex, type IntertieIndex, type Manifest, type RightsIndex } from '../src/lib/dataFile';
+import { fiscalYearOfDay, isoFromDay, parseDateString } from '../src/lib/dates';
 import { dataScriptPath, EMBED_ATTR, ENCODING_ATTR, GZIP_BASE64, LOCAL_MANIFEST, REGISTER_FN, SCRIPTS_META } from '../src/lib/localData';
 import { INTERTIE_FY_FORMAT } from '../src/lib/occto';
+import { allProducts, decodeRightsFile, encodeRightsFile, RIGHTS_FILE, RIGHTS_FILE_FORMAT, rightsSpan, type RightsYears } from '../src/lib/transmissionRights';
 
 /** 1 ファイル版に入れる、1 コマの図に使う入札カーブの日数（入札カーブのタブの「直近 7 日」の比較に足りる分） */
 export const INLINE_CURVE_DAYS = 7;
@@ -85,7 +87,7 @@ const HELP = `使い方: npm run build:single -- [オプション]
   --split                データを HTML と同じ場所の data フォルダに分けて出力する（共有フォルダ向け）
   --curve-days <日数>    1 コマの図に使う入札カーブを直近何日分入れるか（既定: 7 日。--split では取得済みのすべて）
   --no-curves            入札カーブを入れない
-  --no-interties         連系線（広域機関の公表値）を入れない
+  --no-interties         連系線（広域機関の公表値）と間接送電権を入れない
   --no-compress          データを圧縮せず、JSON のまま埋め込む（DecompressionStream に対応していない古いブラウザ向け）
   --artifact             Claude の Artifact に出すページにする（--split ではデータを data フォルダに JSON のまま出す）
   --out <ファイル>       出力先（既定: dist-single/jepx-viewer.html、--artifact では ${ARTIFACT_OUT}）
@@ -228,9 +230,10 @@ function checkName(name: string, pattern: RegExp, what: string): string {
  * 名前と中身がそろっていることを確かめてから返す
  */
 function dataFiles(data: EmbeddedData): [string, unknown][] {
-  const { files, curves, interties } = data.manifest;
+  const { files, curves, interties, transmissionRights } = data.manifest;
   const names = files.map((f) => checkName(f.file, /^spot\/fy\d{4}\.json$/, '年度ファイル'));
   if (interties) names.push(...interties.files.map((f) => checkName(f.file, /^interties\/fy\d{4}\.json$/, '連系線の年度ファイル')));
+  if (transmissionRights) names.push(checkName(transmissionRights.file, /^interties\/transmission-rights\.json$/, '間接送電権のファイル'));
   if (curves) {
     names.push(...curves.metrics.map((m) => checkName(m.file, /^curves\/fy\d{4}\.json$/, '入札カーブの指標のファイル')));
     names.push(...curves.dates.map((d) => curveDayFile(parseDateString(checkName(d, /^\d{8}$/, '入札カーブの日付'))!)));
@@ -410,7 +413,29 @@ async function loadInterties(o: SingleOptions, index: IntertieIndex | undefined,
   return { firstDate: list[0].firstDate, lastDate: list[list.length - 1].lastDate, files: list };
 }
 
-/** 取得済みデータから、埋め込む年度の manifest と年度ファイル・入札カーブ・連系線を読む */
+/** 間接送電権の取引結果から、入れた連系線の期間にかかる商品だけを読む（連系線を入れないときと、かかる商品が無いときは入れない） */
+async function loadRights(
+  o: SingleOptions,
+  index: RightsIndex | undefined,
+  interties: IntertieIndex | undefined,
+  files: Map<string, unknown>,
+): Promise<RightsIndex | undefined> {
+  const first = interties && parseDateString(interties.firstDate);
+  const last = interties && parseDateString(interties.lastDate);
+  if (!index || typeof first !== 'number' || typeof last !== 'number') return undefined;
+  const years: RightsYears = new Map();
+  for (const [fy, products] of decodeRightsFile(await readJson(o, index.file, RIGHTS_FILE_FORMAT))) {
+    const kept = products.filter((p) => p.last >= first && p.first <= last);
+    if (kept.length > 0) years.set(fy, kept);
+  }
+  const products = allProducts(years);
+  const span = rightsSpan(products);
+  if (!span) return undefined;
+  files.set(RIGHTS_FILE, encodeRightsFile(years));
+  return { file: RIGHTS_FILE, firstDate: isoFromDay(span[0]), lastDate: isoFromDay(span[1]), products: products.length };
+}
+
+/** 取得済みデータから、埋め込む年度の manifest と年度ファイル・入札カーブ・連系線・間接送電権を読む */
 async function loadData(o: SingleOptions): Promise<EmbeddedData> {
   let manifest: Manifest;
   try {
@@ -425,10 +450,21 @@ async function loadData(o: SingleOptions): Promise<EmbeddedData> {
   for (const f of entries) files.set(f.file, await readJson(o, f.file, FY_FILE_FORMAT));
   const curves = await loadCurves(o, manifest.curves, files);
   const interties = await loadInterties(o, manifest.interties, files);
+  const transmissionRights = await loadRights(o, manifest.transmissionRights, interties, files);
   // 手元の CSV から作ったデータの取得元（local:フォルダのパス）には作った人の PC のフォルダ名が入るので、配るファイルには入れない
   const source = manifest.source?.startsWith('local:') ? 'local' : manifest.source;
-  const { curves: _all, interties: _ties, ...rest } = manifest;
-  return { manifest: { ...rest, source, files: entries, ...(curves ? { curves } : {}), ...(interties ? { interties } : {}) }, files };
+  const { curves: _all, interties: _ties, transmissionRights: _rights, ...rest } = manifest;
+  return {
+    manifest: {
+      ...rest,
+      source,
+      files: entries,
+      ...(curves ? { curves } : {}),
+      ...(interties ? { interties } : {}),
+      ...(transmissionRights ? { transmissionRights } : {}),
+    },
+    files,
+  };
 }
 
 export async function buildSingle(o: SingleOptions): Promise<{ bytes: number; dataBytes: number; data: EmbeddedData | null }> {
@@ -461,10 +497,13 @@ export async function buildSingle(o: SingleOptions): Promise<{ bytes: number; da
     : 'データなし';
   const curves = data?.manifest.curves;
   const ties = data?.manifest.interties;
+  const rights = data?.manifest.transmissionRights;
   const curveText =
     (curves
       ? `・入札カーブ ${curves.dates.length} 日分（${curves.dates[0].replace(/^(\d{4})(\d{2})(\d{2})$/, '$1-$2-$3')}〜、指標は ${curves.firstDate}〜${curves.lastDate}）`
-      : '') + (ties ? `・連系線 ${ties.firstDate}〜${ties.lastDate}` : '');
+      : '') +
+    (ties ? `・連系線 ${ties.firstDate}〜${ties.lastDate}` : '') +
+    (rights ? `・間接送電権 ${rights.products} 商品` : '');
   // 圧縮したときは、圧縮しなければどれだけになったかも示す
   const uncompressed = () => (o.artifact ? assembleArtifact(indexHtml, readAsset, data) : assembleHtml(indexHtml, readAsset, data));
   const plain = compress && data ? Buffer.byteLength(await uncompressed()) : 0;

@@ -10,6 +10,7 @@
  * - scripts（--split）: HTML と同じ場所の data/spot/fy2024.js が jepxViewerData("spot/fy2024.json", {…}) を呼ぶ。
  *   <script src> は、ファイルから開いたページでも同じフォルダのファイルを読める（fetch と違い CORS の制限を受けない）。
  */
+import { RIGHTS_FILE } from './transmissionRights';
 
 /** データ用 script 要素の属性。値は public/data からの相対パス */
 export const EMBED_ATTR = 'data-jv-file';
@@ -66,10 +67,12 @@ async function gunzipText(bytes: Uint8Array<ArrayBuffer>): Promise<string> {
 
 /**
  * データとして読んでよい名前か（manifest が書き換えられても、data/ の外や別のサイトのファイルは読まない）。
- * 取引結果の年度ファイル、入札カーブの指標の年度ファイル・1 日分のファイル、連系線の年度ファイルだけ
+ * 取引結果の年度ファイル、入札カーブの指標の年度ファイル・1 日分のファイル、連系線の年度ファイル、間接送電権のファイルだけ
  */
 export function isDataFile(file: string): boolean {
-  return file === LOCAL_MANIFEST || /^(spot|curves|interties)\/fy\d{4}\.json$/.test(file) || /^curves\/\d{4}\/\d{8}\.json$/.test(file);
+  return (
+    file === LOCAL_MANIFEST || file === RIGHTS_FILE || /^(spot|curves|interties)\/fy\d{4}\.json$/.test(file) || /^curves\/\d{4}\/\d{8}\.json$/.test(file)
+  );
 }
 
 /** data/*.js の場所（manifest.json → data/manifest.js、spot/fy2024.json → data/spot/fy2024.js） */

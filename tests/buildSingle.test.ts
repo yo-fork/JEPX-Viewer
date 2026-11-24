@@ -25,6 +25,7 @@ import { syntheticCurveDay } from '../src/lib/demoCurves';
 import { encodeIntertieFy, INTERTIE_FIELD_INDEX, INTERTIE_INDEX, intertieOffset, newIntertieDay } from '../src/lib/occto';
 import { SLOTS } from '../src/lib/series';
 import { dataScriptPath, isDataFile, loadDataScript, localDataMode, readEmbedded, REGISTER_FN } from '../src/lib/localData';
+import { allProducts, decodeRightsFile, encodeRightsFile, RIGHTS_FILE, type RightsProduct, type RightsYears } from '../src/lib/transmissionRights';
 
 /** vite build が出力する index.html と同じ形 */
 const INDEX_HTML = `<!doctype html>
@@ -372,6 +373,24 @@ describe('buildSingle（入札カーブ）', () => {
       );
       await writeFile(path.join(data, 'interties', `fy${fy}.json`), JSON.stringify(encodeIntertieFy(fy, map)));
     }
+    // 間接送電権（連系線の期間にかかる週間商品と、かからない週間商品・年間商品）
+    const rights = (code: string, first: number, last: number): RightsProduct => ({
+      code,
+      label: '',
+      from: 'chubu',
+      to: 'tokyo',
+      tradeDay: first - 40,
+      first,
+      last,
+      offer: 1200,
+      price: 0.5,
+      volume: 600,
+    });
+    const years: RightsYears = new Map([
+      [2023, [rights('23W23T43', dayFromYmd(2023, 6, 3), dayFromYmd(2023, 6, 9)), rights('24W14T43', dayFromYmd(2024, 3, 30), dayFromYmd(2024, 4, 5))]],
+      [2024, [rights('Y251T43', dayFromYmd(2025, 4, 1), dayFromYmd(2026, 3, 31))]],
+    ]);
+    await writeFile(path.join(data, RIGHTS_FILE), JSON.stringify(encodeRightsFile(years)));
     await writeManifest(data, 'test');
   });
   afterAll(async () => {
@@ -414,13 +433,26 @@ describe('buildSingle（入札カーブ）', () => {
   it('連系線の年度ファイルも、埋め込む年度の分だけ入れ、--no-interties では入れない', async () => {
     const all = await embedded({});
     expect(all.manifest.interties!.files.map((f) => f.file)).toEqual(['interties/fy2023.json', 'interties/fy2024.json']);
-    expect([...all.files.keys()].filter((f) => f.startsWith('interties/'))).toEqual(['interties/fy2023.json', 'interties/fy2024.json']);
+    expect([...all.files.keys()].filter((f) => /^interties\/fy\d{4}\.json$/.test(f))).toEqual(['interties/fy2023.json', 'interties/fy2024.json']);
     const from = await embedded({ from: 2024 });
     expect(from.manifest.interties).toMatchObject({ firstDate: '2024-04-01', lastDate: '2024-04-02' });
     const none = await embedded({ noInterties: true });
     expect(none.manifest.interties).toBeUndefined();
     expect([...none.files.keys()].some((f) => f.startsWith('interties/'))).toBe(false);
     expect(isDataFile('interties/fy2024.json')).toBe(true);
+  });
+
+  it('間接送電権は、入れた連系線の期間にかかる商品だけを入れ、連系線を入れないときは入れない', async () => {
+    const all = await embedded({});
+    expect(all.manifest.transmissionRights).toEqual({ file: RIGHTS_FILE, firstDate: '2024-03-30', lastDate: '2024-04-05', products: 1 });
+    expect(allProducts(decodeRightsFile(all.files.get(RIGHTS_FILE))).map((p) => p.code)).toEqual(['24W14T43']);
+    // 2024 年度だけでも、連系線の期間（4/1〜4/2）にかかる商品は入れる
+    expect((await embedded({ from: 2024 })).manifest.transmissionRights?.products).toBe(1);
+    const none = await embedded({ noInterties: true });
+    expect(none.manifest.transmissionRights).toBeUndefined();
+    expect(none.files.has(RIGHTS_FILE)).toBe(false);
+    expect(isDataFile(RIGHTS_FILE)).toBe(true);
+    expect(dataScriptPath(RIGHTS_FILE)).toBe('data/interties/transmission-rights.js');
   });
 
   it('既定ではデータを圧縮して埋め込み、--no-compress では JSON のまま埋め込む（中身は同じ）', async () => {

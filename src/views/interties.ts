@@ -1,11 +1,13 @@
 /**
  * 連系線: 電力広域的運営推進機関（広域機関）が公表している、地域間連系線ごとの計画潮流・上限・潮流実績。
  * 連系線ごとの、計画潮流が上限に達したコマ（市場分断が起きる）の割合、選んだ連系線の推移・時間帯別の様子・ヒートマップ。
+ * 推移の図には、JEPX の間接送電権の約定量と、その推定キャンセル量も重ねる。
  */
 import { aggregateBySlot, type Granularity } from '../lib/aggregate';
 import { formatDay, slotRangeLabel, slotStartLabel, wallClockMs } from '../lib/dates';
 import { fmtNum, fmtPct, fmtSigned } from '../lib/format';
 import type { IntertieStore } from '../lib/intertieStore';
+import { RIGHTS_ESTIMATE_FROM } from '../lib/transmissionRights';
 import {
   atLimit,
   fencePartsText,
@@ -30,8 +32,22 @@ import { h } from '../ui/dom';
 import { seriesColor, seriesDashed, TOKENS } from '../ui/theme';
 import { ttHeader, ttNote, ttRow } from '../ui/tooltip';
 import { NO_DATA, View } from './base';
-import { describeSelection, endLabels, grid, labelRoom, LINE_SAMPLING, lineLegend, rangeTag, slotAxis, styledLine, valueAxis } from './common';
-import { CURVE_GRAN_OPTIONS, curveGranularity, granText, namedTooltip, slotZoom } from './curveCommon';
+import {
+  DASH_ICON,
+  describeSelection,
+  endLabels,
+  grid,
+  labelRoom,
+  LINE_ICON,
+  LINE_SAMPLING,
+  lineLegend,
+  rangeTag,
+  slotAxis,
+  styledLine,
+  valueAxis,
+  withAlpha,
+} from './common';
+import { CURVE_GRAN_OPTIONS, curveGranularity, granText, namedTooltip, slotZoom, type AxisParam } from './curveCommon';
 import { buildGrid, colorRange, gridTable, heatmapHeight, heatmapOption } from './heatmap';
 import { breakGaps, buildSeriesPoints, periodLabel, TIME_AXIS_LABEL } from './timeseries';
 
@@ -127,6 +143,94 @@ export function coverageNotes(key: IntertieKey, c: LineCoverage, special = true)
   return notes;
 }
 
+/** 推移の図に重ねた間接送電権の、選んだ期間・時間帯のまとめ（図の下の注記に使う） */
+export interface RightsSummary {
+  /** 約定量のある（線を描いた）向きの数 */
+  shown: number;
+  /** 推定キャンセル量を求めたコマがあるか（2026 年度から）と、それより前に約定量があるか */
+  estimated: boolean;
+  before: boolean;
+  /** 推定キャンセル量が 0 より大きいコマの数と、その合計（MWh） */
+  cancelSlots: number;
+  cancelMwh: number;
+}
+
+/** 推移の図の下に出す、間接送電権の注記 */
+export function rightsNotes(s: RightsSummary): string[] {
+  if (s.shown === 0) return [];
+  // 推定キャンセル量を求めた期間が無ければ、帯の説明は書かない
+  const notes = [
+    '点線は間接送電権の約定量の合計です（JEPX「間接送電権市場」の取引結果。週間商品と年間商品を足したもの）。' +
+      (s.estimated ? '塗った帯は推定キャンセル量で、約定量の線から 0 の側へ、その量の幅で塗っています。' : ''),
+  ];
+  if (s.estimated) {
+    notes.push(
+      'JEPX はキャンセル量を公表していないので、取引規程第 87 条（受渡日の前日の運用容量、マージン、経過措置計画量などで、発行済みの量を超える分を保有量に応じて減らす）に沿って、' +
+        '約定量のうち「運用容量 − マージン」を超える分を推定しています。' +
+        '翌日の値のマージンは、スポット市場のあとに、計画潮流と反対の向きで積み増されていることがあります。' +
+        'キャンセルはスポット市場の前の値で決まると考えて、その日の最小のマージンを使うので、約定量の線が図の上限より外にあっても、帯が無いことがあります。' +
+        '0.1 MW 単位の端数などで、実際の量とは少し違うことがあります。',
+    );
+  }
+  const why = '2025 年度までは、経過措置計画量がデータに無く、広域調整枠を差し引いていたかも分からないためです';
+  if (s.before) {
+    notes.push(
+      s.estimated ? `推定キャンセル量は 2026 年 4 月 1 日受渡分から求めています（${why}）。` : `この期間は 2026 年 3 月までなので、推定キャンセル量は求めていません（${why}）。`,
+    );
+  }
+  if (s.estimated) {
+    notes.push(
+      s.cancelSlots > 0
+        ? `この期間の推定キャンセル量は ${fmtNum(s.cancelSlots)} コマ、合計 ${fmtNum(s.cancelMwh)} MWh です。`
+        : 'この期間に推定キャンセル量はありません。',
+    );
+  }
+  return notes;
+}
+
+/** 推移の図に重ねる、間接送電権の 1 つの向き */
+interface RightsLayer {
+  /** 約定量の線と、推定キャンセル量の帯の名前 */
+  name: string;
+  bandName: string;
+  /** 約定量（正は順方向）、帯の下端（約定量 − 推定キャンセル量）、帯の厚み（推定キャンセル量。約定量と同じ符号） */
+  volume: [number, number][];
+  kept: [number, number][];
+  cancel: [number, number][];
+  /** 推定キャンセル量を求めたコマがあるか（表の列に出す）と、0 より大きいコマがあるか（帯を描く） */
+  estimated: boolean;
+  cancelled: boolean;
+}
+
+/** 間接送電権の約定量の線（点線。暗い配色では青との差が小さいので、線の形でも見分ける） */
+const RIGHTS_DASH = [1, 4];
+const DOT_ICON = 'path://M0 0H3V3H0Z M5.67 0H8.67V3H5.67Z M11.33 0H14.33V3H11.33Z M17 0H20V3H17Z';
+
+/** ツールチップの 1 行の書式（系列ごと） */
+interface TipRow {
+  name: string;
+  color: string;
+  key: 'line' | 'dash' | 'rect';
+  format: (v: number) => string;
+  /** 値の無いときは行を出さない */
+  optional?: boolean;
+}
+
+/** 系列の順に、系列ごとの書式で並べる軸ツールチップ（rows が null の系列は出さない） */
+function rowsTooltip(rows: (TipRow | null)[], header: (first: AxisParam) => string): (params: AxisParam | AxisParam[]) => string {
+  return (params) => {
+    const ps = (Array.isArray(params) ? params : [params]).slice().sort((a, b) => a.seriesIndex - b.seriesIndex);
+    if (ps.length === 0) return '';
+    let html = ttHeader(header(ps[0]));
+    for (const p of ps) {
+      const row = rows[p.seriesIndex];
+      const v = Array.isArray(p.value) ? Number(p.value[1]) : Number(p.value);
+      if (row && (Number.isFinite(v) || !row.optional)) html += ttRow(row.color, row.format(v), row.name, row.key);
+    }
+    return html;
+  };
+}
+
 interface LineStat {
   key: IntertieKey;
   /** 計画潮流のあるコマの数と、順方向・逆方向の上限に達したコマの数 */
@@ -202,10 +306,11 @@ export class IntertiesView extends View {
       return;
     }
     this.note.textContent =
-      `${st.isDemo ? 'デモの値（デモデータのエリア価格から合成したもので、実際の値ではありません）。' : `${OCCTO_SOURCE}。データは ${formatDay(st.first)}〜${formatDay(st.last)} にあります。`}` +
+      `${st.isDemo ? 'デモの値（デモデータのエリア価格などから合成したもので、実際の値ではありません）。' : `${OCCTO_SOURCE}。データは ${formatDay(st.first)}〜${formatDay(st.last)} にあります。`}` +
       '計画潮流（翌日）は前日に策定した値（スポット市場の約定で使った量を含む）、計画潮流（最終）は時間前市場などで変わった後の値、潮流実績は実際に流れた量（5 分ごとの値の 30 分の平均）です。' +
       '上限は「運用容量 − マージン − 広域調整枠」で、計画潮流が上限に達すると市場分断が起きます。正の値は順方向（連系線の名前の前の側から後ろの側）です。' +
-      'エリアの正味の受け入れ量は、そのエリアにつながる連系線の計画潮流（翌日）を足し引きしたもので、スポット市場で約定した買い − 売り（ブロック入札も含む）にあたります（正は受け入れ、負は送り出し）。';
+      'エリアの正味の受け入れ量は、そのエリアにつながる連系線の計画潮流（翌日）を足し引きしたもので、スポット市場で約定した買い − 売り（ブロック入札も含む）にあたります（正は受け入れ、負は送り出し）。' +
+      (st.hasRights ? '' : '間接送電権のデータが無いので、推移の図に約定量と推定キャンセル量は描いていません（npm run fetch で取得します）。');
     if (sel.days.length === 0) {
       cards.forEach((c) => c.setEmpty(NO_DATA));
       return;
@@ -373,7 +478,9 @@ export class IntertiesView extends View {
     const planCalc = this.derivedSpan(sel, [values[0].derived]);
     // 計算した値の終わり（公表値の始まり）に縦線を引く（選んだ期間に公表値もあるとき）
     const boundary = planCalc && planCalc[1] < sel.to ? wallClockMs(planCalc[1] + 1) : null;
-    this.trend.setTitle(`${intertieTitle(key)}の計画潮流と上限の推移`);
+    // 間接送電権: 向きごとの約定量の線と、推定キャンセル量の帯（約定量の線から 0 の側へ、その厚みだけ塗る）
+    const { layers, summary } = this.rightsLayers(st, sel, key, gran);
+    this.trend.setTitle(`${intertieTitle(key)}の計画潮流と上限${layers.length > 0 ? '、間接送電権' : ''}の推移`);
     this.trend.setSubtitle(`${describeSelection(sel, state)}・MW（正は順方向: ${forward(key)}）、${granText(gran)}`);
     // 値の無い期間や日（線が切れる所）と、その理由を図の下に書く。計算した値の説明は、連系線の説明のすぐ後に置く
     const notes = coverageNotes(key, this.coverage(st, sel, key), !st.isDemo);
@@ -385,9 +492,20 @@ export class IntertiesView extends View {
           'フェンスの上限は個別の連系線の上限の和にならないので、この期間の上限は描いていません。',
       );
     }
+    notes.push(...rightsNotes(summary));
+    if (st.rightsError) notes.push(`間接送電権のデータを読み込めませんでした（${st.rightsError}）。`);
     this.trend.footer.replaceChildren(...notes.map((text) => h('p', { class: 'card-note' }, text)));
-    const names = shown.map((l) => l.name);
-    const ends = endLabels(names, shown.map((l) => l.points.map((p) => p[1])), theme, 260);
+    const rightsColor = t.cat[6];
+    const bandColor = withAlpha(rightsColor, t.fillAlpha * 2);
+    const mw = (v: number) => `${fmtSigned(v, 0)} MW`;
+    // 直接ラベルを付ける線: 公表値などの線と、間接送電権の約定量の線（帯には付けない）
+    const lines = [...shown.map((l) => ({ name: l.name, points: l.points })), ...layers.map((r) => ({ name: r.name, points: r.volume }))];
+    const ends = endLabels(
+      lines.map((l) => l.name),
+      lines.map((l) => l.points.map((p) => p[1])),
+      theme,
+      260,
+    );
     const markLine = boundary
       ? {
           markLine: {
@@ -400,46 +518,148 @@ export class IntertiesView extends View {
           },
         }
       : {};
+    const pts = (points: [number, number][]) => (gran === 'slot' ? breakGaps(points) : points);
+    const series: Record<string, unknown>[] = shown.map((l, i) =>
+      styledLine(l.name, color[l.color], theme, pts(l.points), l.dashed, {
+        sampling: LINE_SAMPLING,
+        ...(l.field === 'actual' ? { lineStyle: { width: 1.5 } } : {}),
+        ...ends[i],
+        ...(i === 0 ? markLine : {}),
+      }),
+    );
+    const tips: (TipRow | null)[] = shown.map((l) => ({ name: l.name, color: color[l.color], key: l.dashed ? 'dash' : 'line', format: mw }));
+    const legendItems: { name: string; icon: string; itemStyle?: Record<string, unknown> }[] = shown.map((l) => ({
+      name: l.name,
+      icon: l.dashed ? DASH_ICON : LINE_ICON,
+    }));
+    layers.forEach((r, j) => {
+      series.push(
+        styledLine(r.name, rightsColor, theme, pts(r.volume), false, {
+          sampling: LINE_SAMPLING,
+          lineStyle: { width: 2, type: RIGHTS_DASH, cap: 'round', join: 'round' },
+          ...ends[shown.length + j],
+        }),
+      );
+      tips.push({ name: r.name, color: rightsColor, key: 'dash', format: mw, optional: true });
+      legendItems.push({ name: r.name, icon: DOT_ICON });
+      if (!r.cancelled) return;
+      // 帯は、透明な下端（約定量 − 推定キャンセル量）に厚みを積んで塗る。間引くと 2 つの点がずれるので、間引かない
+      const stack = `rights-${r.name}`;
+      series.push(
+        { type: 'line', name: `_${r.bandName}`, data: pts(r.kept), stack, symbol: 'none', lineStyle: { opacity: 0 }, silent: true, z: 1 },
+        {
+          type: 'line',
+          name: r.bandName,
+          data: pts(r.cancel),
+          stack,
+          symbol: 'none',
+          color: bandColor,
+          lineStyle: { opacity: 0 },
+          areaStyle: { color: bandColor, opacity: 1 },
+          emphasis: { disabled: true },
+          z: 1,
+        },
+      );
+      tips.push(null, { name: r.bandName, color: bandColor, key: 'rect', format: (v) => `${fmtNum(Math.abs(v), 0)} MW`, optional: true });
+      legendItems.push({ name: r.bandName, icon: 'rect', itemStyle: { color: bandColor } });
+    });
     this.trend.setOption(
       {
-        grid: grid({ right: labelRoom(names.length), bottom: zoom.bottom }),
-        legend: lineLegend(shown.map((l) => ({ name: l.name, dashed: l.dashed }))),
+        grid: grid({ right: labelRoom(lines.length), bottom: zoom.bottom }),
+        legend: lineLegend([], { data: legendItems }),
         ...(zoom.dataZoom ? { dataZoom: zoom.dataZoom } : {}),
         tooltip: {
           trigger: 'axis',
-          formatter: namedTooltip(
-            names,
-            shown.map((l) => color[l.color]),
-            (p) => {
-              const x = Number((p.value as number[])[0]);
-              return `${periodLabel(x, gran)}${calcPeriods.has(x) ? '（計算値を含む）' : ''}`;
-            },
-            (v) => `${fmtSigned(v, 0)} MW`,
-            shown.map((l) => l.dashed),
-          ),
+          formatter: rowsTooltip(tips, (p) => {
+            const x = Number((p.value as number[])[0]);
+            return `${periodLabel(x, gran)}${calcPeriods.has(x) ? '（計算値を含む）' : ''}`;
+          }),
         },
         xAxis: { type: 'time', axisLabel: TIME_AXIS_LABEL },
         yAxis: valueAxis('MW'),
-        series: shown.map((l, i) =>
-          styledLine(l.name, color[l.color], theme, gran === 'slot' ? breakGaps(l.points) : l.points, l.dashed, {
-            sampling: LINE_SAMPLING,
-            ...(l.field === 'actual' ? { lineStyle: { width: 1.5 } } : {}),
-            ...ends[i],
-            ...(i === 0 ? markLine : {}),
-          }),
-        ),
+        series,
       },
       {
-        columns: ['期間', ...names.map((n) => `${n}（MW）`), ...(calc ? ['備考'] : [])],
-        rows: (shown[0]?.points ?? []).map((p, r) => [
+        columns: [
+          '期間',
+          ...shown.map((l) => `${l.name}（MW）`),
+          ...layers.flatMap((r) => [`${r.name}（MW）`, ...(r.estimated ? [`${r.bandName}（MW）`] : [])]),
+          ...(calc ? ['備考'] : []),
+        ],
+        rows: (shown[0]?.points ?? []).map((p, row) => [
           periodLabel(p[0], gran),
-          ...shown.map((l) => l.points[r][1]),
+          ...shown.map((l) => l.points[row][1]),
+          ...layers.flatMap((r) => [r.volume[row][1], ...(r.estimated ? [Math.abs(r.cancel[row][1])] : [])]),
           ...(calc ? [calcPeriods.has(p[0]) ? `計画潮流と潮流実績は${fencePartsText(key)}から計算` : ''] : []),
         ]),
-        digits: [null, ...names.map(() => 1), ...(calc ? [null] : [])],
+        digits: [null, ...shown.map(() => 1), ...layers.flatMap((r) => [1, ...(r.estimated ? [1] : [])]), ...(calc ? [null] : [])],
         filename: `jepx_intertie_${key}_${rangeTag(sel)}.csv`,
       },
     );
+  }
+
+  /**
+   * 推移の図に重ねる間接送電権（約定量のある向きだけ）と、注記に使うまとめ。
+   * 約定量と推定キャンセル量はコマごとの値を粒度ごとに平均するので、帯の上端（下端 + 厚み）は約定量の線に重なる
+   */
+  private rightsLayers(st: IntertieStore, sel: Selection, key: IntertieKey, gran: Granularity): { layers: RightsLayer[]; summary: RightsSummary } {
+    const { ds } = this.ctx;
+    const all = st.rightsOf(ds, key);
+    const layers: RightsLayer[] = [];
+    const summary: RightsSummary = { shown: 0, estimated: false, before: false, cancelSlots: 0, cancelMwh: 0 };
+    for (const [side, dir, label] of [['fwd', 1, '順方向'], ['rev', -1, '逆方向']] as const) {
+      const r = all[side];
+      if (!r) continue;
+      let any = false;
+      let estimated = false;
+      let before = false;
+      let slots = 0;
+      let mwh = 0;
+      for (const i of sel.days) {
+        for (let s = 0; s < SLOTS; s++) {
+          if (!sel.slotMask[s]) continue;
+          const k = i * SLOTS + s;
+          if (!(r.volume[k] > 0)) continue;
+          any = true;
+          const c = r.cancel[k];
+          if (Number.isNaN(c)) {
+            if (ds.start + i < RIGHTS_ESTIMATE_FROM) before = true;
+            continue;
+          }
+          estimated = true;
+          if (c > 0) {
+            slots++;
+            mwh += c / 2;
+          }
+        }
+      }
+      if (!any) continue;
+      const n = r.volume.length;
+      const volume = new Float64Array(n);
+      const kept = new Float64Array(n);
+      const cancel = new Float64Array(n);
+      for (let k = 0; k < n; k++) {
+        volume[k] = dir * r.volume[k];
+        cancel[k] = dir * r.cancel[k];
+        kept[k] = dir * (r.volume[k] - r.cancel[k]);
+      }
+      const [pv, pk, pc] = buildSeriesPoints(sel, [{ a: volume }, { a: kept }, { a: cancel }], gran, 'mean');
+      layers.push({
+        name: `間接送電権（${label}）`,
+        bandName: `推定キャンセル量（${label}）`,
+        volume: pv.points,
+        kept: pk.points,
+        cancel: pc.points,
+        estimated,
+        cancelled: slots > 0,
+      });
+      summary.shown++;
+      summary.estimated ||= estimated;
+      summary.before ||= before;
+      summary.cancelSlots += slots;
+      summary.cancelMwh += mwh;
+    }
+    return { layers, summary };
   }
 
   /** 粒度ごとの期間（代表時刻）のうち、個別の連系線から計算した値を含むもの */

@@ -163,7 +163,7 @@ export class App implements AppApi {
       h(
         'p',
         null,
-        '出典: 日本卸電力取引所（JEPX）「スポット市場 取引結果」。連系線のタブは、電力広域的運営推進機関「系統情報サービス」のデータを加工して作成。本ツールは JEPX や電力広域的運営推進機関とは関係のない非公式のビューアです。',
+        '出典: 日本卸電力取引所（JEPX）「スポット市場 取引結果」と「間接送電権市場」。連系線のタブは、電力広域的運営推進機関「系統情報サービス」のデータを加工して作成。本ツールは JEPX や電力広域的運営推進機関とは関係のない非公式のビューアです。',
         '読み込んだ CSV はブラウザ内でのみ処理され、外部には送信されません。',
       ),
     );
@@ -392,7 +392,7 @@ export class App implements AppApi {
       if (json?.format !== MANIFEST_FORMAT || !Array.isArray(json.files) || json.files.length === 0) return;
       this.manifest = json;
       if (json.curves) this.curves = CurveStore.fromIndex(json.curves, (file) => this.readData(file));
-      if (json.interties) this.interties = IntertieStore.fromIndex(json.interties, (file) => this.readData(file));
+      if (json.interties) this.interties = IntertieStore.fromIndex(json.interties, (file) => this.readData(file), json.transmissionRights);
     } catch {
       // 取得済みデータが無い（npm run fetch 未実行）場合はここに来る
       if (LOCAL_DATA === 'scripts') {

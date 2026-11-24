@@ -251,22 +251,55 @@ describe('連系線のデータ（ブラウザ側）', () => {
     expect(st.linesWithData(dataset, dataset.start, dataset.start + dataset.n - 1)).toEqual(['tohokuTokyo']);
   });
 
-  it('デモでは、両側のエリアの価格が違うコマは、安い側から高い側へ上限まで流れる', () => {
+  it('デモでは、両側のエリアの価格が違うコマは、安い側から高い側へ上限まで流れる（作業停止の日は上限が下がる）', () => {
     const ds = new DataStore();
     ds.addDays(generateDemoDays(dayFromYmd(2025, 4, 1), dayFromYmd(2025, 6, 30), 3), 'demo');
     const dataset = ds.dataset()!;
     const st = IntertieStore.demo(dataset)!;
     expect(st.isDemo).toBe(true);
     const plan = st.array(dataset, 'tohokuTokyo', 'plan');
+    const limF = st.array(dataset, 'tohokuTokyo', 'limFwd');
+    const limR = st.array(dataset, 'tohokuTokyo', 'limRev');
     const tohoku = dataset.values[SERIES_INDEX.tohoku];
     const tokyo = dataset.values[SERIES_INDEX.tokyo];
     let split = 0;
     for (let k = 0; k < plan.length; k++) {
       if (Number.isNaN(plan[k]) || Math.abs(tohoku[k] - tokyo[k]) <= 0.005) continue;
       split++;
-      expect(plan[k]).toBe(tohoku[k] < tokyo[k] ? 5550 : -2400);
+      expect(plan[k]).toBe(tohoku[k] < tokyo[k] ? limF[k] : limR[k]);
     }
     expect(split).toBeGreaterThan(0);
+    // 上限は、ふだんの値（5550 / −2400）か、作業停止で 4〜6 割に下げた値
+    const lowered = [...limF].filter((v) => !Number.isNaN(v) && v !== 5550);
+    expect(lowered.length).toBeGreaterThan(0);
+    expect(lowered.every((v) => v >= 5550 * 0.4 - 1 && v <= 5550 * 0.6 + 1)).toBe(true);
+  });
+
+  it('デモの間接送電権は、作業停止で上限が約定量より下がった日に、推定キャンセル量が出る（2026 年度から）', () => {
+    const ds = new DataStore();
+    ds.addDays(generateDemoDays(dayFromYmd(2025, 11, 1), dayFromYmd(2026, 10, 31), 3), 'demo');
+    const dataset = ds.dataset()!;
+    const st = IntertieStore.demo(dataset)!;
+    expect(st.hasRights).toBe(true);
+    const { fwd, rev } = st.rightsOf(dataset, 'tokyoChubu');
+    expect(fwd).not.toBeNull();
+    expect(rev).not.toBeNull();
+    // 中国-四国間は、逆方向（四国 → 中国）だけ
+    expect(st.rightsOf(dataset, 'chugokuShikoku').fwd).toBeNull();
+    const limR = st.array(dataset, 'tokyoChubu', 'limRev');
+    const from = (dayFromYmd(2026, 4, 1) - dataset.start) * SLOTS;
+    let cancelled = 0;
+    for (let k = 0; k < rev!.volume.length; k++) {
+      const c = rev!.cancel[k];
+      if (k < from) {
+        expect(Number.isNaN(c)).toBe(true);
+        continue;
+      }
+      if (Number.isNaN(rev!.volume[k])) continue;
+      expect(c).toBeCloseTo(Math.max(0, rev!.volume[k] + limR[k]), 1);
+      if (c > 0) cancelled++;
+    }
+    expect(cancelled).toBeGreaterThan(0);
   });
 });
 

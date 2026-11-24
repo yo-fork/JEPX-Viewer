@@ -21,12 +21,27 @@ import {
 } from '../src/lib/bidCurves';
 import { toCsv } from '../src/lib/csv';
 import { decodeFyFile, type Manifest } from '../src/lib/dataFile';
-import { dayFromYmd, formatDay } from '../src/lib/dates';
+import { dayFromYmd, dowOfDay, formatDay, isoFromDay } from '../src/lib/dates';
 import { generateDemoDays } from '../src/lib/demo';
 import { syntheticCurveDay } from '../src/lib/demoCurves';
 import { formatSpotCsv, newDayValues, type DayMap } from '../src/lib/jepxCsv';
 import { decodeIntertieFy, INTERTIE_FIELD_INDEX, INTERTIE_INDEX, intertieOffset, type IntertieField } from '../src/lib/occto';
 import { SENSITIVITY_KEYS, SENSITIVITY_SIZES, sensitivityKey, SERIES_INDEX, SLOTS, type SeriesKey } from '../src/lib/series';
+import { decodeRightsFile, RIGHTS_FILE } from '../src/lib/transmissionRights';
+
+/** 間接送電権の取引結果の CSV（JEPX の形。約定日が fy 年度の、6 月 1 週の週間商品 2 つと、翌年度の年間商品 1 つ） */
+function rightsCsv(fy: number): string {
+  const june1 = dayFromYmd(fy, 6, 1);
+  const sat = june1 + ((6 - dowOfDay(june1) + 7) % 7);
+  const ymd = (d: number) => isoFromDay(d).replace(/-/g, '/');
+  const yy = String(fy).slice(2);
+  return toCsv([
+    ['商品名', '説明', '方向', '約定日', '対象期間(自)', '対象期間(至)', '売り入札量(MW)', '約定価格(円/kWh)', '約定量(MW)'],
+    [`${yy}W23T43`, '6月1週ＦＣ[逆]', '中部 -> 東京', ymd(sat - 38), ymd(sat), ymd(sat + 6), '1200.0', '0.75', '1200.0'],
+    [`${yy}W23T34`, '6月1週ＦＣ(順)', '東京 -> 中部', ymd(sat - 38), ymd(sat), ymd(sat + 6), '1200.0', '-', '-'],
+    [`Y${String(fy + 1).slice(2)}1T43`, `${fy + 1}年度ＦＣ[逆]第一回`, '中部 -> 東京', `${fy}/09/18`, `${fy + 1}/04/01`, `${fy + 2}/03/31`, '600.0', '0.50', '300.0'],
+  ]);
+}
 
 /** 各年度の先頭 3 日ぶんの合成データ（Shift_JIS の CSV として配信する） */
 const FIXTURES = new Map<number, DayMap>([
@@ -223,6 +238,7 @@ const urls = () => ({
   urlTemplate: `${baseUrl}/csv_read.php?file=spot_summary_{fy}.csv`,
   curvesUrlTemplate: `${baseUrl}/csv_read.php?dir={dir}&file={file}`,
   sensitivityUrlTemplate: `${baseUrl}/csv_read.php?dir=virtualprice&file=virtualprice_{fy}.csv`,
+  rightsUrlTemplate: `${baseUrl}/csv_read.php?dir=transmission_rights&file=transmission_rights_{fy}.csv`,
   occtoBase: `${baseUrl}/occto/`,
 });
 
@@ -234,6 +250,13 @@ beforeAll(async () => {
       return;
     }
     requests.push(req.url ?? '');
+    // 間接送電権の取引結果は UTF-8 で配信する（JEPX の CSV と同じ）。2019 年度より前は無い
+    const rights = /transmission_rights_(\d{4})\.csv/.exec(req.url ?? '');
+    if (rights) {
+      if (Number(rights[1]) < 2019) res.writeHead(404).end();
+      else res.writeHead(200, { 'Content-Type': 'text/csv' }).end(Buffer.from(rightsCsv(Number(rights[1])), 'utf8'));
+      return;
+    }
     const summary = /spot_summary_(\d{4})\.csv/.exec(req.url ?? '');
     const sens = /virtualprice_(\d{4})\.csv/.exec(req.url ?? '');
     const curve = /(spot_bid_curves|spot_splitting_areas)_(\d{8})\.csv/.exec(req.url ?? '');
@@ -334,6 +357,33 @@ describe('データ取得スクリプト', () => {
     await run({ ...opts, sensitivity: false, log: (m) => logs.push(m) });
     expect(logs).toContain('2024年度: 2024-04-01〜2024-04-03（3 日）を保存（価格感応度 3 日。前に取得したもの）');
     for (const [day, vals] of FIXTURES.get(2024)!) expect((await fy2024()).get(day)).toEqual(withSensitivity(2024, day, vals));
+  });
+
+  it('間接送電権の取引結果を、取引結果の最初の年度の前の年度から取得して 1 つのファイルにまとめる（前年度より前の取得済みの年度は取り直さない）', async () => {
+    const out = path.join(workdir, 'rights');
+    const opts = { ...defaultOptions(), ...urls(), from: 2023, to: 2023, out, delayMs: 0, curves: false, sensitivity: false, interties: false };
+    const logs: string[] = [];
+    const manifest = await run({ ...opts, log: (m) => logs.push(m) });
+    expect(logs).toContain('2022年度: 間接送電権 3 商品');
+    const years = decodeRightsFile(JSON.parse(await readFile(path.join(out, RIGHTS_FILE), 'utf8')));
+    expect([...years.keys()]).toEqual([2022, 2023]);
+    expect(years.get(2023)!.find((p) => p.code === '23W23T43')).toMatchObject({ from: 'chubu', to: 'tokyo', offer: 1200, price: 0.75, volume: 1200 });
+    // 約定しなかった商品は、約定価格と約定量を null にする
+    expect(years.get(2023)!.find((p) => p.code === '23W23T34')).toMatchObject({ price: null, volume: null });
+    // 一覧の期間は、商品の対象期間（年間商品の 2024 年度分まで）
+    expect(manifest.transmissionRights).toEqual({ file: RIGHTS_FILE, firstDate: '2022-06-04', lastDate: '2025-03-31', products: 6 });
+
+    // 2 回目は、前年度より前の取得済みの年度を取り直さない
+    const before = requests.length;
+    const again: string[] = [];
+    await run({ ...opts, log: (m) => again.push(m) });
+    expect(requests.slice(before).filter((r) => r.includes('transmission_rights'))).toEqual([]);
+    expect(again).toContain('間接送電権: 取得済みの 2 年度はスキップ');
+    // 取得しないときも、取得済みのファイルを一覧に載せる
+    const third = requests.length;
+    const kept = await run({ ...opts, rights: false, force: true, log: () => {} });
+    expect(requests.slice(third).filter((r) => r.includes('transmission_rights'))).toEqual([]);
+    expect(kept.transmissionRights?.products).toBe(6);
   });
 
   it('受渡日ごとの入札カーブを取得し、1 日分のファイル・指標の年度ファイル・一覧を作る', async () => {
@@ -437,7 +487,13 @@ describe('データ取得スクリプト', () => {
       delayMs: 0,
       log: () => {},
     });
-    for (const f of ['spot_summary_2024.csv', 'virtualprice_2024.csv', 'curves/spot_bid_curves_20240401.csv', 'curves/spot_splitting_areas_20240401.csv']) {
+    for (const f of [
+      'spot_summary_2024.csv',
+      'virtualprice_2024.csv',
+      'transmission_rights_2024.csv',
+      'curves/spot_bid_curves_20240401.csv',
+      'curves/spot_splitting_areas_20240401.csv',
+    ]) {
       expect(existsSync(path.join(out, 'raw', f))).toBe(true);
     }
   });
@@ -737,6 +793,20 @@ describe('データ取得スクリプト', () => {
     expect(logs.some((l) => l.includes('連系線の計画潮流（翌日） 2024-04-01〜2024-04-02'))).toBe(true);
   });
 
+  it('--from-dir: 間接送電権の取引結果の CSV も列名で見分けて変換する（同じ CSV が 2 つあっても量は重ならない）', async () => {
+    const src = path.join(workdir, 'rights-csv');
+    const out = path.join(workdir, 'rights-out');
+    await mkdir(src, { recursive: true });
+    await writeFile(path.join(src, 'transmission_rights_2024.csv'), rightsCsv(2024));
+    await writeFile(path.join(src, 'copy.csv'), rightsCsv(2024));
+    const logs: string[] = [];
+    const manifest = await run({ ...defaultOptions(), out, fromDirs: [src], log: (m) => logs.push(m) });
+    expect(manifest.transmissionRights).toMatchObject({ products: 3 });
+    const years = decodeRightsFile(JSON.parse(await readFile(path.join(out, RIGHTS_FILE), 'utf8')));
+    expect([...years.keys()]).toEqual([2024]);
+    expect(logs.some((l) => l.startsWith('間接送電権: 2024 年度を'))).toBe(true);
+  });
+
   it('取得する日を、続いている日ごとに決まった日数以内の範囲にまとめる', () => {
     expect(dayRuns([5, 1, 2, 3, 7, 8], 31)).toEqual([
       [1, 3],
@@ -760,6 +830,11 @@ describe('データ取得スクリプト', () => {
     expect(parseArgs(['--from-dir', 'a', '--from-dir', 'b']).fromDirs).toEqual(['a', 'b']);
     expect(o.sensitivity).toBe(true);
     expect(parseArgs(['--no-sensitivity', '--sensitivity-url-template', 'http://x/{fy}.csv'])).toMatchObject({ sensitivity: false, sensitivityUrlTemplate: 'http://x/{fy}.csv' });
+    expect(o.rights).toBe(true);
+    expect(parseArgs(['--no-transmission-rights', '--transmission-rights-url-template', 'http://x/{fy}.csv'])).toMatchObject({
+      rights: false,
+      rightsUrlTemplate: 'http://x/{fy}.csv',
+    });
     const d = defaultOptions();
     expect(d.curvesTo - d.curvesFrom + 1).toBe(90);
     expect([d.interties, d.intertiesTo - d.intertiesFrom + 1]).toEqual([true, 90]);
